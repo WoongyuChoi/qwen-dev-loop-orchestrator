@@ -36,6 +36,8 @@ Windows 11에서 Qwen Code용 `settings.json`을 기반으로 Qwen/OpenAI-compat
 
 실제 호출 성공 시 CMD에는 `HTTP 200 OK (... ms, ... bytes)` 형식의 응답 상태가 출력되고, 추출된 응답 글자 수도 함께 표시됩니다. 404/500 같은 HTTP 오류나 연결 실패는 `Endpoint failed`와 함께 상태 코드/응답 body 일부가 콘솔과 `error.log`에 남습니다.
 
+응답을 받은 뒤에는 `ANSWER PREVIEW`로 실제 답변 본문 앞부분을 기본 4줄/1000자까지 CMD에 보여줍니다. 전체 답변은 `transcript.md`와 `transcript.jsonl`에 저장됩니다. preview가 너무 길거나 불필요하면 `-AnswerPreviewLines`, `-AnswerPreviewChars`, `-NoAnswerPreview`로 조정합니다.
+
 ## 호출 간격
 
 기본 루프는 고정 10분 타이머가 아니라 `-MinIntervalMinutes 8 -MaxIntervalMinutes 15` 범위에서 매 호출 후 새 랜덤 대기시간을 뽑습니다. 예를 들어 한 번 호출한 뒤 11분 20초를 기다렸다면, 다음 호출 뒤에는 다시 8-15분 범위에서 새 값을 뽑습니다.

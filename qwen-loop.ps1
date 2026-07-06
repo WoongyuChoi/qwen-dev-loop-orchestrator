@@ -16,6 +16,8 @@
     [int]$MaxContextChars = 30000,
     [int]$LastTurnChars = 12000,
     [int]$CountdownRefreshSeconds = 1,
+    [int]$AnswerPreviewLines = 4,
+    [int]$AnswerPreviewChars = 1000,
     [int]$MaxRuns = 0,
     [string]$QwenCodeVersion = "",
     [string]$OpenAISdkVersion = "5.11.0",
@@ -29,6 +31,7 @@
     [switch]$LoopDiagnosticHeaders,
     [switch]$NoClientIdentityHeaders,
     [switch]$NoCountdown,
+    [switch]$NoAnswerPreview,
     [switch]$MaskSensitiveLogs,
     [switch]$LogSensitive
 )
@@ -513,6 +516,30 @@ function Extract-NextQuestion([string]$content) {
         return $candidate.Trim()
     }
     return "직전 답변에서 아직 검증되지 않은 핵심 가정 하나를 골라, 같은 기술 트랙 안에서 더 좁고 깊게 분석할 후속 질문을 만들어줘."
+}
+
+function Get-AnswerPreview([string]$content, [int]$maxLines, [int]$maxChars) {
+    if ($NoAnswerPreview) { return "" }
+    if ($maxLines -le 0 -or $maxChars -le 0) { return "" }
+    if ([string]::IsNullOrWhiteSpace($content)) { return "" }
+
+    $previewLines = New-Object System.Collections.Generic.List[string]
+    foreach ($line in ($content -split "`r?`n")) {
+        $trimmed = Remove-BomAndTrim $line
+        if ([string]::IsNullOrWhiteSpace($trimmed)) { continue }
+        if ($trimmed -match '^NEXT_QUESTION\s*[:：]\s*') { continue }
+
+        $previewLines.Add($trimmed)
+        if ($previewLines.Count -ge $maxLines) { break }
+    }
+
+    if ($previewLines.Count -eq 0) { return "" }
+
+    $preview = ($previewLines -join "`n")
+    if ($preview.Length -gt $maxChars) {
+        $preview = $preview.Substring(0, $maxChars).TrimEnd() + "`n...[answer preview truncated]..."
+    }
+    return $preview
 }
 
 function Read-QuestionSeeds([string]$seedFile, [string]$questionBankFile, [string]$trackFilter) {
@@ -1112,6 +1139,8 @@ Write-Host "WireMode     : Qwen Code OpenAI SDK-like headers/body"
 Write-Host "Stream       : $(-not [bool]$NonStreaming)"
 Write-Host "HeaderLog    : $(if ($MaskSensitiveLogs -and -not $LogSensitive) { 'masked' } else { 'unmasked' })"
 Write-Host "QuestionSrc  : $($initialQuestion.Source)"
+$answerPreviewText = if ($NoAnswerPreview) { "disabled" } else { "$AnswerPreviewLines lines / $AnswerPreviewChars chars" }
+Write-Host "AnswerPreview: $answerPreviewText"
 Write-Host "IntervalMode : $($intervalPlan.Mode)"
 if ($intervalPlan.Mode -eq "fixed") {
     Write-Host "Interval     : $(Format-IntervalDuration $intervalPlan.FixedSeconds)"
@@ -1143,6 +1172,11 @@ $settingsSummary = [ordered]@{
     compatBody = [bool]$CompatBody
     stream = (-not [bool]$NonStreaming)
     timeoutSec = $EffectiveTimeoutSec
+    answerPreview = [ordered]@{
+        enabled = (-not [bool]$NoAnswerPreview)
+        lines = $AnswerPreviewLines
+        chars = $AnswerPreviewChars
+    }
     interval = [ordered]@{
         mode = $intervalPlan.Mode
         minSeconds = $intervalPlan.MinSeconds
@@ -1232,7 +1266,7 @@ $contextBundle
 다음 질문은 최근 질문 히스토리를 반복하지 말고, 현재 질문의 주 기술 트랙을 유지하면서 더 좁고 검증 가능한 쟁점으로 이어가줘.
 "@
 
-        Write-Host "`n[$($started.ToString('yyyy-MM-dd HH:mm:ss'))] QUESTION:" -ForegroundColor Green
+        Write-Host "`n[$($started.ToString('yyyy-MM-dd HH:mm:ss'))] RUN #$runCount QUESTION:" -ForegroundColor Green
         Write-Host $question
 
         $answer = Invoke-QwenChat $providerInfo $settings $networkIdentity $systemPrompt $userPrompt
@@ -1288,6 +1322,16 @@ $answer
         }
         Append-Utf8File $jsonlPath (($record | ConvertTo-Json -Compress -Depth 50) + "`n")
 
+        if (-not $NoAnswerPreview) {
+            $answerPreview = Get-AnswerPreview $answer $AnswerPreviewLines $AnswerPreviewChars
+            Write-Host "`nANSWER PREVIEW:" -ForegroundColor Cyan
+            if ([string]::IsNullOrWhiteSpace($answerPreview)) {
+                Write-Host "(preview is empty; full answer is saved in transcript.md)" -ForegroundColor DarkGray
+            } else {
+                Write-Host $answerPreview
+            }
+        }
+
         Write-Host "`nNEXT QUESTION:" -ForegroundColor Magenta
         Write-Host $nextQuestion
         Write-Host "`nSaved:" -ForegroundColor DarkGreen
@@ -1298,6 +1342,7 @@ $answer
         Write-Host "- $(Join-Path $WorkDir 'last_request_headers.json')"
         Write-Host "- $(Join-Path $WorkDir 'last_request_body.json')"
         Write-Host "- $(Join-Path $WorkDir 'last_response_status.json')"
+        Write-Host "`nRUN #$runCount complete. Full answer saved to transcript.md." -ForegroundColor Green
     } catch {
         $msg = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ERROR: $($_.Exception.Message)`n$($_.ScriptStackTrace)`n"
         Append-Utf8File $errorLogPath $msg
