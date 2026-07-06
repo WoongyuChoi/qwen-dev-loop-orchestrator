@@ -42,6 +42,8 @@ Windows 11에서 Qwen Code용 `settings.json`을 기반으로 Qwen/OpenAI-compat
 
 기존처럼 고정 간격 테스트가 필요하면 `qwen-loop.ps1`에 `-IntervalSeconds 600`만 단독으로 넘깁니다. `-MinIntervalMinutes`/`-MaxIntervalMinutes`를 함께 넘기면 랜덤 범위가 우선입니다.
 
+대기 중에는 CMD의 같은 줄에서 남은 시간과 다음 호출 예정 시각이 기본 1초마다 갱신됩니다. 너무 번잡하면 `-CountdownRefreshSeconds 60`으로 1분마다 갱신하거나, `-NoCountdown`으로 예전처럼 한 번만 출력하고 조용히 대기할 수 있습니다.
+
 ## 먼저 볼 파일
 
 ```text

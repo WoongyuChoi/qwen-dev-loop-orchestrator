@@ -15,6 +15,7 @@
     [int]$TimeoutSec = 120,
     [int]$MaxContextChars = 30000,
     [int]$LastTurnChars = 12000,
+    [int]$CountdownRefreshSeconds = 1,
     [int]$MaxRuns = 0,
     [string]$QwenCodeVersion = "",
     [string]$OpenAISdkVersion = "5.11.0",
@@ -27,6 +28,7 @@
     [switch]$UseSchedulerSamplingDefaults,
     [switch]$LoopDiagnosticHeaders,
     [switch]$NoClientIdentityHeaders,
+    [switch]$NoCountdown,
     [switch]$MaskSensitiveLogs,
     [switch]$LogSensitive
 )
@@ -409,6 +411,37 @@ function Format-IntervalDuration([int]$seconds) {
     $remainingSeconds = $seconds % 60
     if ($remainingSeconds -eq 0) { return "$minutes min ($seconds sec)" }
     return "$minutes min $remainingSeconds sec ($seconds sec)"
+}
+
+function Wait-WithCountdown([int]$seconds, $intervalPlan) {
+    if ($seconds -le 0) { return }
+    if ($CountdownRefreshSeconds -le 0) { throw "CountdownRefreshSeconds는 1 이상이어야 합니다." }
+
+    $nextAt = (Get-Date).AddSeconds($seconds)
+    $modeSuffix = if ($intervalPlan.Mode -eq "random") { "next wait randomized after next request" } else { "fixed interval" }
+
+    if ($NoCountdown) {
+        Write-Host "`nWaiting $(Format-IntervalDuration $seconds). Next request around $($nextAt.ToString('HH:mm:ss')). $modeSuffix. Ctrl+C to stop." -ForegroundColor DarkGray
+        Start-Sleep -Seconds $seconds
+        return
+    }
+
+    Write-Host ""
+    $lastLength = 0
+    while ($true) {
+        $remaining = [int][Math]::Ceiling(($nextAt - (Get-Date)).TotalSeconds)
+        if ($remaining -lt 0) { $remaining = 0 }
+
+        $line = "Waiting $(Format-IntervalDuration $remaining) | next request around $($nextAt.ToString('HH:mm:ss')) | $modeSuffix | Ctrl+C to stop"
+        $paddingLength = [Math]::Max(0, $lastLength - $line.Length)
+        $padding = if ($paddingLength -gt 0) { " " * $paddingLength } else { "" }
+        [Console]::Write("`r$line$padding")
+        $lastLength = $line.Length
+
+        if ($remaining -le 0) { break }
+        Start-Sleep -Seconds ([Math]::Min($CountdownRefreshSeconds, $remaining))
+    }
+    [Console]::WriteLine("")
 }
 
 function Expand-PathInput([string]$PathText) {
@@ -1085,6 +1118,8 @@ if ($intervalPlan.Mode -eq "fixed") {
 } else {
     Write-Host "IntervalRange: $(Format-IntervalDuration $intervalPlan.MinSeconds) - $(Format-IntervalDuration $intervalPlan.MaxSeconds)"
 }
+$countdownText = if ($NoCountdown) { "disabled" } else { "every $CountdownRefreshSeconds sec" }
+Write-Host "Countdown    : $countdownText"
 Write-Host "TimeoutSec   : $EffectiveTimeoutSec"
 Write-Host "WorkDir      : $WorkDir"
 Write-Host "Stop         : Ctrl+C"
@@ -1116,6 +1151,8 @@ $settingsSummary = [ordered]@{
         minIntervalMinutes = $MinIntervalMinutes
         maxIntervalMinutes = $MaxIntervalMinutes
         legacyIntervalSeconds = $IntervalSeconds
+        countdownEnabled = (-not [bool]$NoCountdown)
+        countdownRefreshSeconds = $CountdownRefreshSeconds
         note = $intervalPlan.Note
     }
     initialQuestionSource = $initialQuestion.Source
@@ -1273,10 +1310,5 @@ $answer
     }
 
     $nextWaitSeconds = Get-NextIntervalSeconds $intervalPlan
-    if ($intervalPlan.Mode -eq "random") {
-        Write-Host "`nWaiting $(Format-IntervalDuration $nextWaitSeconds). Next wait will be randomized again after the next request. Ctrl+C to stop." -ForegroundColor DarkGray
-    } else {
-        Write-Host "`nWaiting $(Format-IntervalDuration $nextWaitSeconds). Ctrl+C to stop." -ForegroundColor DarkGray
-    }
-    Start-Sleep -Seconds $nextWaitSeconds
+    Wait-WithCountdown $nextWaitSeconds $intervalPlan
 }
