@@ -19,6 +19,9 @@
     [int]$AnswerPreviewLines = 4,
     [int]$AnswerPreviewChars = 1000,
     [int]$MaxRuns = 0,
+    [int]$MaxRetries = 3,
+    [int]$RetryInitialDelaySeconds = 1,
+    [int]$RetryMaxDelaySeconds = 10,
     [string]$QwenCodeVersion = "",
     [string]$OpenAISdkVersion = "5.11.0",
     [string]$NodeRuntimeVersion = "",
@@ -774,12 +777,12 @@ function Get-ClientNetworkIdentity([string]$BaseUrl) {
     return [PSCustomObject]$result
 }
 
-function Build-ClientHeaders($providerInfo, $settings, $networkIdentity) {
+function Build-ClientHeaders($providerInfo, $settings, $networkIdentity, [int]$RetryCount = 0) {
     $headers = [ordered]@{}
 
     Set-HeaderLikeSdk $headers "Accept" "application/json"
     Set-HeaderLikeSdk $headers "User-Agent" "OpenAI/JS $OpenAISdkVersion"
-    Set-HeaderLikeSdk $headers "X-Stainless-Retry-Count" "0"
+    Set-HeaderLikeSdk $headers "X-Stainless-Retry-Count" ([string]$RetryCount)
     Set-HeaderLikeSdk $headers "X-Stainless-Timeout" ([string]$EffectiveTimeoutSec)
     Set-HeaderLikeSdk $headers "X-Stainless-Lang" "js"
     Set-HeaderLikeSdk $headers "X-Stainless-Package-Version" $OpenAISdkVersion
@@ -942,6 +945,48 @@ function Build-RequestBody($settings, $providerInfo, [string]$systemPrompt, [str
     return $bodyObj
 }
 
+function Get-HttpStatusFromErrorMessage([string]$message) {
+    if ([string]::IsNullOrWhiteSpace($message)) { return $null }
+    if ($message -match '^HTTP\s+(\d+)\s+') { return [int]$Matches[1] }
+    return $null
+}
+
+function Test-RetryableError([string]$message) {
+    $statusCode = Get-HttpStatusFromErrorMessage $message
+    if ($null -eq $statusCode) {
+        # Transport errors, connection resets, DNS failures, and request timeouts do not
+        # always have an HTTP status. Treat them as retryable.
+        return $true
+    }
+
+    if ($statusCode -eq 408 -or $statusCode -eq 409 -or $statusCode -eq 429) { return $true }
+    if ($statusCode -ge 500 -and $statusCode -le 599) { return $true }
+    return $false
+}
+
+function Assert-RetryConfig() {
+    if ($MaxRetries -lt 0) { throw "MaxRetries는 0 이상이어야 합니다." }
+    if ($RetryInitialDelaySeconds -le 0) { throw "RetryInitialDelaySeconds는 1 이상이어야 합니다." }
+    if ($RetryMaxDelaySeconds -le 0) { throw "RetryMaxDelaySeconds는 1 이상이어야 합니다." }
+    if ($RetryMaxDelaySeconds -lt $RetryInitialDelaySeconds) {
+        throw "RetryMaxDelaySeconds는 RetryInitialDelaySeconds보다 크거나 같아야 합니다."
+    }
+}
+
+function Get-RetryDelayMilliseconds([int]$retryNumber) {
+    Assert-RetryConfig
+
+    $power = [Math]::Pow(2, [Math]::Max(0, $retryNumber - 1))
+    $delaySeconds = [Math]::Min($RetryMaxDelaySeconds, $RetryInitialDelaySeconds * $power)
+    $jitterMs = Get-Random -Minimum 0 -Maximum 1000
+    return [int]([Math]::Round($delaySeconds * 1000) + $jitterMs)
+}
+
+function Format-Milliseconds([int]$milliseconds) {
+    if ($milliseconds -lt 1000) { return "$milliseconds ms" }
+    return ("{0:N1} sec" -f ($milliseconds / 1000.0))
+}
+
 function Invoke-JsonPostUtf8([string]$Uri, $Headers, [byte[]]$BodyBytes, [int]$TimeoutSeconds) {
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $req = [System.Net.HttpWebRequest]::Create($Uri)
@@ -1056,58 +1101,78 @@ function Convert-OpenAIResponseToText([string]$raw, [bool]$isStreaming) {
 }
 
 function Invoke-QwenChat($providerInfo, $settings, $networkIdentity, [string]$systemPrompt, [string]$userPrompt) {
-    $headers = Build-ClientHeaders $providerInfo $settings $networkIdentity
     $bodyObj = Build-RequestBody $settings $providerInfo $systemPrompt $userPrompt $networkIdentity
     $body = $bodyObj | ConvertTo-Json -Depth 80 -Compress
     $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($body)
 
     Write-Utf8File (Join-Path $WorkDir "last_request_body.json") $body
 
-    $debugHeaders = Get-LoggedHeaders $headers
-    Write-Utf8File (Join-Path $WorkDir "last_request_headers.json") (($debugHeaders | ConvertTo-Json -Depth 30))
-    if ($LogSensitive) { Write-Utf8File (Join-Path $WorkDir "last_request_headers_sensitive.json") (($headers | ConvertTo-Json -Depth 30)) }
+    Assert-RetryConfig
 
     $lastError = $null
     foreach ($endpoint in (Get-EndpointCandidates $providerInfo.BaseUrl)) {
-        try {
-            Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] POST $endpoint" -ForegroundColor Cyan
-            $response = Invoke-JsonPostUtf8 -Uri $endpoint -Headers $headers -BodyBytes $bodyBytes -TimeoutSeconds $EffectiveTimeoutSec
-            Write-Host ("[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] HTTP {0} {1} ({2} ms, {3} bytes)" -f $response.StatusCode, $response.StatusDescription, $response.DurationMs, $response.ReceivedBytes) -ForegroundColor Green
-            Write-Utf8File (Join-Path $WorkDir "last_response_status.json") (([ordered]@{
-                ok = $true
-                endpoint = $endpoint
-                statusCode = $response.StatusCode
-                statusDescription = $response.StatusDescription
-                contentType = $response.ContentType
-                receivedBytes = $response.ReceivedBytes
-                durationMs = $response.DurationMs
-                completedAt = (Get-Date).ToString("o")
-            }) | ConvertTo-Json -Depth 10)
-            $answerText = Convert-OpenAIResponseToText $response.Body (-not [bool]$NonStreaming)
-            Write-Host ("ResponseText : {0} chars extracted" -f $answerText.Length) -ForegroundColor DarkGreen
-            return $answerText
-        } catch {
-            $lastError = [string]$_.Exception.Message
-            Write-Host "Endpoint failed: $endpoint" -ForegroundColor Yellow
-            Write-Host $lastError -ForegroundColor Yellow
+        for ($attempt = 0; $attempt -le $MaxRetries; $attempt++) {
+            $headers = Build-ClientHeaders $providerInfo $settings $networkIdentity $attempt
+            $debugHeaders = Get-LoggedHeaders $headers
+            Write-Utf8File (Join-Path $WorkDir "last_request_headers.json") (($debugHeaders | ConvertTo-Json -Depth 30))
+            if ($LogSensitive) { Write-Utf8File (Join-Path $WorkDir "last_request_headers_sensitive.json") (($headers | ConvertTo-Json -Depth 30)) }
 
-            $errorStatusCode = $null
-            $errorStatusDescription = $null
-            $errorDurationMs = $null
-            if ($lastError -match '^HTTP\s+(\d+)\s+(.+?)\s+after\s+(\d+)\s+ms') {
-                $errorStatusCode = [int]$Matches[1]
-                $errorStatusDescription = [string]$Matches[2]
-                $errorDurationMs = [int64]$Matches[3]
+            try {
+                $attemptText = "$($attempt + 1)/$($MaxRetries + 1)"
+                Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] POST $endpoint (attempt $attemptText, retry-count=$attempt)" -ForegroundColor Cyan
+                $response = Invoke-JsonPostUtf8 -Uri $endpoint -Headers $headers -BodyBytes $bodyBytes -TimeoutSeconds $EffectiveTimeoutSec
+                Write-Host ("[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] HTTP {0} {1} ({2} ms, {3} bytes, retry-count={4})" -f $response.StatusCode, $response.StatusDescription, $response.DurationMs, $response.ReceivedBytes, $attempt) -ForegroundColor Green
+                Write-Utf8File (Join-Path $WorkDir "last_response_status.json") (([ordered]@{
+                    ok = $true
+                    endpoint = $endpoint
+                    attempt = ($attempt + 1)
+                    retryCount = $attempt
+                    maxRetries = $MaxRetries
+                    statusCode = $response.StatusCode
+                    statusDescription = $response.StatusDescription
+                    contentType = $response.ContentType
+                    receivedBytes = $response.ReceivedBytes
+                    durationMs = $response.DurationMs
+                    completedAt = (Get-Date).ToString("o")
+                }) | ConvertTo-Json -Depth 10)
+                $answerText = Convert-OpenAIResponseToText $response.Body (-not [bool]$NonStreaming)
+                Write-Host ("ResponseText : {0} chars extracted" -f $answerText.Length) -ForegroundColor DarkGreen
+                return $answerText
+            } catch {
+                $lastError = [string]$_.Exception.Message
+                $retryable = Test-RetryableError $lastError
+                Write-Host "Endpoint failed: $endpoint (attempt $($attempt + 1)/$($MaxRetries + 1), retryable=$retryable)" -ForegroundColor Yellow
+                Write-Host $lastError -ForegroundColor Yellow
+
+                $errorStatusCode = $null
+                $errorStatusDescription = $null
+                $errorDurationMs = $null
+                if ($lastError -match '^HTTP\s+(\d+)\s+(.+?)\s+after\s+(\d+)\s+ms') {
+                    $errorStatusCode = [int]$Matches[1]
+                    $errorStatusDescription = [string]$Matches[2]
+                    $errorDurationMs = [int64]$Matches[3]
+                }
+                Write-Utf8File (Join-Path $WorkDir "last_response_status.json") (([ordered]@{
+                    ok = $false
+                    endpoint = $endpoint
+                    attempt = ($attempt + 1)
+                    retryCount = $attempt
+                    maxRetries = $MaxRetries
+                    retryable = $retryable
+                    statusCode = $errorStatusCode
+                    statusDescription = $errorStatusDescription
+                    durationMs = $errorDurationMs
+                    error = $lastError
+                    completedAt = (Get-Date).ToString("o")
+                }) | ConvertTo-Json -Depth 10)
+
+                if (-not $retryable -or $attempt -ge $MaxRetries) { break }
+
+                $retryNumber = $attempt + 1
+                $delayMs = Get-RetryDelayMilliseconds $retryNumber
+                Write-Host "Retry $retryNumber/$MaxRetries in $(Format-Milliseconds $delayMs)..." -ForegroundColor DarkYellow
+                Start-Sleep -Milliseconds $delayMs
             }
-            Write-Utf8File (Join-Path $WorkDir "last_response_status.json") (([ordered]@{
-                ok = $false
-                endpoint = $endpoint
-                statusCode = $errorStatusCode
-                statusDescription = $errorStatusDescription
-                durationMs = $errorDurationMs
-                error = $lastError
-                completedAt = (Get-Date).ToString("o")
-            }) | ConvertTo-Json -Depth 10)
         }
     }
     throw "모든 endpoint 호출 실패. 마지막 오류: $lastError"
@@ -1121,6 +1186,7 @@ $settings = $settingsRaw | ConvertFrom-Json
 $providerInfo = Get-SettingsProvider $settings $ProviderName $ModelName
 $EffectiveTimeoutSec = Get-EffectiveTimeoutSeconds $providerInfo
 $intervalPlan = Get-IntervalPlan
+Assert-RetryConfig
 $networkIdentity = $null
 if ($LoopDiagnosticHeaders) {
     $networkIdentity = Get-ClientNetworkIdentity $providerInfo.BaseUrl
@@ -1161,6 +1227,7 @@ if ($LoopDiagnosticHeaders) {
 Write-Host "CompatBody   : $CompatBody"
 Write-Host "WireMode     : Qwen Code OpenAI SDK-like headers/body"
 Write-Host "Stream       : $(-not [bool]$NonStreaming)"
+Write-Host "Retry        : max $MaxRetries, backoff $RetryInitialDelaySeconds-$RetryMaxDelaySeconds sec"
 Write-Host "HeaderLog    : $(if ($MaskSensitiveLogs -and -not $LogSensitive) { 'masked' } else { 'unmasked' })"
 Write-Host "QuestionSrc  : $($initialQuestion.Source)"
 $answerPreviewText = if ($NoAnswerPreview) { "disabled" } else { "$AnswerPreviewLines lines / $AnswerPreviewChars chars" }
@@ -1196,6 +1263,13 @@ $settingsSummary = [ordered]@{
     compatBody = [bool]$CompatBody
     stream = (-not [bool]$NonStreaming)
     timeoutSec = $EffectiveTimeoutSec
+    retry = [ordered]@{
+        maxRetries = $MaxRetries
+        retryInitialDelaySeconds = $RetryInitialDelaySeconds
+        retryMaxDelaySeconds = $RetryMaxDelaySeconds
+        retryableStatusCodes = @("408", "409", "429", "5xx")
+        note = "Retries transport failures and HTTP 408/409/429/5xx. HTTP 400/401/403/404 are not retried."
+    }
     bannerEnabled = (-not [bool]$NoBanner)
     answerPreview = [ordered]@{
         enabled = (-not [bool]$NoAnswerPreview)

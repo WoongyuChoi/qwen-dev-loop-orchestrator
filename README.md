@@ -40,6 +40,8 @@ Windows 11에서 Qwen Code용 `settings.json`을 기반으로 Qwen/OpenAI-compat
 
 응답을 받은 뒤에는 `ANSWER PREVIEW`로 실제 답변 본문 앞부분을 기본 4줄/1000자까지 CMD에 보여줍니다. 전체 답변은 `transcript.md`와 `transcript.jsonl`에 저장됩니다. preview가 너무 길거나 불필요하면 `-AnswerPreviewLines`, `-AnswerPreviewChars`, `-NoAnswerPreview`로 조정합니다.
 
+통신 실패 시 기본 `-MaxRetries 3`으로 즉시 재시도합니다. 네트워크/타임아웃 오류와 HTTP `408`, `409`, `429`, `5xx`는 retry 대상이고, `400`, `401`, `403`, `404`처럼 요청/인증/경로가 틀린 오류는 같은 endpoint에서 반복해도 회복 가능성이 낮아 재시도하지 않습니다. 각 retry 요청의 `X-Stainless-Retry-Count` header는 `0`, `1`, `2`, `3`처럼 실제 시도 횟수에 맞춰 증가합니다.
+
 ## 호출 간격
 
 기본 루프는 고정 10분 타이머가 아니라 `-MinIntervalMinutes 8 -MaxIntervalMinutes 15` 범위에서 매 호출 후 새 랜덤 대기시간을 뽑습니다. 예를 들어 한 번 호출한 뒤 11분 20초를 기다렸다면, 다음 호출 뒤에는 다시 8-15분 범위에서 새 값을 뽑습니다.

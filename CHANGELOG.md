@@ -20,6 +20,7 @@
 - 기본 전송은 Qwen Code CLI처럼 `X-Stainless-*`/`QwenCode/<version>` header와 streaming body를 사용.
 - client identity header는 기본 전송하지 않고 `-LoopDiagnosticHeaders`에서만 동적으로 전송.
 - CMD 시작 화면에 `Qwen Loop Scheduler` ASCII 배너와 작은 터미널 아바타를 표시.
+- 통신 실패 시 기본 3회 즉시 retry를 수행하고 `X-Stainless-Retry-Count`를 실제 시도 횟수에 맞게 증가.
 - 기본 루프 간격은 매 호출 후 8-15분 사이 랜덤 대기시간을 새로 샘플링.
 - 대기 중 CMD 같은 줄 countdown으로 남은 시간과 다음 호출 예정 시각을 표시.
 - 실제 응답 수신 후 CMD에 답변 본문 preview와 다음 질문, 저장 경로, 사이클 완료 상태를 표시.
