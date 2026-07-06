@@ -131,6 +131,8 @@ function Test-ProtectedWorkFile([string]$Root, [string]$FileFullName) {
         "last_turn.txt",
         "transcript.md",
         "transcript.jsonl",
+        "run_history.md",
+        "run_history.jsonl",
         "error.log",
         "settings_effective_summary.json",
         "last_request_headers.json",
@@ -780,15 +782,50 @@ function Format-IntervalDuration([int]$seconds) {
     return "$minutes min $remainingSeconds sec ($seconds sec)"
 }
 
+function Format-CountdownDuration([int]$seconds) {
+    if ($seconds -lt 0) { $seconds = 0 }
+
+    $span = [TimeSpan]::FromSeconds($seconds)
+    if ($span.TotalHours -ge 1) {
+        return "{0:00}:{1:00}:{2:00}" -f [int][Math]::Floor($span.TotalHours), $span.Minutes, $span.Seconds
+    }
+    return "{0:00}:{1:00}" -f $span.Minutes, $span.Seconds
+}
+
+function Get-ConsoleLineLimit() {
+    $widths = New-Object System.Collections.Generic.List[int]
+    try {
+        if ([Console]::BufferWidth -gt 0) { $widths.Add([int][Console]::BufferWidth) }
+    } catch { }
+    try {
+        if ([Console]::WindowWidth -gt 0) { $widths.Add([int][Console]::WindowWidth) }
+    } catch { }
+
+    $width = 80
+    if ($widths.Count -gt 0) {
+        $width = [int](($widths | Measure-Object -Minimum).Minimum)
+    }
+
+    return [Math]::Max(20, [Math]::Min(60, $width - 2))
+}
+
+function Get-SafeConsoleLine([string]$Line) {
+    $maxLength = Get-ConsoleLineLimit
+
+    if ($Line.Length -le $maxLength) { return $Line }
+    if ($maxLength -le 3) { return $Line.Substring(0, $maxLength) }
+    return ($Line.Substring(0, $maxLength - 3) + "...")
+}
+
 function Wait-WithCountdown([int]$seconds, $intervalPlan) {
     if ($seconds -le 0) { return }
     if ($CountdownRefreshSeconds -le 0) { throw "CountdownRefreshSeconds는 1 이상이어야 합니다." }
 
     $nextAt = (Get-Date).AddSeconds($seconds)
-    $modeSuffix = if ($intervalPlan.Mode -eq "random") { "next wait randomized after next request" } else { "fixed interval" }
+    $modeSuffix = if ($intervalPlan.Mode -eq "random") { "random" } else { "fixed" }
 
     if ($NoCountdown) {
-        Write-Host "`nWaiting $(Format-IntervalDuration $seconds). Next request around $($nextAt.ToString('HH:mm:ss')). $modeSuffix. Ctrl+C to stop." -ForegroundColor DarkGray
+        Write-Host "`nWait $(Format-CountdownDuration $seconds) ($(Format-IntervalDuration $seconds)); next $($nextAt.ToString('HH:mm:ss')); $modeSuffix; Ctrl+C to stop." -ForegroundColor DarkGray
         Start-Sleep -Seconds $seconds
         return
     }
@@ -799,8 +836,9 @@ function Wait-WithCountdown([int]$seconds, $intervalPlan) {
         $remaining = [int][Math]::Ceiling(($nextAt - (Get-Date)).TotalSeconds)
         if ($remaining -lt 0) { $remaining = 0 }
 
-        $line = "Waiting $(Format-IntervalDuration $remaining) | next request around $($nextAt.ToString('HH:mm:ss')) | $modeSuffix | Ctrl+C to stop"
-        $paddingLength = [Math]::Max(0, $lastLength - $line.Length)
+        $lineLimit = Get-ConsoleLineLimit
+        $line = Get-SafeConsoleLine ("Wait $(Format-CountdownDuration $remaining) (${remaining}s) | next $($nextAt.ToString('HH:mm:ss')) | $modeSuffix | Ctrl+C")
+        $paddingLength = [Math]::Max(0, ([Math]::Min($lastLength, $lineLimit) - $line.Length))
         $padding = if ($paddingLength -gt 0) { " " * $paddingLength } else { "" }
         [Console]::Write("`r$line$padding")
         $lastLength = $line.Length
@@ -809,6 +847,105 @@ function Wait-WithCountdown([int]$seconds, $intervalPlan) {
         Start-Sleep -Seconds ([Math]::Min($CountdownRefreshSeconds, $remaining))
     }
     [Console]::WriteLine("")
+}
+
+function Format-HistoryDate($DateValue) {
+    if ($null -eq $DateValue) { return "" }
+    try { return ([datetime]$DateValue).ToString("yyyy-MM-dd HH:mm:ss") } catch { return "" }
+}
+
+function Format-HistoryDuration([Nullable[double]]$Seconds) {
+    if ($null -eq $Seconds) { return "" }
+    if ($Seconds -lt 1) { return ("{0:N0} ms" -f ($Seconds * 1000)) }
+    if ($Seconds -lt 60) { return ("{0:N1} sec" -f $Seconds) }
+    return (Format-IntervalDuration ([int][Math]::Round($Seconds)))
+}
+
+function Get-HistoryPreview([string]$Text, [int]$MaxChars) {
+    if ([string]::IsNullOrWhiteSpace($Text)) { return "" }
+    $singleLine = (($Text -replace '\r?\n', ' ') -replace '\s+', ' ').Trim()
+    if ($singleLine.Length -le $MaxChars) { return $singleLine }
+    return ($singleLine.Substring(0, [Math]::Max(0, $MaxChars - 3)) + "...")
+}
+
+function Escape-MarkdownTableCell([string]$Text) {
+    if ($null -eq $Text) { return "" }
+    return (([string]$Text) -replace '\|', '\|' -replace '\r?\n', '<br>')
+}
+
+function Ensure-RunHistoryMarkdown([string]$Path) {
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+        $item = Get-Item -LiteralPath $Path -ErrorAction SilentlyContinue
+        if ($item -and $item.Length -gt 0) { return }
+    }
+
+    $header = @"
+# Qwen Loop Run History
+
+이 파일은 실행 생명주기 확인용 기록입니다. `transcript.md`가 답변 내용 중심이라면, 이 파일은 언제 쐈고 언제 응답이 왔고 다음 실행 예정이 언제였는지 보는 테이블입니다.
+
+| Seq | Session | Status | Started | Request | Response | Elapsed | HTTP | Next Wait | Next Run | Question | Next Question | Note |
+|---:|---:|---|---|---|---|---:|---|---|---|---|---|---|
+"@
+    Write-Utf8File $Path ($header + "`n")
+}
+
+function Get-NextRunHistorySequence([string]$JsonlPath) {
+    if (!(Test-Path -LiteralPath $JsonlPath -PathType Leaf)) { return 1 }
+
+    $lines = @(Get-Content -LiteralPath $JsonlPath -Encoding UTF8 | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+        try {
+            $record = $lines[$i] | ConvertFrom-Json
+            $seq = Get-JsonProperty $record "seq"
+            if ($null -ne $seq) { return ([int]$seq + 1) }
+        } catch { }
+    }
+    return ($lines.Count + 1)
+}
+
+function Append-RunHistory($Record, [string]$MarkdownPath, [string]$JsonlPath) {
+    Ensure-RunHistoryMarkdown $MarkdownPath
+
+    $elapsed = ""
+    if ($Record.startedAt -and $Record.completedAt) {
+        try { $elapsed = Format-HistoryDuration (([datetime]$Record.completedAt - [datetime]$Record.startedAt).TotalSeconds) } catch { }
+    }
+
+    $http = ""
+    if ($Record.httpStatusCode) {
+        $http = "$($Record.httpStatusCode) $($Record.httpStatusDescription)".Trim()
+    }
+
+    $nextWait = ""
+    if ($Record.nextWaitSeconds -ne $null) { $nextWait = Format-IntervalDuration ([int]$Record.nextWaitSeconds) }
+
+    $note = ""
+    if ($Record.error) {
+        $note = Get-HistoryPreview ([string]$Record.error) 80
+    } elseif ($Record.answerChars -ne $null) {
+        $note = "answer=$($Record.answerChars) chars"
+        if ($Record.outputTokens -ne $null) { $note += ", outputTokens=$($Record.outputTokens)" }
+    }
+
+    $cells = @(
+        $Record.seq,
+        $Record.sessionRun,
+        $Record.status,
+        (Format-HistoryDate $Record.startedAt),
+        (Format-HistoryDate $Record.requestAt),
+        (Format-HistoryDate $Record.completedAt),
+        $elapsed,
+        $http,
+        $nextWait,
+        (Format-HistoryDate $Record.nextRunAt),
+        (Get-HistoryPreview ([string]$Record.question) 70),
+        (Get-HistoryPreview ([string]$Record.nextQuestion) 70),
+        $note
+    ) | ForEach-Object { Escape-MarkdownTableCell ([string]$_) }
+
+    Append-Utf8File $MarkdownPath (("| " + ($cells -join " | ") + " |") + "`n")
+    Append-Utf8File $JsonlPath (($Record | ConvertTo-Json -Compress -Depth 30) + "`n")
 }
 
 function Expand-PathInput([string]$PathText) {
@@ -1631,6 +1768,15 @@ function Invoke-QwenChat($providerInfo, $settings, $networkIdentity, [string]$sy
                     Text = $answerText
                     Usage = $tokenUsage
                     TokenUse = $tokenProfile
+                    Endpoint = $endpoint
+                    Attempt = ($attempt + 1)
+                    RetryCount = $attempt
+                    StatusCode = $response.StatusCode
+                    StatusDescription = $response.StatusDescription
+                    ContentType = $response.ContentType
+                    ReceivedBytes = $response.ReceivedBytes
+                    DurationMs = $response.DurationMs
+                    CompletedAt = (Get-Date)
                 }
             } catch {
                 $lastError = [string]$_.Exception.Message
@@ -1692,6 +1838,8 @@ $nextQuestionPath = Join-Path $WorkDir "next_question.txt"
 $lastTurnPath = Join-Path $WorkDir "last_turn.txt"
 $transcriptPath = Join-Path $WorkDir "transcript.md"
 $jsonlPath = Join-Path $WorkDir "transcript.jsonl"
+$runHistoryPath = Join-Path $WorkDir "run_history.md"
+$runHistoryJsonlPath = Join-Path $WorkDir "run_history.jsonl"
 $errorLogPath = Join-Path $WorkDir "error.log"
 
 $initialQuestion = Initialize-NextQuestion $nextQuestionPath $jsonlPath $transcriptPath $lastTurnPath $SeedFile $QuestionBankFile $QuestionTrack
@@ -1854,9 +2002,22 @@ DryRun preview. 이 파일은 API 호출 없이 실제 전송 예정 header/body
 }
 
 $runCount = 0
+$nextRunSequence = Get-NextRunHistorySequence $runHistoryJsonlPath
 while ($true) {
     $runCount++
+    $runSeq = $nextRunSequence
+    $nextRunSequence++
     $started = Get-Date
+    $requestAt = $null
+    $completedAt = $null
+    $runStatus = "error"
+    $errorText = ""
+    $question = ""
+    $nextQuestion = ""
+    $answer = ""
+    $tokenUsage = $null
+    $tokenUse = $null
+    $chatResult = $null
     try {
         $question = (Read-Utf8File $nextQuestionPath).Trim()
         if ([string]::IsNullOrWhiteSpace($question)) { $question = $seedQuestion }
@@ -1888,12 +2049,15 @@ $contextBundle
         Write-Host "`n[$($started.ToString('yyyy-MM-dd HH:mm:ss'))] RUN #$runCount QUESTION:" -ForegroundColor Green
         Write-Host $question
 
+        $requestAt = Get-Date
         $chatResult = Invoke-QwenChat $providerInfo $settings $networkIdentity $systemPrompt $userPrompt
         $answer = [string]$chatResult.Text
         $tokenUsage = $chatResult.Usage
         $tokenUse = $chatResult.TokenUse
         $nextQuestion = Extract-NextQuestion $answer
         $ended = Get-Date
+        $completedAt = $ended
+        $runStatus = "ok"
 
         Write-Utf8File $nextQuestionPath $nextQuestion
 
@@ -1972,7 +2136,9 @@ $answer
         Write-Host "- $(Join-Path $WorkDir 'last_response_status.json')"
         Write-Host "`nRUN #$runCount complete. Full answer saved to transcript.md." -ForegroundColor Green
     } catch {
+        $completedAt = Get-Date
         $msg = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ERROR: $($_.Exception.Message)`n$($_.ScriptStackTrace)`n"
+        $errorText = [string]$_.Exception.Message
         Append-Utf8File $errorLogPath $msg
         Write-Host $msg -ForegroundColor Red
     }
@@ -1980,11 +2146,60 @@ $answer
     $loopCleanup = Invoke-WorkDirCleanup $WorkDir $transcriptPath $jsonlPath $errorLogPath
     Write-WorkDirCleanupStatus $loopCleanup $false
 
-    if ($Once -or ($MaxRuns -gt 0 -and $runCount -ge $MaxRuns)) {
+    $willStop = ($Once -or ($MaxRuns -gt 0 -and $runCount -ge $MaxRuns))
+    $nextWaitSeconds = $null
+    $nextRunAt = $null
+    if (-not $willStop) {
+        $nextWaitSeconds = Get-NextIntervalSeconds $intervalPlan
+        $nextRunAt = (Get-Date).AddSeconds($nextWaitSeconds)
+    }
+
+    $historyInputTokens = $null
+    $historyOutputTokens = $null
+    $historyTotalTokens = $null
+    if ($tokenUsage) {
+        $historyInputTokens = $tokenUsage.inputTokens
+        $historyOutputTokens = $tokenUsage.outputTokens
+        $historyTotalTokens = $tokenUsage.totalTokens
+    }
+
+    $historyRecord = [ordered]@{
+        seq = $runSeq
+        sessionRun = $runCount
+        status = $runStatus
+        startedAt = $started.ToString("o")
+        requestAt = if ($requestAt) { $requestAt.ToString("o") } else { $null }
+        completedAt = if ($completedAt) { $completedAt.ToString("o") } else { $null }
+        nextWaitSeconds = $nextWaitSeconds
+        nextRunAt = if ($nextRunAt) { $nextRunAt.ToString("o") } else { $null }
+        providerType = $providerInfo.Type
+        provider = $providerInfo.ProviderName
+        providerId = $providerInfo.ProviderId
+        baseUrl = $providerInfo.BaseUrl
+        model = $providerInfo.ModelId
+        endpoint = if ($chatResult) { $chatResult.Endpoint } else { $null }
+        httpStatusCode = if ($chatResult) { $chatResult.StatusCode } else { $null }
+        httpStatusDescription = if ($chatResult) { $chatResult.StatusDescription } else { $null }
+        attempt = if ($chatResult) { $chatResult.Attempt } else { $null }
+        retryCount = if ($chatResult) { $chatResult.RetryCount } else { $null }
+        durationMs = if ($chatResult) { $chatResult.DurationMs } else { $null }
+        receivedBytes = if ($chatResult) { $chatResult.ReceivedBytes } else { $null }
+        inputTokens = $historyInputTokens
+        outputTokens = $historyOutputTokens
+        totalTokens = $historyTotalTokens
+        tokenUse = ConvertTo-PlainObject $tokenUse
+        question = $question
+        nextQuestion = $nextQuestion
+        answerChars = if ($answer) { $answer.Length } else { 0 }
+        error = $errorText
+    }
+    Append-RunHistory ([PSCustomObject]$historyRecord) $runHistoryPath $runHistoryJsonlPath
+    Write-Host "RunHistory  : $runHistoryPath" -ForegroundColor DarkGreen
+
+    if ($willStop) {
         Write-Host "`n지정된 실행 횟수만큼 실행 후 종료합니다." -ForegroundColor DarkGray
         break
     }
 
-    $nextWaitSeconds = Get-NextIntervalSeconds $intervalPlan
     Wait-WithCountdown $nextWaitSeconds $intervalPlan
 }

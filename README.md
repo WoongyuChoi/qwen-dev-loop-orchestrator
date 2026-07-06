@@ -41,6 +41,8 @@ Windows 11에서 Qwen Code용 `settings.json`을 기반으로 Qwen/OpenAI-compat
 
 응답을 받은 뒤에는 `ANSWER PREVIEW`로 실제 답변 본문 앞부분을 기본 4줄/1000자까지 CMD에 보여줍니다. 전체 답변은 `transcript.md`와 `transcript.jsonl`에 저장됩니다. preview가 너무 길거나 불필요하면 `-AnswerPreviewLines`, `-AnswerPreviewChars`, `-NoAnswerPreview`로 조정합니다.
 
+각 호출 생명주기는 `run_history.md`와 `run_history.jsonl`에 별도로 누적됩니다. `transcript`가 답변 본문 중심이라면, `run_history`는 `Seq`, `Session`, `Status`, `Started`, `Request`, `Response`, `HTTP`, `Next Wait`, `Next Run`을 테이블처럼 남겨 “정말 다음 순번까지 쐈는지” 확인하는 용도입니다.
+
 서버가 OpenAI-compatible `usage` 값을 반환하면 CMD에 `TokenUse`도 표시합니다. 기본 기준은 출력 토큰이 `1000` 미만이면 초록색 `light`, `1000-3999`면 노란색 `balanced`, `4000` 이상이면 마젠타색 `rich`입니다. 이 루프는 깊은 답변을 의도하므로 `rich`는 경고가 아니라 분석량이 충분하다는 신호에 가깝고, 대신 응답 시간과 비용은 늘 수 있습니다. 기준은 `-TokenLowThreshold`, `-TokenRichThreshold`로 조정합니다.
 
 통신 실패 시 기본 `-MaxRetries 3`으로 즉시 재시도합니다. 네트워크/타임아웃 오류와 HTTP `408`, `409`, `429`, `5xx`는 retry 대상이고, `400`, `401`, `403`, `404`처럼 요청/인증/경로가 틀린 오류는 같은 endpoint에서 반복해도 회복 가능성이 낮아 재시도하지 않습니다. 각 retry 요청의 `X-Stainless-Retry-Count` header는 `0`, `1`, `2`, `3`처럼 실제 시도 횟수에 맞춰 증가합니다.
@@ -53,7 +55,7 @@ Windows 11에서 Qwen Code용 `settings.json`을 기반으로 Qwen/OpenAI-compat
 
 기존처럼 고정 간격 테스트가 필요하면 `qwen-loop.ps1`에 `-IntervalSeconds 600`만 단독으로 넘깁니다. `-MinIntervalMinutes`/`-MaxIntervalMinutes`를 함께 넘기면 랜덤 범위가 우선입니다.
 
-대기 중에는 CMD의 같은 줄에서 남은 시간과 다음 호출 예정 시각이 기본 1초마다 갱신됩니다. 너무 번잡하면 `-CountdownRefreshSeconds 60`으로 1분마다 갱신하거나, `-NoCountdown`으로 예전처럼 한 번만 출력하고 조용히 대기할 수 있습니다.
+대기 중에는 CMD의 같은 줄에서 `Wait 07:30 (450s) | next 15:23:29 | random | Ctrl+C`처럼 짧은 countdown이 기본 1초마다 갱신됩니다. 너무 번잡하면 `-CountdownRefreshSeconds 60`으로 1분마다 갱신하거나, `-NoCountdown`으로 예전처럼 한 번만 출력하고 조용히 대기할 수 있습니다.
 
 ## 먼저 볼 파일
 
@@ -197,7 +199,8 @@ Saved:
 - ...\qwen-loop-data\last_response_status.json
 
 RUN #1 complete. Full answer saved to transcript.md.
-Waiting 11 min 50 sec | next request around 14:02:32 | next wait will be randomized again after the next request | Ctrl+C to stop
+RunHistory  : ...\qwen-loop-data\run_history.md
+Wait 11:50 (710s) | next 14:02:32 | random | Ctrl+C
 ```
 
 통신이 불안정하면 retry 대상 오류만 다시 시도합니다. `404`나 인증 오류처럼 같은 요청을 반복해도 해결되지 않는 오류는 retry 없이 실패 로그를 남깁니다.
@@ -231,14 +234,39 @@ next_question.txt
 last_turn.txt
 transcript.md
 transcript.jsonl
+run_history.md
+run_history.jsonl
 error.log
 ```
+
+## run_history 예시
+
+`run_history.md`는 콘솔을 계속 보고 있지 않아도 호출 흐름을 확인할 수 있는 실행 일지입니다. `Seq`는 `run_history.jsonl`을 기준으로 계속 증가하는 누적 번호이고, `Session`은 현재 프로그램 실행 창 안의 `RUN #1`, `RUN #2` 번호입니다.
+
+```text
+# Qwen Loop Run History
+
+| Seq | Session | Status | Started | Request | Response | Elapsed | HTTP | Next Wait | Next Run | Question | Next Question | Note |
+|---:|---:|---|---|---|---|---:|---|---|---|---|---|---|
+| 1 | 1 | ok | 2026-07-06 15:36:32 | 2026-07-06 15:36:32 | 2026-07-06 15:36:32 | 334 ms | 200 OK | 0 min 1 sec (1 sec) | 2026-07-06 15:36:33 | 업무용 React 화면에서 키보드 접근성... | history-follow-up-1 | answer=53 chars, outputTokens=201 |
+| 2 | 2 | ok | 2026-07-06 15:36:34 | 2026-07-06 15:36:34 | 2026-07-06 15:36:34 | 130 ms | 200 OK | 11 min 50 sec (710 sec) | 2026-07-06 15:48:24 | history-follow-up-1 | history-follow-up-2 | answer=53 chars, outputTokens=202 |
+| 3 | 3 | error | 2026-07-06 15:48:24 | 2026-07-06 15:48:24 | 2026-07-06 15:50:24 | 2 min (120 sec) |  | 8 min 4 sec (484 sec) | 2026-07-06 15:58:28 | history-follow-up-2 |  | 모든 endpoint 호출 실패... |
+```
+
+이 예시에서 볼 수 있는 것:
+
+- `Seq 1`, `Seq 2`가 모두 `ok`이고 HTTP가 `200 OK`이면 실제 요청/응답이 정상 완료된 것입니다.
+- `Seq 2`의 `Question`이 `Seq 1`의 `Next Question`과 같으면 다음 질문 이어달리기가 정상입니다.
+- 마지막 실행이 `-Once`나 `-MaxRuns`로 끝나는 경우에는 `Next Wait`/`Next Run`이 비어 있을 수 있습니다.
+- `Status`가 `error`이면 `HTTP`가 비어 있거나 실패 코드가 들어가고, `Note`에 오류 요약이 남습니다.
+
+`run_history.jsonl`은 같은 내용을 한 줄 JSON으로 저장합니다. 사람이 볼 때는 `run_history.md`, 나중에 필터링하거나 집계할 때는 `run_history.jsonl`을 보면 됩니다.
 
 ## 문서/산출물 정리 기준
 
 현재 유지하는 기준 문서는 `README.md`, `AGENTS.md`, `CHANGELOG.md`입니다. 과거 대화 요약, 일회성 인수인계 문서, 이전 배포 zip/diff 같은 reference artifact는 현재 실행 기준과 충돌하거나 중복되면 보관하지 않습니다.
 
-`qwen-loop-data`는 예외입니다. 이 폴더는 실행할 때마다 생기는 상태/검증 출력이므로 git에 올리지 않지만, 루프 재시작과 API 검증에는 실제로 사용됩니다.
+`qwen-loop-data`는 예외입니다. 이 폴더는 실행할 때마다 생기는 상태/검증 출력이므로 git에 올리지 않지만, 루프 재시작과 API 검증에는 실제로 사용됩니다. 특히 `run_history.md`는 호출 성공/실패와 다음 실행 예정 시각을 빠르게 보는 운영 일지 역할을 합니다.
 
 ## 질문 루프
 
