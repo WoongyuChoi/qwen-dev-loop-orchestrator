@@ -4,6 +4,8 @@ Windows 11에서 Qwen Code용 `settings.json`을 기반으로 Qwen/OpenAI-compat
 
 이 프로젝트는 기존 `qwen_loop_scheduler_v4_settings_first` 최신 파일을 기반으로 따로 분리한 Codex 작업용 프로젝트입니다.
 
+더블클릭 실행 시 CMD 상단에 `Qwen Loop Scheduler` ASCII 배너와 작은 터미널 아바타가 표시됩니다. 조용한 로그가 필요하면 `qwen-loop.ps1` 실행 옵션에 `-NoBanner`를 추가합니다.
+
 ## 핵심 목표
 
 - `%USERPROFILE%\.qwen\settings.json` 설정을 최대한 존중한다.

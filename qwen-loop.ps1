@@ -30,6 +30,7 @@
     [switch]$UseSchedulerSamplingDefaults,
     [switch]$LoopDiagnosticHeaders,
     [switch]$NoClientIdentityHeaders,
+    [switch]$NoBanner,
     [switch]$NoCountdown,
     [switch]$NoAnswerPreview,
     [switch]$MaskSensitiveLogs,
@@ -131,6 +132,28 @@ function Remove-HeaderKey($headers, [string]$name) {
 function Set-HeaderLikeSdk($headers, [string]$name, $value) {
     Remove-HeaderKey $headers $name
     if ($null -ne $value) { $headers[$name] = [string]$value }
+}
+
+function Write-StartupBanner() {
+    if ($NoBanner) { return }
+
+    Write-Host ""
+    Write-Host "   ____                         __                         " -ForegroundColor DarkYellow
+    Write-Host "  / __ \__      _____  ____    / /   ____  ____  ____     " -ForegroundColor Yellow
+    Write-Host " / / / / | /| / / _ \/ __ \  / /   / __ \/ __ \/ __ \    " -ForegroundColor Yellow
+    Write-Host "/ /_/ /| |/ |/ /  __/ / / / / /___/ /_/ / /_/ / /_/ /    " -ForegroundColor Yellow
+    Write-Host "\___\_\|__/|__/\___/_/ /_/ /_____/\____/\____/ .___/     " -ForegroundColor DarkYellow
+    Write-Host "                                             /_/          " -ForegroundColor DarkYellow
+    Write-Host "                 S C H E D U L E R   v4                  " -ForegroundColor DarkYellow
+    Write-Host "       +------------------------------------------------+" -ForegroundColor DarkGray
+    Write-Host "       | settings-first OpenAI-compatible API runner    |" -ForegroundColor Yellow
+    Write-Host "       | random loop / visible status / transcript log  |" -ForegroundColor Yellow
+    Write-Host "       +--------------------------.---------------------+" -ForegroundColor DarkGray
+    Write-Host "                                  |" -ForegroundColor DarkGray
+    Write-Host "                              [ QWEN ]" -ForegroundColor DarkYellow
+    Write-Host "                               (o_o)" -ForegroundColor Yellow
+    Write-Host "                            ---/|_|\---" -ForegroundColor DarkYellow
+    Write-Host ""
 }
 
 function Get-PlatformUserAgent() {
@@ -1114,7 +1137,8 @@ $seedQuestion = $initialQuestion.Question
 
 $systemPrompt = Build-SettingsAwareSystemPrompt $settings $providerInfo
 
-Write-Host "=== Qwen Loop Scheduler v4 SETTINGS-FIRST ===" -ForegroundColor Green
+Write-StartupBanner
+Write-Host "=== Runtime Summary: SETTINGS-FIRST ===" -ForegroundColor Green
 Write-Host "SettingsPath : $SettingsPath"
 Write-Host "ProviderType : $($providerInfo.Type)"
 Write-Host "ProviderName : $($providerInfo.ProviderName)"
@@ -1172,6 +1196,7 @@ $settingsSummary = [ordered]@{
     compatBody = [bool]$CompatBody
     stream = (-not [bool]$NonStreaming)
     timeoutSec = $EffectiveTimeoutSec
+    bannerEnabled = (-not [bool]$NoBanner)
     answerPreview = [ordered]@{
         enabled = (-not [bool]$NoAnswerPreview)
         lines = $AnswerPreviewLines
