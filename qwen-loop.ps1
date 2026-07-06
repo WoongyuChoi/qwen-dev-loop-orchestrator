@@ -8,14 +8,22 @@
     [int]$IntervalSeconds = 600,
     [int]$MaxTokens = 8192,
     [double]$Temperature = 0.35,
-    [int]$TimeoutSec = 900,
+    [int]$TimeoutSec = 120,
     [int]$MaxContextChars = 30000,
     [int]$LastTurnChars = 12000,
     [int]$MaxRuns = 0,
+    [string]$QwenCodeVersion = "",
+    [string]$OpenAISdkVersion = "5.11.0",
+    [string]$NodeRuntimeVersion = "",
     [switch]$Once,
     [switch]$DryRun,
     [switch]$CompatBody,
+    [switch]$NonStreaming,
+    [switch]$EndpointFallbacks,
+    [switch]$UseSchedulerSamplingDefaults,
+    [switch]$LoopDiagnosticHeaders,
     [switch]$NoClientIdentityHeaders,
+    [switch]$MaskSensitiveLogs,
     [switch]$LogSensitive
 )
 
@@ -84,6 +92,150 @@ function Mask-Secret([string]$value) {
     return ($value.Substring(0,2) + "****" + $value.Substring($value.Length-2))
 }
 
+function Test-QuotedEmptySecret([string]$value) {
+    if ($null -eq $value) { return $false }
+    $trimmed = $value.Trim()
+    return ($trimmed -eq '""' -or $trimmed -eq "''")
+}
+
+function Is-SensitiveHeaderName([string]$name) {
+    if ([string]::IsNullOrWhiteSpace($name)) { return $false }
+    if ($name -match '(?i)(source|envkey)$') { return $false }
+    return ($name -match '(?i)(authorization|api[-_]?key|token|secret|credential|cookie)')
+}
+
+function Mask-HeaderValue([string]$name, [string]$value) {
+    if ($name -ieq "Authorization" -and $value -match '^(Bearer\s+)(.+)$') {
+        return ($Matches[1] + (Mask-Secret $Matches[2]))
+    }
+    return Mask-Secret $value
+}
+
+function Remove-HeaderKey($headers, [string]$name) {
+    foreach ($key in @($headers.Keys)) {
+        if ($key -ieq $name) { $headers.Remove($key) }
+    }
+}
+
+function Set-HeaderLikeSdk($headers, [string]$name, $value) {
+    Remove-HeaderKey $headers $name
+    if ($null -ne $value) { $headers[$name] = [string]$value }
+}
+
+function Get-PlatformUserAgent() {
+    $arch = if ([Environment]::Is64BitProcess) { "x64" } else { "x86" }
+    $version = $QwenCodeVersion
+    if ([string]::IsNullOrWhiteSpace($version)) {
+        $version = [Environment]::GetEnvironmentVariable("QWEN_CODE_VERSION")
+    }
+    if ([string]::IsNullOrWhiteSpace($version)) { $version = "unknown" }
+    return "QwenCode/$version (win32; $arch)"
+}
+
+function Get-NodeLikeRuntimeVersion() {
+    if (-not [string]::IsNullOrWhiteSpace($NodeRuntimeVersion)) { return $NodeRuntimeVersion }
+
+    $fromEnv = [Environment]::GetEnvironmentVariable("QWEN_CODE_NODE_VERSION")
+    if (-not [string]::IsNullOrWhiteSpace($fromEnv)) { return $fromEnv }
+
+    return "unknown"
+}
+
+function Get-StainlessOsName() {
+    return "Windows"
+}
+
+function Get-StainlessArchName() {
+    if ([Environment]::Is64BitProcess) { return "x64" }
+    return "x32"
+}
+
+function Get-ObjectProperties($obj) {
+    if ($null -eq $obj -or $null -eq $obj.PSObject) { return @() }
+    return @($obj.PSObject.Properties)
+}
+
+function Get-GenerationConfig($providerInfo) {
+    if ($null -eq $providerInfo -or $null -eq $providerInfo.ProviderRaw) { return $null }
+    return Get-JsonProperty $providerInfo.ProviderRaw "generationConfig"
+}
+
+function Get-ProviderModels($modelProviders, [string]$selectedType) {
+    $selectedProviders = Get-JsonProperty $modelProviders $selectedType
+    if ($null -eq $selectedProviders) { return @() }
+
+    # Qwen Code source currently treats modelProviders.<authType> as ModelConfig[].
+    # Some docs/examples show { protocol, models }, so accept that shape too.
+    if ($selectedProviders -is [System.Management.Automation.PSCustomObject]) {
+        $models = Get-JsonProperty $selectedProviders "models"
+        if ($models) { return @($models) }
+    }
+    return @($selectedProviders)
+}
+
+function Read-DotEnvFile([string]$Path) {
+    $result = [ordered]@{}
+    if ([string]::IsNullOrWhiteSpace($Path) -or !(Test-Path -LiteralPath $Path -PathType Leaf)) { return $result }
+
+    foreach ($line in (Get-Content -LiteralPath $Path -Encoding UTF8)) {
+        $trimmed = Remove-BomAndTrim $line
+        if ([string]::IsNullOrWhiteSpace($trimmed) -or $trimmed.StartsWith("#")) { continue }
+        if ($trimmed -notmatch '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$') { continue }
+
+        $key = $Matches[1]
+        $value = $Matches[2].Trim()
+        if (($value.StartsWith('"') -and $value.EndsWith('"')) -or ($value.StartsWith("'") -and $value.EndsWith("'"))) {
+            if ($value.Length -ge 2) { $value = $value.Substring(1, $value.Length - 2) }
+        }
+        $result[$key] = $value
+    }
+    return $result
+}
+
+function Get-DotEnvCandidates([string]$settingsPath) {
+    $candidates = New-Object System.Collections.Generic.List[string]
+    $scriptQwenEnv = Join-Path $PSScriptRoot ".qwen\.env"
+    $scriptEnv = Join-Path $PSScriptRoot ".env"
+    $candidates.Add($scriptQwenEnv)
+    $candidates.Add($scriptEnv)
+
+    $settingsDir = Split-Path -Parent (Expand-PathInput $settingsPath)
+    if ($settingsDir) { $candidates.Add((Join-Path $settingsDir ".env")) }
+
+    if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+        $candidates.Add((Join-Path $env:USERPROFILE ".qwen\.env"))
+        $candidates.Add((Join-Path $env:USERPROFILE ".env"))
+    }
+
+    return $candidates | Select-Object -Unique
+}
+
+function Get-ApiKeyFromEnvironment([string]$envKeyName, $settings, [string]$settingsPath) {
+    if ([string]::IsNullOrWhiteSpace($envKeyName)) {
+        return [PSCustomObject]@{ Value = $null; Source = "none" }
+    }
+
+    $apiKey = [Environment]::GetEnvironmentVariable($envKeyName)
+    if (-not [string]::IsNullOrEmpty($apiKey)) {
+        return [PSCustomObject]@{ Value = $apiKey; Source = "os-environment" }
+    }
+
+    foreach ($candidate in (Get-DotEnvCandidates $settingsPath)) {
+        $dotenv = Read-DotEnvFile $candidate
+        if ($dotenv.Contains($envKeyName) -and -not [string]::IsNullOrEmpty([string]$dotenv[$envKeyName])) {
+            return [PSCustomObject]@{ Value = [string]$dotenv[$envKeyName]; Source = ".env:$candidate" }
+        }
+    }
+
+    $envObj = Get-JsonProperty $settings "env"
+    $settingsEnvValue = Get-JsonProperty $envObj $envKeyName
+    if ($null -ne $settingsEnvValue -and -not [string]::IsNullOrEmpty([string]$settingsEnvValue)) {
+        return [PSCustomObject]@{ Value = [string]$settingsEnvValue; Source = "settings.json/env" }
+    }
+
+    return [PSCustomObject]@{ Value = $null; Source = "none" }
+}
+
 function Get-SettingsProvider($settings, [string]$providerName, [string]$modelNameOverride) {
     $modelProviders = Get-JsonProperty $settings "modelProviders"
     if ($null -eq $modelProviders) { throw "settings.json에서 modelProviders 항목을 찾지 못했습니다." }
@@ -94,8 +246,7 @@ function Get-SettingsProvider($settings, [string]$providerName, [string]$modelNa
     $selectedFromSettings = Get-JsonProperty $auth "selectedType"
     if (-not [string]::IsNullOrWhiteSpace([string]$selectedFromSettings)) { $selectedType = [string]$selectedFromSettings }
 
-    $selectedProviders = Get-JsonProperty $modelProviders $selectedType
-    $providers = @($selectedProviders)
+    $providers = @(Get-ProviderModels $modelProviders $selectedType)
     if ($providers.Count -eq 0 -or $null -eq $providers[0]) {
         throw "settings.json에서 modelProviders.$selectedType 항목을 찾지 못했습니다."
     }
@@ -121,22 +272,9 @@ function Get-SettingsProvider($settings, [string]$providerName, [string]$modelNa
     if ([string]::IsNullOrWhiteSpace($modelId)) { throw "선택된 provider에 model id/name이 없습니다." }
 
     # IMPORTANT: exact envKey behavior. No dummy normalization.
-    # Priority matches typical client behavior: OS environment variable first, then settings.json env object.
+    # Priority mirrors Qwen Code closely: OS environment, .env candidates, then settings.json env object.
     $envKeyName = [string](Get-JsonProperty $provider "envKey")
-    $apiKey = $null
-    $apiKeySource = "none"
-    if (-not [string]::IsNullOrWhiteSpace($envKeyName)) {
-        $apiKey = [Environment]::GetEnvironmentVariable($envKeyName)
-        if ($null -ne $apiKey) { $apiKeySource = "os-environment" }
-        if ($null -eq $apiKey) {
-            $envObj = Get-JsonProperty $settings "env"
-            $settingsEnvValue = Get-JsonProperty $envObj $envKeyName
-            if ($null -ne $settingsEnvValue) {
-                $apiKey = [string]$settingsEnvValue
-                $apiKeySource = "settings.json/env"
-            }
-        }
-    }
+    $apiKeyResult = Get-ApiKeyFromEnvironment $envKeyName $settings $SettingsPath
 
     return [PSCustomObject]@{
         Type = $selectedType
@@ -145,14 +283,18 @@ function Get-SettingsProvider($settings, [string]$providerName, [string]$modelNa
         ModelId = $modelId
         BaseUrl = $baseUrl
         EnvKey = $envKeyName
-        ApiKey = $apiKey
-        ApiKeySource = $apiKeySource
+        ApiKey = $apiKeyResult.Value
+        ApiKeySource = $apiKeyResult.Source
         ProviderRaw = $provider
     }
 }
 
 function Get-EndpointCandidates([string]$baseUrl) {
     $b = $baseUrl.TrimEnd('/')
+    if (-not $EndpointFallbacks) {
+        return @("$b/chat/completions")
+    }
+
     $candidates = New-Object System.Collections.Generic.List[string]
     if ($b -match '/v1$') {
         $candidates.Add("$b/chat/completions")
@@ -161,6 +303,62 @@ function Get-EndpointCandidates([string]$baseUrl) {
         $candidates.Add("$b/chat/completions")
     }
     return $candidates | Select-Object -Unique
+}
+
+function Normalize-ModelForQwenTokenLimit([string]$model) {
+    $s = ([string]$model).ToLower().Trim()
+    $s = $s -replace '^.*/', ''
+    $parts = $s -split '[|:]'
+    $s = $parts[$parts.Length - 1]
+    $s = $s -replace '\s+', '-'
+    if ($s -notmatch '^qwen-(?:plus|flash|vl-max)-latest$' -and $s -notmatch '^kimi-k2-\d{4}$') {
+        $s = $s -replace '-(?:\d{4,}|\d+x\d+b|v\d+(?:\.\d+)*|latest|exp)$', ''
+    }
+    $s = $s -replace '-(?:\d?bit|int[48]|bf16|fp16|q[45]|quantized)$', ''
+    return $s
+}
+
+function Get-QwenCodeOutputTokenLimit([string]$model) {
+    $envMaxTokens = [Environment]::GetEnvironmentVariable("QWEN_CODE_MAX_OUTPUT_TOKENS")
+    if (-not [string]::IsNullOrWhiteSpace($envMaxTokens) -and $envMaxTokens -match '^\d+$') {
+        $parsed = [int64]$envMaxTokens
+        if ($parsed -gt 0 -and $parsed -le [int]::MaxValue) { return [int]$parsed }
+    }
+
+    $norm = Normalize-ModelForQwenTokenLimit $model
+    if ($norm -match '^gemini-3') { return 65536 }
+    if ($norm -match '^gemini-') { return 8192 }
+    if ($norm -match '^gpt-5') { return 131072 }
+    if ($norm -match '^gpt-') { return 16384 }
+    if ($norm -match '^o\d') { return 131072 }
+    if ($norm -match '^claude-opus-4-6') { return 131072 }
+    if ($norm -match '^claude-sonnet-4-6') { return 65536 }
+    if ($norm -match '^claude-') { return 65536 }
+    if ($norm -match '^qwen3\.\d') { return 65536 }
+    if ($norm -match '^coder-model$') { return 65536 }
+    if ($norm -match '^qwen') { return 32000 }
+    if ($norm -match '^deepseek-v4') { return 384000 }
+    if ($norm -match '^deepseek-reasoner' -or $norm -match '^deepseek-r1') { return 65536 }
+    if ($norm -match '^deepseek-chat') { return 8192 }
+    if ($norm -match '^glm-5(?:\.\d+)?(?:-|$)') { return 131072 }
+    if ($norm -match '^glm-4\.7') { return 16384 }
+    if ($norm -match '^minimax-m2\.5') { return 65536 }
+    if ($norm -match '^kimi-k2\.5') { return 32000 }
+    return 32000
+}
+
+function Get-EffectiveTimeoutSeconds($providerInfo) {
+    $generationConfig = Get-GenerationConfig $providerInfo
+    $timeoutMs = Get-JsonProperty $generationConfig "timeout"
+    if ($null -ne $timeoutMs) {
+        try {
+            $numericTimeoutMs = [double]$timeoutMs
+            if ($numericTimeoutMs -gt 0) {
+                return [int][Math]::Ceiling($numericTimeoutMs / 1000)
+            }
+        } catch { }
+    }
+    return $TimeoutSec
 }
 
 function Expand-PathInput([string]$PathText) {
@@ -306,35 +504,71 @@ function Get-ClientNetworkIdentity([string]$BaseUrl) {
 }
 
 function Build-ClientHeaders($providerInfo, $settings, $networkIdentity) {
-    $headers = [ordered]@{
-        "Accept" = "application/json"
-        "Accept-Charset" = "utf-8"
-        "X-Qwen-Loop-Client" = "qwen-loop-scheduler-v4-settings-first"
-        "X-Qwen-Loop-Provider-Type" = [string]$providerInfo.Type
-        "X-Qwen-Loop-Provider-Name" = [string]$providerInfo.ProviderName
-        "X-Qwen-Loop-Provider-Id" = [string]$providerInfo.ProviderId
-        "X-Qwen-Loop-Model" = [string]$providerInfo.ModelId
-        "X-Qwen-Loop-EnvKey" = [string]$providerInfo.EnvKey
-        "X-Qwen-Loop-ApiKey-Source" = [string]$providerInfo.ApiKeySource
-        "X-Qwen-Loop-Settings-Version" = [string](Get-JsonProperty $settings '$version')
-    }
+    $headers = [ordered]@{}
 
-    if (-not $NoClientIdentityHeaders) {
-        if ($networkIdentity.computerName) { $headers["X-Qwen-Loop-Computer-Name"] = [string]$networkIdentity.computerName }
-        if ($networkIdentity.userName) { $headers["X-Qwen-Loop-User-Name"] = [string]$networkIdentity.userName }
-        if ($networkIdentity.userDomain) { $headers["X-Qwen-Loop-User-Domain"] = [string]$networkIdentity.userDomain }
-        if ($networkIdentity.localAddress) { $headers["X-Qwen-Loop-Client-IP"] = [string]$networkIdentity.localAddress }
-        if ($networkIdentity.localPort) { $headers["X-Qwen-Loop-Client-Port"] = [string]$networkIdentity.localPort }
-    }
+    Set-HeaderLikeSdk $headers "Accept" "application/json"
+    Set-HeaderLikeSdk $headers "User-Agent" "OpenAI/JS $OpenAISdkVersion"
+    Set-HeaderLikeSdk $headers "X-Stainless-Retry-Count" "0"
+    Set-HeaderLikeSdk $headers "X-Stainless-Timeout" ([string]$EffectiveTimeoutSec)
+    Set-HeaderLikeSdk $headers "X-Stainless-Lang" "js"
+    Set-HeaderLikeSdk $headers "X-Stainless-Package-Version" $OpenAISdkVersion
+    Set-HeaderLikeSdk $headers "X-Stainless-OS" (Get-StainlessOsName)
+    Set-HeaderLikeSdk $headers "X-Stainless-Arch" (Get-StainlessArchName)
+    Set-HeaderLikeSdk $headers "X-Stainless-Runtime" "node"
+    Set-HeaderLikeSdk $headers "X-Stainless-Runtime-Version" (Get-NodeLikeRuntimeVersion)
 
-    # IMPORTANT: if settings/envKey produced a value, send exactly that value. No dummy replacement.
     if ($null -ne $providerInfo.ApiKey) {
-        $headers["Authorization"] = "Bearer $($providerInfo.ApiKey)"
+        Set-HeaderLikeSdk $headers "Authorization" "Bearer $($providerInfo.ApiKey)"
+    }
+
+    Set-HeaderLikeSdk $headers "User-Agent" (Get-PlatformUserAgent)
+
+    $generationConfig = Get-GenerationConfig $providerInfo
+    $customHeaders = Get-JsonProperty $generationConfig "customHeaders"
+    if ($customHeaders) {
+        foreach ($p in (Get-ObjectProperties $customHeaders)) {
+            Set-HeaderLikeSdk $headers ([string]$p.Name) $p.Value
+        }
+    }
+
+    Set-HeaderLikeSdk $headers "Content-Type" "application/json"
+
+    # Qwen Code CLI does not send these project diagnostics. They are opt-in only.
+    if ($LoopDiagnosticHeaders) {
+        Set-HeaderLikeSdk $headers "X-Qwen-Loop-Client" "qwen-loop-scheduler-v4-settings-first"
+        Set-HeaderLikeSdk $headers "X-Qwen-Loop-Provider-Type" ([string]$providerInfo.Type)
+        Set-HeaderLikeSdk $headers "X-Qwen-Loop-Provider-Name" ([string]$providerInfo.ProviderName)
+        Set-HeaderLikeSdk $headers "X-Qwen-Loop-Provider-Id" ([string]$providerInfo.ProviderId)
+        Set-HeaderLikeSdk $headers "X-Qwen-Loop-Model" ([string]$providerInfo.ModelId)
+        Set-HeaderLikeSdk $headers "X-Qwen-Loop-EnvKey" ([string]$providerInfo.EnvKey)
+        Set-HeaderLikeSdk $headers "X-Qwen-Loop-ApiKey-Source" ([string]$providerInfo.ApiKeySource)
+        Set-HeaderLikeSdk $headers "X-Qwen-Loop-Settings-Version" ([string](Get-JsonProperty $settings '$version'))
+
+        if (-not $NoClientIdentityHeaders) {
+            if ($networkIdentity.computerName) { Set-HeaderLikeSdk $headers "X-Qwen-Loop-Computer-Name" ([string]$networkIdentity.computerName) }
+            if ($networkIdentity.userName) { Set-HeaderLikeSdk $headers "X-Qwen-Loop-User-Name" ([string]$networkIdentity.userName) }
+            if ($networkIdentity.userDomain) { Set-HeaderLikeSdk $headers "X-Qwen-Loop-User-Domain" ([string]$networkIdentity.userDomain) }
+            if ($networkIdentity.localAddress) { Set-HeaderLikeSdk $headers "X-Qwen-Loop-Client-IP" ([string]$networkIdentity.localAddress) }
+            if ($networkIdentity.localPort) { Set-HeaderLikeSdk $headers "X-Qwen-Loop-Client-Port" ([string]$networkIdentity.localPort) }
+        }
     }
     return $headers
 }
 
-function Build-SettingsAwareSystemPrompt($settings, $providerInfo) {
+function Get-LoggedHeaders($headers) {
+    $debugHeaders = [ordered]@{}
+    $shouldMask = [bool]$MaskSensitiveLogs -and -not [bool]$LogSensitive
+    foreach ($k in $headers.Keys) {
+        if ($shouldMask -and (Is-SensitiveHeaderName $k)) {
+            $debugHeaders[$k] = Mask-HeaderValue $k ([string]$headers[$k])
+        } else {
+            $debugHeaders[$k] = $headers[$k]
+        }
+    }
+    return $debugHeaders
+}
+
+function Build-SettingsAwareSystemPrompt($settings, $providerInfo, [string]$sourceSettingsPath) {
     $general = Get-JsonProperty $settings "general"
     $outputLanguage = [string](Get-JsonProperty $general "outputLanguage")
     if ([string]::IsNullOrWhiteSpace($outputLanguage)) { $outputLanguage = "한국어" }
@@ -351,7 +585,7 @@ function Build-SettingsAwareSystemPrompt($settings, $providerInfo) {
 @"
 너는 Java Spring Boot, MyBatis/JPA, React, TypeScript, 운영 배포 환경을 함께 보는 시니어 개발 아키텍트다.
 
-아래 정보는 C:\Users\KB099\.qwen\settings.json에서 읽은 클라이언트 설정이다. 이 설정을 무시하지 말고 응답 방식과 작업 범위 판단에 반영한다.
+아래 정보는 $sourceSettingsPath 에서 읽은 클라이언트 설정이다. 이 설정을 무시하지 말고 응답 방식과 작업 범위 판단에 반영한다.
 
 - provider type: $($providerInfo.Type)
 - provider name: $($providerInfo.ProviderName)
@@ -371,7 +605,7 @@ $allowText
 NEXT_QUESTION: 여기에 다음 루프에서 물어볼 구체적인 후속 질문을 한 문장으로 작성
 
 2. NEXT_QUESTION은 이전 답변이 없어도 이해될 정도로 구체적이고 자기완결적인 질문이어야 한다.
-3. 두 번째 줄부터는 현재 질문에 대한 답변을 $outputLanguage 로 자세히 작성한다.
+3. 두 번째 줄부터는 현재 질문에 대한 답변을 settings.general.outputLanguage($outputLanguage)에 맞춰 자세히 작성한다.
 4. 답변은 실무 개발자가 바로 사용할 수 있게 구체적으로 작성한다.
 5. Java Spring Boot와 React 관점에서 구조, 위험요소, 테스트, 리팩토링, 성능, 보안, 유지보수성을 같이 고려한다.
 6. 코드베이스 내용이 제공되지 않은 경우에는 추측을 확정처럼 말하지 말고, 확인해야 할 파일과 명령을 제시한다.
@@ -387,41 +621,36 @@ function Build-RequestBody($settings, $providerInfo, [string]$systemPrompt, [str
             @{ role = "system"; content = $systemPrompt },
             @{ role = "user"; content = $userPrompt }
         )
-        temperature = $Temperature
-        max_tokens = $MaxTokens
-        stream = $false
+        stream = (-not [bool]$NonStreaming)
     }
 
-    # Respect provider.generationConfig from settings.json.
-    # Full mode passes these keys into the OpenAI-compatible request body. Compat mode disables this if a strict server rejects unknown fields.
-    $generationConfig = Get-JsonProperty $providerInfo.ProviderRaw "generationConfig"
-    if ($generationConfig -and -not $CompatBody) {
-        foreach ($p in $generationConfig.PSObject.Properties) {
-            if (-not $bodyObj.Contains($p.Name)) {
-                $bodyObj[$p.Name] = ConvertTo-PlainObject $p.Value
-            }
+    if (-not $NonStreaming) {
+        $bodyObj["stream_options"] = @{ include_usage = $true }
+    }
+
+    $generationConfig = Get-GenerationConfig $providerInfo
+    $samplingParams = Get-JsonProperty $generationConfig "samplingParams"
+
+    if ($samplingParams -and -not $CompatBody) {
+        # Qwen Code treats samplingParams as the source of truth for the OpenAI wire shape.
+        foreach ($p in (Get-ObjectProperties $samplingParams)) {
+            if ($null -ne $p.Value) { $bodyObj[[string]$p.Name] = ConvertTo-PlainObject $p.Value }
         }
-        $bodyObj["generationConfig"] = ConvertTo-PlainObject $generationConfig
+    } elseif ($UseSchedulerSamplingDefaults) {
+        $bodyObj["temperature"] = $Temperature
+        $bodyObj["max_tokens"] = $MaxTokens
+    } else {
+        $bodyObj["max_tokens"] = Get-QwenCodeOutputTokenLimit $providerInfo.ModelId
     }
 
     if (-not $CompatBody) {
-        $metadata = [ordered]@{
-            settingsPath = $SettingsPath
-            selectedProviderType = $providerInfo.Type
-            provider = ConvertTo-PlainObject $providerInfo.ProviderRaw
-            security = ConvertTo-PlainObject (Get-JsonProperty $settings "security")
-            model = ConvertTo-PlainObject (Get-JsonProperty $settings "model")
-            general = ConvertTo-PlainObject (Get-JsonProperty $settings "general")
-            permissions = ConvertTo-PlainObject (Get-JsonProperty $settings "permissions")
-            ui = ConvertTo-PlainObject (Get-JsonProperty $settings "ui")
-            version = ConvertTo-PlainObject (Get-JsonProperty $settings '$version')
-            envKey = $providerInfo.EnvKey
-            apiKeySource = $providerInfo.ApiKeySource
-            clientNetworkIdentity = ConvertTo-PlainObject $networkIdentity
+        $extraBody = Get-JsonProperty $generationConfig "extra_body"
+        if ($extraBody) {
+            # Qwen Code merges extra_body last, so provider-specific fields can override defaults.
+            foreach ($p in (Get-ObjectProperties $extraBody)) {
+                if ($null -ne $p.Value) { $bodyObj[[string]$p.Name] = ConvertTo-PlainObject $p.Value }
+            }
         }
-        # env values are not put into prompt, but the selected envKey value is sent in Authorization exactly.
-        # This metadata tells the receiver what envKey was used without duplicating the secret in the JSON body.
-        $bodyObj["qwen_client_settings"] = $metadata
     }
     return $bodyObj
 }
@@ -430,11 +659,11 @@ function Invoke-JsonPostUtf8([string]$Uri, $Headers, [byte[]]$BodyBytes, [int]$T
     $req = [System.Net.HttpWebRequest]::Create($Uri)
     $req.Method = "POST"
     $req.Accept = "application/json"
-    $req.ContentType = "application/json; charset=utf-8"
-    $req.UserAgent = "qwen-loop-scheduler/4.0-settings-first"
+    $req.ContentType = "application/json"
+    $req.UserAgent = Get-PlatformUserAgent
     $req.Timeout = $TimeoutSeconds * 1000
     $req.ReadWriteTimeout = $TimeoutSeconds * 1000
-    $req.KeepAlive = $false
+    $req.KeepAlive = $true
 
     foreach ($key in $Headers.Keys) {
         if ($key -ieq "Accept") { $req.Accept = [string]$Headers[$key] }
@@ -474,19 +703,65 @@ function Invoke-JsonPostUtf8([string]$Uri, $Headers, [byte[]]$BodyBytes, [int]$T
     }
 }
 
+function Convert-OpenAIResponseToText([string]$raw, [bool]$isStreaming) {
+    if ($isStreaming) {
+        $textParts = New-Object System.Collections.Generic.List[string]
+        $jsonLines = New-Object System.Collections.Generic.List[string]
+
+        foreach ($line in ($raw -split "`r?`n")) {
+            $trimmed = $line.Trim()
+            if (-not $trimmed.StartsWith("data:")) { continue }
+
+            $data = $trimmed.Substring(5).Trim()
+            if ([string]::IsNullOrWhiteSpace($data) -or $data -eq "[DONE]") { continue }
+            $jsonLines.Add($data)
+
+            try {
+                $chunk = $data | ConvertFrom-Json
+                if ($chunk.choices -and $chunk.choices.Count -gt 0) {
+                    foreach ($choice in @($chunk.choices)) {
+                        if ($choice.delta) {
+                            $deltaText = Convert-MessageContentToText $choice.delta.content
+                            if (-not [string]::IsNullOrEmpty($deltaText)) { $textParts.Add($deltaText) }
+                        }
+                    }
+                }
+            } catch { }
+        }
+
+        $joined = ($textParts -join "")
+        if (-not [string]::IsNullOrWhiteSpace($joined)) {
+            return (Repair-MojibakeIfLikely $joined)
+        }
+
+        if ($jsonLines.Count -gt 0) {
+            return (Repair-MojibakeIfLikely ($jsonLines -join "`n"))
+        }
+        return (Repair-MojibakeIfLikely $raw)
+    }
+
+    $resp = $raw | ConvertFrom-Json
+    if ($resp.choices -and $resp.choices.Count -gt 0) {
+        $choice = $resp.choices[0]
+        if ($choice.message) {
+            $text = Convert-MessageContentToText $choice.message.content
+            $text = Repair-MojibakeIfLikely $text
+            if (-not [string]::IsNullOrWhiteSpace($text)) { return $text }
+        }
+        if ($choice.text) { return (Repair-MojibakeIfLikely ([string]$choice.text)) }
+    }
+    return (Repair-MojibakeIfLikely ($resp | ConvertTo-Json -Depth 30))
+}
+
 function Invoke-QwenChat($providerInfo, $settings, $networkIdentity, [string]$systemPrompt, [string]$userPrompt) {
     $headers = Build-ClientHeaders $providerInfo $settings $networkIdentity
     $bodyObj = Build-RequestBody $settings $providerInfo $systemPrompt $userPrompt $networkIdentity
-    $body = $bodyObj | ConvertTo-Json -Depth 80
+    $body = $bodyObj | ConvertTo-Json -Depth 80 -Compress
     $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($body)
 
     Write-Utf8File (Join-Path $WorkDir "last_request_body.json") $body
 
-    $debugHeaders = [ordered]@{}
-    foreach ($k in $headers.Keys) {
-        if ($k -eq "Authorization" -and -not $LogSensitive) { $debugHeaders[$k] = "Bearer " + (Mask-Secret $providerInfo.ApiKey) }
-        else { $debugHeaders[$k] = $headers[$k] }
-    }
+    $debugHeaders = Get-LoggedHeaders $headers
     Write-Utf8File (Join-Path $WorkDir "last_request_headers.json") (($debugHeaders | ConvertTo-Json -Depth 30))
     if ($LogSensitive) { Write-Utf8File (Join-Path $WorkDir "last_request_headers_sensitive.json") (($headers | ConvertTo-Json -Depth 30)) }
 
@@ -494,18 +769,8 @@ function Invoke-QwenChat($providerInfo, $settings, $networkIdentity, [string]$sy
     foreach ($endpoint in (Get-EndpointCandidates $providerInfo.BaseUrl)) {
         try {
             Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] POST $endpoint" -ForegroundColor Cyan
-            $raw = Invoke-JsonPostUtf8 -Uri $endpoint -Headers $headers -BodyBytes $bodyBytes -TimeoutSeconds $TimeoutSec
-            $resp = $raw | ConvertFrom-Json
-            if ($resp.choices -and $resp.choices.Count -gt 0) {
-                $choice = $resp.choices[0]
-                if ($choice.message) {
-                    $text = Convert-MessageContentToText $choice.message.content
-                    $text = Repair-MojibakeIfLikely $text
-                    if (-not [string]::IsNullOrWhiteSpace($text)) { return $text }
-                }
-                if ($choice.text) { return (Repair-MojibakeIfLikely ([string]$choice.text)) }
-            }
-            return (Repair-MojibakeIfLikely ($resp | ConvertTo-Json -Depth 30))
+            $raw = Invoke-JsonPostUtf8 -Uri $endpoint -Headers $headers -BodyBytes $bodyBytes -TimeoutSeconds $EffectiveTimeoutSec
+            return Convert-OpenAIResponseToText $raw (-not [bool]$NonStreaming)
         } catch {
             $lastError = [string]$_.Exception.Message
             Write-Host "Endpoint failed: $endpoint" -ForegroundColor Yellow
@@ -521,6 +786,7 @@ New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
 $settingsRaw = Read-Utf8File $SettingsPath
 $settings = $settingsRaw | ConvertFrom-Json
 $providerInfo = Get-SettingsProvider $settings $ProviderName $ModelName
+$EffectiveTimeoutSec = Get-EffectiveTimeoutSeconds $providerInfo
 $networkIdentity = Get-ClientNetworkIdentity $providerInfo.BaseUrl
 
 $nextQuestionPath = Join-Path $WorkDir "next_question.txt"
@@ -534,7 +800,7 @@ if (Test-Path -LiteralPath $SeedFile) { $seedQuestion = (Read-Utf8File $SeedFile
 if ([string]::IsNullOrWhiteSpace($seedQuestion)) { throw "seed_prompt.txt가 비어 있습니다: $SeedFile" }
 if (!(Test-Path -LiteralPath $nextQuestionPath)) { Write-Utf8File $nextQuestionPath $seedQuestion }
 
-$systemPrompt = Build-SettingsAwareSystemPrompt $settings $providerInfo
+$systemPrompt = Build-SettingsAwareSystemPrompt $settings $providerInfo $SettingsPath
 
 Write-Host "=== Qwen Loop Scheduler v4 SETTINGS-FIRST ===" -ForegroundColor Green
 Write-Host "SettingsPath : $SettingsPath"
@@ -547,11 +813,17 @@ Write-Host "EnvKey       : $($providerInfo.EnvKey)"
 Write-Host "ApiKeySource : $($providerInfo.ApiKeySource)"
 if ($null -eq $providerInfo.ApiKey) { Write-Host "Authorization: not sent because envKey value was not found" -ForegroundColor Yellow }
 else { Write-Host "Authorization: sent exactly from $($providerInfo.ApiKeySource)" -ForegroundColor Green }
+if (Test-QuotedEmptySecret $providerInfo.ApiKey) {
+    Write-Host "WARNING      : API key value is literal empty quotes. OS env or .env should override it for real calls." -ForegroundColor Yellow
+}
 Write-Host "ClientHost   : $($networkIdentity.computerName) / $($networkIdentity.userDomain)\$($networkIdentity.userName)"
 Write-Host "ClientIP     : $($networkIdentity.localAddress):$($networkIdentity.localPort)"
 Write-Host "CompatBody   : $CompatBody"
+Write-Host "WireMode     : Qwen Code OpenAI SDK-like headers/body"
+Write-Host "Stream       : $(-not [bool]$NonStreaming)"
+Write-Host "HeaderLog    : $(if ($MaskSensitiveLogs -and -not $LogSensitive) { 'masked' } else { 'unmasked' })"
 Write-Host "IntervalSec  : $IntervalSeconds"
-Write-Host "MaxTokens    : $MaxTokens"
+Write-Host "TimeoutSec   : $EffectiveTimeoutSec"
 Write-Host "WorkDir      : $WorkDir"
 Write-Host "Stop         : Ctrl+C"
 Write-Host "==============================================" -ForegroundColor Green
@@ -566,18 +838,50 @@ $settingsSummary = [ordered]@{
     envKey = $providerInfo.EnvKey
     apiKeySource = $providerInfo.ApiKeySource
     authorizationSent = ($null -ne $providerInfo.ApiKey)
-    apiKeyMasked = (Mask-Secret $providerInfo.ApiKey)
+    apiKeyLogged = if ($MaskSensitiveLogs -and -not $LogSensitive) { Mask-Secret $providerInfo.ApiKey } else { $providerInfo.ApiKey }
+    apiKeyLooksLikeQuotedEmpty = (Test-QuotedEmptySecret $providerInfo.ApiKey)
     clientNetworkIdentity = ConvertTo-PlainObject $networkIdentity
     compatBody = [bool]$CompatBody
-    endpointCandidates = @(Get-EndpointCandidates $providerInfo.BaseUrl)
+    stream = (-not [bool]$NonStreaming)
+    timeoutSec = $EffectiveTimeoutSec
+    loopDiagnosticHeaders = [bool]$LoopDiagnosticHeaders
+    endpointFallbacks = [bool]$EndpointFallbacks
+    endpoints = @(Get-EndpointCandidates $providerInfo.BaseUrl)
+    qwenCompat = [ordered]@{
+        userAgent = (Get-PlatformUserAgent)
+        openAISdkVersion = $OpenAISdkVersion
+        nodeRuntimeVersion = (Get-NodeLikeRuntimeVersion)
+        generationConfig = ConvertTo-PlainObject (Get-GenerationConfig $providerInfo)
+        customHeaderKeys = @((Get-ObjectProperties (Get-JsonProperty (Get-GenerationConfig $providerInfo) "customHeaders")) | ForEach-Object { $_.Name })
+        samplingParamKeys = @((Get-ObjectProperties (Get-JsonProperty (Get-GenerationConfig $providerInfo) "samplingParams")) | ForEach-Object { $_.Name })
+        extraBodyKeys = @((Get-ObjectProperties (Get-JsonProperty (Get-GenerationConfig $providerInfo) "extra_body")) | ForEach-Object { $_.Name })
+        maxTokensPolicy = if ($UseSchedulerSamplingDefaults) { "scheduler-argument" } elseif ((Get-JsonProperty (Get-GenerationConfig $providerInfo) "samplingParams")) { "settings.generationConfig.samplingParams" } else { "qwen-code-token-limit" }
+        bodyPolicy = if ($CompatBody) { "standard-openai-only" } else { "qwen-code-compatible-streaming-samplingParams-extra_body" }
+        note = "Default wire mode follows Qwen Code's OpenAI-compatible provider path more closely: OpenAI SDK stainless headers, QwenCode user-agent, streaming with include_usage, no qwen-loop diagnostic headers, exact baseUrl/chat/completions endpoint, customHeaders to headers, samplingParams and extra_body to request body."
+    }
 }
 Write-Utf8File (Join-Path $WorkDir "settings_effective_summary.json") ($settingsSummary | ConvertTo-Json -Depth 50)
 
 if ($DryRun) {
+    $dryRunPrompt = @"
+현재 루프 질문:
+$seedQuestion
+
+요청:
+DryRun preview. 이 파일은 API 호출 없이 실제 전송 예정 header/body 형태를 확인하기 위한 샘플입니다.
+"@
+    $dryRunHeaders = Build-ClientHeaders $providerInfo $settings $networkIdentity
+    $dryRunBody = Build-RequestBody $settings $providerInfo $systemPrompt $dryRunPrompt $networkIdentity
+    Write-Utf8File (Join-Path $WorkDir "dry_run_request_headers.json") ((Get-LoggedHeaders $dryRunHeaders) | ConvertTo-Json -Depth 30)
+    Write-Utf8File (Join-Path $WorkDir "dry_run_request_body.json") ($dryRunBody | ConvertTo-Json -Depth 80 -Compress)
+    if ($LogSensitive) { Write-Utf8File (Join-Path $WorkDir "dry_run_request_headers_sensitive.json") ($dryRunHeaders | ConvertTo-Json -Depth 30) }
+
     Write-Host "DryRun mode: API 호출 없이 settings.json 활용 내역만 확인했습니다." -ForegroundColor Yellow
     Write-Host "Created:" -ForegroundColor Yellow
     Write-Host "- $(Join-Path $WorkDir 'settings_effective_summary.json')"
-    Write-Host "Endpoint candidates:" -ForegroundColor Yellow
+    Write-Host "- $(Join-Path $WorkDir 'dry_run_request_headers.json')"
+    Write-Host "- $(Join-Path $WorkDir 'dry_run_request_body.json')"
+    Write-Host "Endpoint$(if ($EndpointFallbacks) { ' candidates' } else { '' }):" -ForegroundColor Yellow
     Get-EndpointCandidates $providerInfo.BaseUrl | ForEach-Object { Write-Host "- $_" }
     exit 0
 }
