@@ -860,6 +860,7 @@ function Build-RequestBody($settings, $providerInfo, [string]$systemPrompt, [str
 }
 
 function Invoke-JsonPostUtf8([string]$Uri, $Headers, [byte[]]$BodyBytes, [int]$TimeoutSeconds) {
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $req = [System.Net.HttpWebRequest]::Create($Uri)
     $req.Method = "POST"
     $req.Accept = "application/json"
@@ -888,12 +889,21 @@ function Invoke-JsonPostUtf8([string]$Uri, $Headers, [byte[]]$BodyBytes, [int]$T
             $ms = New-Object System.IO.MemoryStream
             $respStream.CopyTo($ms)
             $bytes = $ms.ToArray()
-            return [System.Text.Encoding]::UTF8.GetString($bytes)
+            $sw.Stop()
+            return [PSCustomObject]@{
+                Body = [System.Text.Encoding]::UTF8.GetString($bytes)
+                StatusCode = [int]$resp.StatusCode
+                StatusDescription = [string]$resp.StatusDescription
+                ContentType = [string]$resp.ContentType
+                ReceivedBytes = [int64]$bytes.Length
+                DurationMs = [int64]$sw.ElapsedMilliseconds
+            }
         } finally {
             if ($respStream) { $respStream.Close() }
             if ($resp) { $resp.Close() }
         }
     } catch [System.Net.WebException] {
+        $sw.Stop()
         $resp = $_.Exception.Response
         if ($resp) {
             $respStream = $resp.GetResponseStream()
@@ -901,8 +911,13 @@ function Invoke-JsonPostUtf8([string]$Uri, $Headers, [byte[]]$BodyBytes, [int]$T
             if ($respStream) { $respStream.CopyTo($ms) }
             $bytes = $ms.ToArray()
             $body = [System.Text.Encoding]::UTF8.GetString($bytes)
-            throw "HTTP 호출 실패: $($_.Exception.Message)`nResponse body:`n$body"
+            $statusCode = [int]$resp.StatusCode
+            $statusDescription = [string]$resp.StatusDescription
+            throw "HTTP $statusCode $statusDescription after $($sw.ElapsedMilliseconds) ms: $($_.Exception.Message)`nResponse body:`n$body"
         }
+        throw "HTTP 호출 실패 after $($sw.ElapsedMilliseconds) ms: $($_.Exception.Message)"
+    } catch {
+        $sw.Stop()
         throw
     }
 }
@@ -973,12 +988,43 @@ function Invoke-QwenChat($providerInfo, $settings, $networkIdentity, [string]$sy
     foreach ($endpoint in (Get-EndpointCandidates $providerInfo.BaseUrl)) {
         try {
             Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] POST $endpoint" -ForegroundColor Cyan
-            $raw = Invoke-JsonPostUtf8 -Uri $endpoint -Headers $headers -BodyBytes $bodyBytes -TimeoutSeconds $EffectiveTimeoutSec
-            return Convert-OpenAIResponseToText $raw (-not [bool]$NonStreaming)
+            $response = Invoke-JsonPostUtf8 -Uri $endpoint -Headers $headers -BodyBytes $bodyBytes -TimeoutSeconds $EffectiveTimeoutSec
+            Write-Host ("[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] HTTP {0} {1} ({2} ms, {3} bytes)" -f $response.StatusCode, $response.StatusDescription, $response.DurationMs, $response.ReceivedBytes) -ForegroundColor Green
+            Write-Utf8File (Join-Path $WorkDir "last_response_status.json") (([ordered]@{
+                ok = $true
+                endpoint = $endpoint
+                statusCode = $response.StatusCode
+                statusDescription = $response.StatusDescription
+                contentType = $response.ContentType
+                receivedBytes = $response.ReceivedBytes
+                durationMs = $response.DurationMs
+                completedAt = (Get-Date).ToString("o")
+            }) | ConvertTo-Json -Depth 10)
+            $answerText = Convert-OpenAIResponseToText $response.Body (-not [bool]$NonStreaming)
+            Write-Host ("ResponseText : {0} chars extracted" -f $answerText.Length) -ForegroundColor DarkGreen
+            return $answerText
         } catch {
             $lastError = [string]$_.Exception.Message
             Write-Host "Endpoint failed: $endpoint" -ForegroundColor Yellow
             Write-Host $lastError -ForegroundColor Yellow
+
+            $errorStatusCode = $null
+            $errorStatusDescription = $null
+            $errorDurationMs = $null
+            if ($lastError -match '^HTTP\s+(\d+)\s+(.+?)\s+after\s+(\d+)\s+ms') {
+                $errorStatusCode = [int]$Matches[1]
+                $errorStatusDescription = [string]$Matches[2]
+                $errorDurationMs = [int64]$Matches[3]
+            }
+            Write-Utf8File (Join-Path $WorkDir "last_response_status.json") (([ordered]@{
+                ok = $false
+                endpoint = $endpoint
+                statusCode = $errorStatusCode
+                statusDescription = $errorStatusDescription
+                durationMs = $errorDurationMs
+                error = $lastError
+                completedAt = (Get-Date).ToString("o")
+            }) | ConvertTo-Json -Depth 10)
         }
     }
     throw "모든 endpoint 호출 실패. 마지막 오류: $lastError"
@@ -1214,6 +1260,7 @@ $answer
         Write-Host "- $jsonlPath"
         Write-Host "- $(Join-Path $WorkDir 'last_request_headers.json')"
         Write-Host "- $(Join-Path $WorkDir 'last_request_body.json')"
+        Write-Host "- $(Join-Path $WorkDir 'last_response_status.json')"
     } catch {
         $msg = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ERROR: $($_.Exception.Message)`n$($_.ScriptStackTrace)`n"
         Append-Utf8File $errorLogPath $msg
