@@ -10,7 +10,7 @@ Windows 11에서 Qwen Code용 `settings.json`을 기반으로 Qwen/OpenAI-compat
 - `envKey`, `generationConfig`, `permissions`, `general`, `ui`, `$version` 등을 임의로 버리지 않는다.
 - Windows 11에서 더블클릭 BAT 파일로 실행한다.
 - 한글 질문/응답/로그가 깨지지 않도록 UTF-8을 강제한다.
-- 10분마다 질문 → 답변 → 다음 질문 추출 → 다음 루프를 반복한다.
+- 매 호출 후 8-15분 사이의 랜덤 대기시간을 새로 뽑아 질문 → 답변 → 다음 질문 추출 → 다음 루프를 반복한다.
 - 실제 전송 헤더와 바디를 로그로 확인할 수 있게 한다.
 
 ## Qwen Code 호환 전송 기준
@@ -33,6 +33,12 @@ Windows 11에서 Qwen Code용 `settings.json`을 기반으로 Qwen/OpenAI-compat
 `X-Qwen-Loop-*` 진단 header는 기본으로 보내지 않습니다. 수신자 추적이 필요할 때만 `qwen-loop.ps1` 실행 시 `-LoopDiagnosticHeaders`를 추가합니다. PC명, 사용자명, local IP 같은 식별 header만 빼려면 `-LoopDiagnosticHeaders -NoClientIdentityHeaders`를 함께 사용합니다.
 
 `dry_run_request_headers.json`과 `last_request_headers.json`은 내부 API 테스트용으로 기본 비마스킹 저장합니다. 민감값 마스킹이 필요한 경우에만 `-MaskSensitiveLogs`를 추가합니다.
+
+## 호출 간격
+
+기본 루프는 고정 10분 타이머가 아니라 `-MinIntervalMinutes 8 -MaxIntervalMinutes 15` 범위에서 매 호출 후 새 랜덤 대기시간을 뽑습니다. 예를 들어 한 번 호출한 뒤 11분 20초를 기다렸다면, 다음 호출 뒤에는 다시 8-15분 범위에서 새 값을 뽑습니다.
+
+기존처럼 고정 간격 테스트가 필요하면 `qwen-loop.ps1`에 `-IntervalSeconds 600`만 단독으로 넘깁니다. `-MinIntervalMinutes`/`-MaxIntervalMinutes`를 함께 넘기면 랜덤 범위가 우선입니다.
 
 ## 먼저 볼 파일
 
@@ -58,6 +64,8 @@ run-qwen-loop.bat                 실제 사용자 settings 기준 메인 루프
 ```
 
 세부 검증용 파일:
+
+`10MIN`이 들어간 파일명은 기존 호환 이름이며, 현재 루프 BAT의 실제 기본 대기시간은 8-15분 랜덤입니다.
 
 실제 사용자 경로 `%USERPROFILE%\.qwen\settings.json`을 읽는 파일:
 

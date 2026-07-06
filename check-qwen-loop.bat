@@ -61,7 +61,7 @@ if not exist "%SETTINGS_TO_CHECK%" (
 
 echo [%STEP%] %LABEL% DryRun
 echo       %SETTINGS_TO_CHECK%
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%qwen-loop.ps1" -SettingsPath "%SETTINGS_TO_CHECK%" -IntervalSeconds 600 -LastTurnChars 12000 -WorkDir "%WORK_TO_USE%" -SeedFile "%SCRIPT_DIR%seed_prompt.txt" -ContextListFile "%SCRIPT_DIR%context_files.txt" -DryRun
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%qwen-loop.ps1" -SettingsPath "%SETTINGS_TO_CHECK%" -MinIntervalMinutes 8 -MaxIntervalMinutes 15 -LastTurnChars 12000 -WorkDir "%WORK_TO_USE%" -SeedFile "%SCRIPT_DIR%seed_prompt.txt" -ContextListFile "%SCRIPT_DIR%context_files.txt" -DryRun
 if errorlevel 1 (
   echo [FAIL] %LABEL% DryRun 실패
   set "FAILED=1"

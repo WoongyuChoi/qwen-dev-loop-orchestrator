@@ -11,7 +11,8 @@ if not exist "%SETTINGS_PATH%" (
 
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%qwen-loop.ps1" ^
   -SettingsPath "%SETTINGS_PATH%" ^
-  -IntervalSeconds 600 ^
+  -MinIntervalMinutes 8 ^
+  -MaxIntervalMinutes 15 ^
   -LastTurnChars 12000 ^
   -WorkDir "%SCRIPT_DIR%qwen-loop-data" ^
   -SeedFile "%SCRIPT_DIR%seed_prompt.txt" ^

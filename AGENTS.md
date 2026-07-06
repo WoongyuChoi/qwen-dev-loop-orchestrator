@@ -24,10 +24,10 @@
 - `question_bank.txt`: 트랙별 초기 질문 seed 모음
 - `01_CHECK_SETTINGS_DOUBLECLICK.bat`: `%USERPROFILE%\.qwen\settings.json` 기준 DryRun
 - `02_RUN_ONCE_TEST_DOUBLECLICK.bat`: 실제 사용자 설정 기준 1회 호출
-- `03_RUN_LOOP_10MIN_DOUBLECLICK.bat`: 실제 사용자 설정 기준 10분 루프
+- `03_RUN_LOOP_10MIN_DOUBLECLICK.bat`: 실제 사용자 설정 기준 8-15분 랜덤 간격 루프
 - `06_CHECK_PROJECT_SETTINGS_DOUBLECLICK.bat`: 프로젝트 내부 `settings.json` 기준 DryRun
 - `07_RUN_ONCE_PROJECT_SETTINGS_DOUBLECLICK.bat`: 프로젝트 내부 `settings.json` 기준 1회 호출
-- `08_RUN_LOOP_10MIN_PROJECT_SETTINGS_DOUBLECLICK.bat`: 프로젝트 내부 `settings.json` 기준 10분 루프
+- `08_RUN_LOOP_10MIN_PROJECT_SETTINGS_DOUBLECLICK.bat`: 프로젝트 내부 `settings.json` 기준 8-15분 랜덤 간격 루프
 
 ## 테스트 체크리스트
 
@@ -36,6 +36,7 @@
 - `qwen-loop-data/last_request_headers.json`과 `last_request_body.json`에 settings 기반 정보가 반영되는지 확인한다.
 - `dry_run_request_headers.json`에서 `User-Agent: QwenCode/<version> (win32; x64)`와 `X-Stainless-*`가 보이고 `X-Qwen-Loop-*` 진단 헤더가 기본으로 빠져 있는지 확인한다.
 - `dry_run_request_body.json`에서 기본 `stream: true`, `stream_options.include_usage: true`인지 확인하고, 임의 `temperature: 0.35`/`max_tokens: 8192`가 들어가지 않는지 확인한다.
+- `settings_effective_summary.json`에서 기본 interval이 `random`이고 `minSeconds=480`, `maxSeconds=900`인지 확인한다.
 - `next_question.txt`가 있으면 재시작 시 같은 질문 루프를 이어가고, 없으면 `transcript.jsonl`/`transcript.md`에서 복구한 뒤 마지막 fallback으로 `question_bank.txt` 랜덤 seed를 사용한다.
 - `qwen-loop-data/transcript.md`와 `next_question.txt`가 UTF-8 한글로 저장되는지 확인한다.
 - 서버가 extra body를 거부하면 `04_RUN_LOOP_10MIN_COMPAT_BODY_IF_SERVER_REJECTS.bat` 또는 `-CompatBody` 경로를 검토한다.

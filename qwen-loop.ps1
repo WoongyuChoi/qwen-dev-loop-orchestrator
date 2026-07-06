@@ -8,6 +8,8 @@
     [string]$ContextListFile = "$PSScriptRoot\context_files.txt",
     [string]$WorkDir = "$PSScriptRoot\qwen-loop-data",
     [int]$IntervalSeconds = 600,
+    [int]$MinIntervalMinutes = 8,
+    [int]$MaxIntervalMinutes = 15,
     [int]$MaxTokens = 8192,
     [double]$Temperature = 0.35,
     [int]$TimeoutSec = 120,
@@ -30,6 +32,8 @@
 )
 
 $ErrorActionPreference = "Stop"
+$ScriptBoundParameterNames = @{}
+foreach ($key in $PSBoundParameters.Keys) { $ScriptBoundParameterNames[$key] = $true }
 
 # Windows PowerShell 5.1 + Korean Windows: make console and files consistently UTF-8.
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
@@ -361,6 +365,50 @@ function Get-EffectiveTimeoutSeconds($providerInfo) {
         } catch { }
     }
     return $TimeoutSec
+}
+
+function Get-IntervalPlan() {
+    $fixedIntervalWasExplicit = $ScriptBoundParameterNames.ContainsKey("IntervalSeconds")
+    $randomIntervalWasExplicit = $ScriptBoundParameterNames.ContainsKey("MinIntervalMinutes") -or $ScriptBoundParameterNames.ContainsKey("MaxIntervalMinutes")
+
+    if ($fixedIntervalWasExplicit -and -not $randomIntervalWasExplicit) {
+        if ($IntervalSeconds -le 0) { throw "IntervalSeconds는 1 이상이어야 합니다." }
+        return [PSCustomObject]@{
+            Mode = "fixed"
+            FixedSeconds = [int]$IntervalSeconds
+            MinSeconds = [int]$IntervalSeconds
+            MaxSeconds = [int]$IntervalSeconds
+            Note = "Legacy fixed interval mode because -IntervalSeconds was explicitly provided without random min/max."
+        }
+    }
+
+    if ($MinIntervalMinutes -le 0) { throw "MinIntervalMinutes는 1 이상이어야 합니다." }
+    if ($MaxIntervalMinutes -le 0) { throw "MaxIntervalMinutes는 1 이상이어야 합니다." }
+    if ($MaxIntervalMinutes -lt $MinIntervalMinutes) {
+        throw "MaxIntervalMinutes는 MinIntervalMinutes보다 크거나 같아야 합니다. min=$MinIntervalMinutes max=$MaxIntervalMinutes"
+    }
+
+    $minSeconds = [int]($MinIntervalMinutes * 60)
+    $maxSeconds = [int]($MaxIntervalMinutes * 60)
+    return [PSCustomObject]@{
+        Mode = "random"
+        FixedSeconds = $null
+        MinSeconds = $minSeconds
+        MaxSeconds = $maxSeconds
+        Note = "After each request, a new random wait interval is sampled from MinIntervalMinutes..MaxIntervalMinutes."
+    }
+}
+
+function Get-NextIntervalSeconds($intervalPlan) {
+    if ($intervalPlan.Mode -eq "fixed") { return [int]$intervalPlan.FixedSeconds }
+    return [int](Get-Random -Minimum ([int]$intervalPlan.MinSeconds) -Maximum ([int]$intervalPlan.MaxSeconds + 1))
+}
+
+function Format-IntervalDuration([int]$seconds) {
+    $minutes = [int][Math]::Floor($seconds / 60)
+    $remainingSeconds = $seconds % 60
+    if ($remainingSeconds -eq 0) { return "$minutes min ($seconds sec)" }
+    return "$minutes min $remainingSeconds sec ($seconds sec)"
 }
 
 function Expand-PathInput([string]$PathText) {
@@ -943,6 +991,7 @@ $settingsRaw = Read-Utf8File $SettingsPath
 $settings = $settingsRaw | ConvertFrom-Json
 $providerInfo = Get-SettingsProvider $settings $ProviderName $ModelName
 $EffectiveTimeoutSec = Get-EffectiveTimeoutSeconds $providerInfo
+$intervalPlan = Get-IntervalPlan
 $networkIdentity = $null
 if ($LoopDiagnosticHeaders) {
     $networkIdentity = Get-ClientNetworkIdentity $providerInfo.BaseUrl
@@ -984,7 +1033,12 @@ Write-Host "WireMode     : Qwen Code OpenAI SDK-like headers/body"
 Write-Host "Stream       : $(-not [bool]$NonStreaming)"
 Write-Host "HeaderLog    : $(if ($MaskSensitiveLogs -and -not $LogSensitive) { 'masked' } else { 'unmasked' })"
 Write-Host "QuestionSrc  : $($initialQuestion.Source)"
-Write-Host "IntervalSec  : $IntervalSeconds"
+Write-Host "IntervalMode : $($intervalPlan.Mode)"
+if ($intervalPlan.Mode -eq "fixed") {
+    Write-Host "Interval     : $(Format-IntervalDuration $intervalPlan.FixedSeconds)"
+} else {
+    Write-Host "IntervalRange: $(Format-IntervalDuration $intervalPlan.MinSeconds) - $(Format-IntervalDuration $intervalPlan.MaxSeconds)"
+}
 Write-Host "TimeoutSec   : $EffectiveTimeoutSec"
 Write-Host "WorkDir      : $WorkDir"
 Write-Host "Stop         : Ctrl+C"
@@ -1008,6 +1062,16 @@ $settingsSummary = [ordered]@{
     compatBody = [bool]$CompatBody
     stream = (-not [bool]$NonStreaming)
     timeoutSec = $EffectiveTimeoutSec
+    interval = [ordered]@{
+        mode = $intervalPlan.Mode
+        minSeconds = $intervalPlan.MinSeconds
+        maxSeconds = $intervalPlan.MaxSeconds
+        fixedSeconds = $intervalPlan.FixedSeconds
+        minIntervalMinutes = $MinIntervalMinutes
+        maxIntervalMinutes = $MaxIntervalMinutes
+        legacyIntervalSeconds = $IntervalSeconds
+        note = $intervalPlan.Note
+    }
     initialQuestionSource = $initialQuestion.Source
     initialQuestionSeedSource = $initialQuestion.SeedSource
     questionTrack = $QuestionTrack
@@ -1161,6 +1225,11 @@ $answer
         break
     }
 
-    Write-Host "`nWaiting $IntervalSeconds seconds... Ctrl+C to stop." -ForegroundColor DarkGray
-    Start-Sleep -Seconds $IntervalSeconds
+    $nextWaitSeconds = Get-NextIntervalSeconds $intervalPlan
+    if ($intervalPlan.Mode -eq "random") {
+        Write-Host "`nWaiting $(Format-IntervalDuration $nextWaitSeconds). Next wait will be randomized again after the next request. Ctrl+C to stop." -ForegroundColor DarkGray
+    } else {
+        Write-Host "`nWaiting $(Format-IntervalDuration $nextWaitSeconds). Ctrl+C to stop." -ForegroundColor DarkGray
+    }
+    Start-Sleep -Seconds $nextWaitSeconds
 }

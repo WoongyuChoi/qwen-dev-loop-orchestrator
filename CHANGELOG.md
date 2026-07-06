@@ -17,6 +17,8 @@
 - settings.json을 source of truth로 사용.
 - envKey를 dummy로 정규화하지 않음.
 - generationConfig/general/permissions/ui/version을 가능한 한 반영.
-- client identity header 전송.
+- 기본 전송은 Qwen Code CLI처럼 `X-Stainless-*`/`QwenCode/<version>` header와 streaming body를 사용.
+- client identity header는 기본 전송하지 않고 `-LoopDiagnosticHeaders`에서만 동적으로 전송.
+- 기본 루프 간격은 매 호출 후 8-15분 사이 랜덤 대기시간을 새로 샘플링.
 - last_request_headers/body 로그 생성.
 - 더블클릭 BAT 기반 실행 흐름 제공.
