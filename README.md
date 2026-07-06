@@ -43,6 +43,8 @@ settings.json                     스크린샷 기반 재구성 settings.json
 docs/CONVERSATION_SUMMARY.md      지금까지 대화 요약
 docs/CODEX_HANDOFF.md             Codex에게 맡길 작업 지시서
 qwen-loop.ps1                     메인 실행 로직
+seed_prompt.txt                   question_bank.txt가 없거나 비었을 때 쓰는 단일 fallback 질문
+question_bank.txt                 트랙별 초기 질문 seed 모음
 ```
 
 ## 더블클릭 실행 파일
@@ -99,6 +101,19 @@ transcript.md
 transcript.jsonl
 error.log
 ```
+
+## 질문 루프
+
+질문은 아래 순서로 결정됩니다.
+
+1. `qwen-loop-data\next_question.txt`가 있으면 그대로 이어서 사용
+2. 없거나 비어 있으면 `transcript.jsonl`의 마지막 `nextQuestion` 복구
+3. 그래도 없으면 `transcript.md`의 마지막 `## Next Question` 복구
+4. 그래도 없으면 `last_turn.txt`를 바탕으로 복구 질문 생성
+5. 완전히 처음이면 `question_bank.txt`에서 랜덤 seed 선택
+6. `question_bank.txt`가 없거나 비어 있으면 `seed_prompt.txt` 사용
+
+`question_bank.txt`는 `[java-spring]`, `[react-typescript]`처럼 트랙을 붙인 질문 목록입니다. 특정 트랙만 시작하고 싶으면 `qwen-loop.ps1`에 `-QuestionTrack java-spring`처럼 넘깁니다. 기본 프롬프트는 Java/Spring 질문과 React 질문을 억지로 묶지 않고, 현재 질문의 주 트랙 안에서 더 좁고 검증 가능한 후속 질문을 만들도록 지시합니다.
 
 ## 주의
 

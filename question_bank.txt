@@ -1,0 +1,28 @@
+# 첫 루프나 복구 불가능한 상태에서 사용할 질문 seed 모음입니다.
+# 형식: [track] 질문
+# Java/Spring, React/TypeScript를 한 질문에 억지로 묶지 말고, 필요한 경우 API contract 같은 경계 트랙을 별도로 둡니다.
+
+[java-spring] Spring Boot 서비스 계층에서 트랜잭션 경계가 컨트롤러, 서비스, MyBatis mapper 사이에 흩어져 있을 때 어떤 실패 모드가 생기는지, 재현 가능한 테스트 관점에서 분석해줘.
+[java-spring] Spring Boot 애플리케이션에서 도메인 규칙이 service, mapper XML, controller validation에 분산되어 있을 때 응집도를 회복하기 위한 리팩토링 순서를 설계해줘.
+[java-spring] MyBatis XML 쿼리가 화면 요구사항에 맞춰 계속 커지는 상황에서 N+1, 동적 조건 폭발, resultMap 결합도를 어떻게 진단하고 줄일 수 있는지 분석해줘.
+[java-spring] Spring MVC API에서 예외 처리, 오류 코드, 로깅 correlation id가 일관되지 않을 때 운영 장애 분석 비용이 어떻게 증가하는지와 개선 전략을 설명해줘.
+[java-concurrency] Java 서버에서 캐시, static 상태, 트랜잭션 격리 수준이 함께 얽힐 때 동시성 버그를 어떻게 모델링하고 테스트해야 하는지 분석해줘.
+[java-testing] Spring Boot 통합 테스트가 느리고 취약할 때 slice test, contract test, testcontainer, fixture 전략을 어떤 기준으로 나눌지 설계해줘.
+
+[react-typescript] React 컴포넌트가 서버 DTO 모양을 그대로 따라가면서 상태와 렌더링 책임이 뒤섞일 때 어떤 유지보수 문제가 생기는지 TypeScript 타입 설계 관점에서 분석해줘.
+[react-typescript] React 화면에서 form state, server state, derived state가 섞여 있을 때 불변식이 깨지는 경로를 어떻게 찾고 분리할지 설계해줘.
+[react-rendering] React 목록/트리 화면에서 불필요한 재렌더링이 누적될 때 profiler 없이도 의심 지점을 좁히는 방법과 memoization의 부작용을 분석해줘.
+[react-state] React 앱에서 Zustand나 Context 같은 전역 상태가 화면 편의를 위해 커질 때 domain state와 UI state를 분리하는 기준을 제안해줘.
+[react-testing] React Testing Library 테스트가 DOM 문구에 과도하게 의존할 때 리팩토링 내성을 높이는 테스트 설계 원칙을 설명해줘.
+[react-accessibility] 업무용 React 화면에서 키보드 접근성, focus trap, aria 상태가 누락될 때 실제 사용자 흐름과 테스트 자동화에 어떤 문제가 생기는지 분석해줘.
+
+[api-contract] 백엔드 API 응답 스키마가 화면별 편의에 맞춰 흔들릴 때 contract test와 versioning으로 변경 위험을 어떻게 관리할지 분석해줘.
+[api-contract] pagination, filtering, sorting API가 화면마다 다르게 구현될 때 서버/클라이언트 양쪽의 복잡도가 어떻게 증가하는지 contract-first 관점에서 설계해줘.
+
+[database] 운영 DB 테이블의 공통 컬럼, 이력 관리, soft delete 정책이 일관되지 않을 때 데이터 정합성과 감사 추적에 어떤 위험이 생기는지 분석해줘.
+[database] 복잡한 조회 화면에서 DB index, where 조건 선택도, 정렬 조건, pagination 방식이 충돌할 때 병목을 체계적으로 찾는 절차를 설명해줘.
+
+[security] 사내 업무 시스템에서 인증 주체, 권한 정책, 화면 버튼 제어, API 권한 검증이 분리되어 있을 때 우회 가능성을 어떻게 검증할지 분석해줘.
+[observability] 장애가 났을 때 프론트 이벤트, API 요청, DB 쿼리, 배치 작업 로그가 이어지지 않는다면 어떤 correlation 체계를 먼저 설계해야 하는지 설명해줘.
+[architecture] 레거시 모듈을 한 번에 갈아엎지 못하는 상황에서 strangler pattern, anti-corruption layer, feature toggle을 어떤 기준으로 적용할지 분석해줘.
+[performance] 응답 시간이 느린 업무 화면에서 브라우저 렌더링, API latency, DB query, serialization 중 병목을 분해하는 실험 설계를 제안해줘.
