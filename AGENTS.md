@@ -16,6 +16,8 @@
 ## 주요 파일
 
 - `qwen-loop.ps1`: 메인 루프 실행 로직
+- `check-qwen-loop.bat`: 실제 호출 없이 사용자/프로젝트 settings를 순차 DryRun하는 권장 체크 진입점
+- `run-qwen-loop.bat`: 실제 사용자 설정 기준 메인 루프 실행 진입점
 - `settings.json`: 스크린샷 기반으로 재구성한 Qwen Code 설정 파일
 - `.qwen/settings.json`: 실제 사용자 경로 구조를 프로젝트 내부에 미러링한 파일
 - `01_CHECK_SETTINGS_DOUBLECLICK.bat`: `%USERPROFILE%\.qwen\settings.json` 기준 DryRun
@@ -27,7 +29,7 @@
 
 ## 테스트 체크리스트
 
-- `01_CHECK_SETTINGS_DOUBLECLICK.bat` 또는 `06_CHECK_PROJECT_SETTINGS_DOUBLECLICK.bat` 더블클릭 시 settings 해석이 정상인지 확인한다.
+- `check-qwen-loop.bat` 더블클릭 시 사용자/프로젝트 settings DryRun이 순차적으로 정상 실행되는지 확인한다.
 - `02_RUN_ONCE_TEST_DOUBLECLICK.bat` 또는 `07_RUN_ONCE_PROJECT_SETTINGS_DOUBLECLICK.bat` 더블클릭 시 `NEXT_QUESTION` 한글이 깨지지 않는지 확인한다.
 - `qwen-loop-data/last_request_headers.json`과 `last_request_body.json`에 settings 기반 정보가 반영되는지 확인한다.
 - `dry_run_request_headers.json`에서 `User-Agent: QwenCode/<version> (win32; x64)`와 `X-Stainless-*`가 보이고 `X-Qwen-Loop-*` 진단 헤더가 기본으로 빠져 있는지 확인한다.

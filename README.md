@@ -47,6 +47,16 @@ qwen-loop.ps1                     메인 실행 로직
 
 ## 더블클릭 실행 파일
 
+권장 진입점:
+
+```text
+check-qwen-loop.bat               실제 호출 없이 사용자/프로젝트 settings를 순차 DryRun
+run-qwen-loop.bat                 실제 사용자 settings 기준 메인 루프 실행
+05_OPEN_LOG_FOLDER.bat            로그 폴더 열기
+```
+
+세부 검증용 파일:
+
 실제 사용자 경로 `C:\Users\KB099\.qwen\settings.json`을 읽는 파일:
 
 ```text
@@ -64,19 +74,12 @@ qwen-loop.ps1                     메인 실행 로직
 08_RUN_LOOP_10MIN_PROJECT_SETTINGS_DOUBLECLICK.bat
 ```
 
-로그 폴더 열기:
-
-```text
-05_OPEN_LOG_FOLDER.bat
-```
-
 ## 추천 실행 순서
 
-1. `01_CHECK_SETTINGS_DOUBLECLICK.bat` 더블클릭
-2. settings 해석이 맞는지 확인
-3. `02_RUN_ONCE_TEST_DOUBLECLICK.bat` 더블클릭
-4. `qwen-loop-data`의 로그와 한글 깨짐 여부 확인
-5. 정상이라면 `03_RUN_LOOP_10MIN_DOUBLECLICK.bat` 실행
+1. `check-qwen-loop.bat` 더블클릭
+2. 사용자/프로젝트 settings DryRun 결과 확인
+3. `qwen-loop-data\check\...\dry_run_request_headers.json`과 `dry_run_request_body.json` 확인
+4. 정상이라면 `run-qwen-loop.bat` 실행
 
 프로젝트 내부 settings로 테스트하려면 01/02/03 대신 06/07/08을 사용합니다.
 
