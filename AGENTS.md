@@ -11,7 +11,7 @@
 5. 사용자가 더블클릭으로 실행할 수 있는 `.bat` 파일을 우선 제공한다. 사용자가 PowerShell 명령어를 직접 복붙해야 하는 흐름은 피한다.
 6. 내부 API 테스트 정확도를 위해 header/body 로그는 기본 비마스킹으로 저장한다. 마스킹은 `-MaskSensitiveLogs` 옵션으로만 사용한다.
 7. request body를 줄여야 하는 경우에도 `settings-first` 원칙을 README와 코드에 명확히 남긴다.
-8. 기본 전송은 Qwen Code의 OpenAI Node SDK 경로처럼 보이도록 `X-Stainless-*`, `User-Agent: QwenCode/<version>`, streaming body, `baseUrl + /chat/completions`를 사용하고 `X-Qwen-Loop-*` 진단 헤더는 보내지 않는다. 수신자 식별이 필요할 때만 `-LoopDiagnosticHeaders`로 TCP local IP, PC명, 사용자명 등 클라이언트 식별 헤더를 보낼 수 있게 유지한다.
+8. 기본 전송은 Qwen Code의 OpenAI Node SDK 경로처럼 보이도록 `X-Stainless-*`, `User-Agent: QwenCode/<version>`, streaming body, `baseUrl + /chat/completions`를 사용하고 `X-Qwen-Loop-*` 진단 헤더는 보내지 않는다. 수신자 식별이 필요할 때만 `-LoopDiagnosticHeaders`로 TCP local IP, PC명, 사용자명 등 클라이언트 식별값을 동적으로 조회하고 헤더/로그에 남길 수 있게 유지한다.
 
 ## 주요 파일
 

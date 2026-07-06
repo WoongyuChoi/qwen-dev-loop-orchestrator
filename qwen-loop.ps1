@@ -708,7 +708,21 @@ function Get-LoggedHeaders($headers) {
     return $debugHeaders
 }
 
-function Build-SettingsAwareSystemPrompt($settings, $providerInfo, [string]$sourceSettingsPath) {
+function Convert-SettingHintForPrompt([string]$text) {
+    if ($null -eq $text) { return "" }
+
+    $result = [string]$text
+    if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+        $result = [regex]::Replace($result, [regex]::Escape($env:USERPROFILE), "%USERPROFILE%", "IgnoreCase")
+    }
+
+    # Project mirror settings may contain the original user's home path. Present it
+    # portably in prompts without changing the actual settings source.
+    $result = [regex]::Replace($result, '(?i)C:\\Users\\[^\\]+\\\.qwen', '%USERPROFILE%\.qwen')
+    return $result
+}
+
+function Build-SettingsAwareSystemPrompt($settings, $providerInfo) {
     $general = Get-JsonProperty $settings "general"
     $outputLanguage = [string](Get-JsonProperty $general "outputLanguage")
     if ([string]::IsNullOrWhiteSpace($outputLanguage)) { $outputLanguage = "한국어" }
@@ -716,7 +730,7 @@ function Build-SettingsAwareSystemPrompt($settings, $providerInfo, [string]$sour
     $permissions = Get-JsonProperty $settings "permissions"
     $allow = Get-JsonProperty $permissions "allow"
     $allowText = ""
-    if ($allow) { $allowText = (($allow | ForEach-Object { "- $_" }) -join "`n") }
+    if ($allow) { $allowText = (($allow | ForEach-Object { "- $(Convert-SettingHintForPrompt ([string]$_))" }) -join "`n") }
 
     $generationConfig = Get-JsonProperty $providerInfo.ProviderRaw "generationConfig"
     $generationConfigJson = "{}"
@@ -725,7 +739,7 @@ function Build-SettingsAwareSystemPrompt($settings, $providerInfo, [string]$sour
 @"
 너는 Java Spring Boot, MyBatis/JPA, React, TypeScript, 운영 배포 환경을 함께 보는 시니어 개발 아키텍트다.
 
-아래 정보는 $sourceSettingsPath 에서 읽은 클라이언트 설정이다. 이 설정을 무시하지 말고 응답 방식과 작업 범위 판단에 반영한다.
+아래 정보는 Qwen settings에서 읽은 클라이언트 설정이다. 이 설정을 무시하지 말고 응답 방식과 작업 범위 판단에 반영한다.
 
 - provider type: $($providerInfo.Type)
 - provider name: $($providerInfo.ProviderName)
@@ -736,7 +750,7 @@ function Build-SettingsAwareSystemPrompt($settings, $providerInfo, [string]$sour
 - provider.generationConfig:
 $generationConfigJson
 
-Qwen settings permissions.allow 참고값:
+Qwen settings permissions.allow 참고값(프롬프트용 경로 표기는 동적 환경 기준으로 정규화):
 $allowText
 
 매 응답은 반드시 아래 규칙을 지킨다.
@@ -929,7 +943,10 @@ $settingsRaw = Read-Utf8File $SettingsPath
 $settings = $settingsRaw | ConvertFrom-Json
 $providerInfo = Get-SettingsProvider $settings $ProviderName $ModelName
 $EffectiveTimeoutSec = Get-EffectiveTimeoutSeconds $providerInfo
-$networkIdentity = Get-ClientNetworkIdentity $providerInfo.BaseUrl
+$networkIdentity = $null
+if ($LoopDiagnosticHeaders) {
+    $networkIdentity = Get-ClientNetworkIdentity $providerInfo.BaseUrl
+}
 
 $nextQuestionPath = Join-Path $WorkDir "next_question.txt"
 $lastTurnPath = Join-Path $WorkDir "last_turn.txt"
@@ -940,7 +957,7 @@ $errorLogPath = Join-Path $WorkDir "error.log"
 $initialQuestion = Initialize-NextQuestion $nextQuestionPath $jsonlPath $transcriptPath $lastTurnPath $SeedFile $QuestionBankFile $QuestionTrack
 $seedQuestion = $initialQuestion.Question
 
-$systemPrompt = Build-SettingsAwareSystemPrompt $settings $providerInfo $SettingsPath
+$systemPrompt = Build-SettingsAwareSystemPrompt $settings $providerInfo
 
 Write-Host "=== Qwen Loop Scheduler v4 SETTINGS-FIRST ===" -ForegroundColor Green
 Write-Host "SettingsPath : $SettingsPath"
@@ -956,8 +973,12 @@ else { Write-Host "Authorization: sent exactly from $($providerInfo.ApiKeySource
 if (Test-QuotedEmptySecret $providerInfo.ApiKey) {
     Write-Host "WARNING      : API key value is literal empty quotes. OS env or .env should override it for real calls." -ForegroundColor Yellow
 }
-Write-Host "ClientHost   : $($networkIdentity.computerName) / $($networkIdentity.userDomain)\$($networkIdentity.userName)"
-Write-Host "ClientIP     : $($networkIdentity.localAddress):$($networkIdentity.localPort)"
+if ($LoopDiagnosticHeaders) {
+    Write-Host "ClientHost   : $($networkIdentity.computerName) / $($networkIdentity.userDomain)\$($networkIdentity.userName)"
+    Write-Host "ClientIP     : $($networkIdentity.localAddress):$($networkIdentity.localPort)"
+} else {
+    Write-Host "ClientIdent  : disabled; use -LoopDiagnosticHeaders only when receiver-side tracing needs it"
+}
 Write-Host "CompatBody   : $CompatBody"
 Write-Host "WireMode     : Qwen Code OpenAI SDK-like headers/body"
 Write-Host "Stream       : $(-not [bool]$NonStreaming)"
@@ -971,6 +992,7 @@ Write-Host "==============================================" -ForegroundColor Gre
 
 $settingsSummary = [ordered]@{
     settingsPath = $SettingsPath
+    settingsPathPolicy = "runtime settings file path used by this process; not included in API request body"
     providerType = $providerInfo.Type
     providerName = $providerInfo.ProviderName
     providerId = $providerInfo.ProviderId
@@ -981,7 +1003,8 @@ $settingsSummary = [ordered]@{
     authorizationSent = ($null -ne $providerInfo.ApiKey)
     apiKeyLogged = if ($MaskSensitiveLogs -and -not $LogSensitive) { Mask-Secret $providerInfo.ApiKey } else { $providerInfo.ApiKey }
     apiKeyLooksLikeQuotedEmpty = (Test-QuotedEmptySecret $providerInfo.ApiKey)
-    clientNetworkIdentity = ConvertTo-PlainObject $networkIdentity
+    clientNetworkIdentity = if ($LoopDiagnosticHeaders) { ConvertTo-PlainObject $networkIdentity } else { $null }
+    clientNetworkIdentityPolicy = if ($LoopDiagnosticHeaders) { "collected-and-sent-as-X-Qwen-Loop-diagnostic-headers" } else { "not-collected-or-sent-by-default" }
     compatBody = [bool]$CompatBody
     stream = (-not [bool]$NonStreaming)
     timeoutSec = $EffectiveTimeoutSec

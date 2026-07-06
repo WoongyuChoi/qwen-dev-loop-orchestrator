@@ -6,7 +6,7 @@ Windows 11에서 Qwen Code용 `settings.json`을 기반으로 Qwen/OpenAI-compat
 
 ## 핵심 목표
 
-- `C:\Users\KB099\.qwen\settings.json` 설정을 최대한 존중한다.
+- `%USERPROFILE%\.qwen\settings.json` 설정을 최대한 존중한다.
 - `envKey`, `generationConfig`, `permissions`, `general`, `ui`, `$version` 등을 임의로 버리지 않는다.
 - Windows 11에서 더블클릭 BAT 파일로 실행한다.
 - 한글 질문/응답/로그가 깨지지 않도록 UTF-8을 강제한다.
@@ -59,7 +59,7 @@ run-qwen-loop.bat                 실제 사용자 settings 기준 메인 루프
 
 세부 검증용 파일:
 
-실제 사용자 경로 `C:\Users\KB099\.qwen\settings.json`을 읽는 파일:
+실제 사용자 경로 `%USERPROFILE%\.qwen\settings.json`을 읽는 파일:
 
 ```text
 01_CHECK_SETTINGS_DOUBLECLICK.bat
@@ -87,7 +87,9 @@ run-qwen-loop.bat                 실제 사용자 settings 기준 메인 루프
 
 ## 로그 파일
 
-실행 후 `qwen-loop-data` 폴더에 생성됩니다.
+실행 후 `qwen-loop-data` 폴더에 생성됩니다. 이 폴더는 `.gitignore` 대상인 런타임 상태/검증 출력이며 설정 원천이 아닙니다. 다른 PC에서 실행하면 그 PC의 `%USERPROFILE%`, settings 경로, 질문 상태에 맞춰 새로 생성됩니다.
+
+기본 실행에서는 Qwen Code CLI 전송 모양을 해치지 않도록 PC명, 사용자명, 도메인, TCP local IP, target host 같은 `X-Qwen-Loop-*` 진단값을 조회하거나 보내지 않습니다. 수신자 추적이 필요할 때만 `-LoopDiagnosticHeaders`를 켜며, 이때 생성되는 `clientNetworkIdentity` 값은 해당 실행 환경에서 동적으로 계산된 진단 로그입니다.
 
 ```text
 settings_effective_summary.json
