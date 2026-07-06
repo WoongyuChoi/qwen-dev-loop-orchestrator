@@ -1,0 +1,543 @@
+diff -ruN /mnt/data/qwen_v1/qwen_loop_scheduler/README.md /mnt/data/qwen_v2/qwen_loop_scheduler_v2/README.md
+--- /mnt/data/qwen_v1/qwen_loop_scheduler/README.md	2026-07-03 08:43:32.000000000 +0000
++++ /mnt/data/qwen_v2/qwen_loop_scheduler_v2/README.md	2026-07-03 08:58:10.000000000 +0000
+@@ -1,6 +1,6 @@
+-﻿# Qwen Loop Scheduler
++﻿# Qwen Loop Scheduler v2
+ 
+-`C:\Users\KB099\.qwen\settings.json`에 있는 Qwen Code 설정을 읽어서, OpenAI-compatible API로 10분마다 질문을 던지는 Windows용 루프 스크립트입니다.
++Windows 11에서 `C:\Users\KB099\.qwen\settings.json`에 있는 Qwen Code 설정을 읽어서, OpenAI-compatible API로 일정 간격마다 질문을 던지는 루프 스크립트입니다.
+ 
+ ## 파일
+ 
+@@ -9,6 +9,7 @@
+ - `seed_prompt.txt`: 첫 질문
+ - `context_files.txt`: 매 요청마다 같이 첨부할 문서 경로 목록
+ - `qwen-loop-data/next_question.txt`: 다음 루프 질문 저장 위치
++- `qwen-loop-data/last_answer.txt`: 직전 답변 저장 위치
+ - `qwen-loop-data/transcript.md`: 질문/답변 누적 로그
+ - `qwen-loop-data/transcript.jsonl`: JSONL 로그
+ - `qwen-loop-data/error.log`: 오류 로그
+@@ -21,13 +22,36 @@
+ 4. `run-qwen-loop.bat`를 더블클릭하거나 cmd에서 실행합니다.
+ 5. 종료는 콘솔에서 `Ctrl+C`를 누릅니다.
+ 
++## 동작 확인만 하기
++
++PowerShell에서 아래처럼 실행하면 API 호출 없이 settings 파싱만 확인합니다.
++
++```powershell
++powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\qwen-loop.ps1 -DryRun
++```
++
++한 번만 실제 호출해보고 싶으면 아래처럼 실행합니다.
++
++```powershell
++powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\qwen-loop.ps1 -MaxRuns 1 -IntervalSeconds 5
++```
++
+ ## 기본값
+ 
+-- settings path: `C:\Users\KB099\.qwen\settings.json`
++- settings path: `%USERPROFILE%\.qwen\settings.json`
+ - interval: 600초
+ - max_tokens: 8192
+ - temperature: 0.35
++- timeout: 900초
++
++## provider 선택
++
++settings.json에 `qwen3.6-agent_test` 같은 두 번째 provider가 있다면:
++
++```powershell
++powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\qwen-loop.ps1 -ProviderName "qwen3.6-agent_test"
++```
+ 
+ ## 주의
+ 
+-이 루프는 모델의 가중치를 학습시키지는 않습니다. 대신 질문/답변 로그를 계속 쌓아 프로젝트 분석 문서나 RAG 자료로 재활용할 수 있게 해줍니다.
++이 루프는 모델의 가중치를 학습시키지는 않습니다. 대신 질문/답변 로그와 분석 자료를 계속 쌓아 프로젝트 분석 문서나 RAG 자료로 재활용할 수 있게 해줍니다.
+diff -ruN /mnt/data/qwen_v1/qwen_loop_scheduler/context_files.txt /mnt/data/qwen_v2/qwen_loop_scheduler_v2/context_files.txt
+--- /mnt/data/qwen_v1/qwen_loop_scheduler/context_files.txt	2026-07-03 08:43:32.000000000 +0000
++++ /mnt/data/qwen_v2/qwen_loop_scheduler_v2/context_files.txt	2026-07-03 08:59:34.000000000 +0000
+@@ -1,4 +1,5 @@
+-﻿# 여기에 매 루프마다 같이 넣고 싶은 문서 파일 경로를 한 줄씩 적으세요.
++# 여기에 매 루프마다 같이 넣고 싶은 문서 파일 경로를 한 줄씩 적으세요.
++# %USERPROFILE%, ~ 도 사용할 수 있습니다.
+ # 예시:
+ # C:\workspace\my-project\docs\AI_PROJECT_MAP.md
+ # C:\workspace\my-project\.continue\rules\project.md
+diff -ruN /mnt/data/qwen_v1/qwen_loop_scheduler/qwen-loop.ps1 /mnt/data/qwen_v2/qwen_loop_scheduler_v2/qwen-loop.ps1
+--- /mnt/data/qwen_v1/qwen_loop_scheduler/qwen-loop.ps1	2026-07-03 08:43:32.000000000 +0000
++++ /mnt/data/qwen_v2/qwen_loop_scheduler_v2/qwen-loop.ps1	2026-07-03 08:59:34.000000000 +0000
+@@ -9,23 +9,30 @@
+     [int]$MaxTokens = 8192,
+     [double]$Temperature = 0.35,
+     [int]$TimeoutSec = 900,
+-    [int]$MaxContextChars = 30000
++    [int]$MaxContextChars = 30000,
++    [int]$IncludePreviousAnswerChars = 12000,
++    [int]$MaxRuns = 0,
++    [switch]$NoAuthHeader,
++    [switch]$DryRun
+ )
+ 
+ $ErrorActionPreference = "Stop"
+-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
++$ProgressPreference = "SilentlyContinue"
++[System.Net.ServicePointManager]::Expect100Continue = $false
++try { [Console]::InputEncoding = [System.Text.Encoding]::UTF8 } catch {}
++try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
+ $OutputEncoding = [System.Text.Encoding]::UTF8
+ 
+ function Write-Utf8File($Path, $Text) {
+     $dir = Split-Path -Parent $Path
+     if ($dir -and !(Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+-    [System.IO.File]::WriteAllText($Path, $Text, [System.Text.UTF8Encoding]::new($false))
++    [System.IO.File]::WriteAllText($Path, [string]$Text, [System.Text.UTF8Encoding]::new($false))
+ }
+ 
+ function Append-Utf8File($Path, $Text) {
+     $dir = Split-Path -Parent $Path
+     if ($dir -and !(Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+-    [System.IO.File]::AppendAllText($Path, $Text, [System.Text.UTF8Encoding]::new($false))
++    [System.IO.File]::AppendAllText($Path, [string]$Text, [System.Text.UTF8Encoding]::new($false))
+ }
+ 
+ function Normalize-ApiKey($value) {
+@@ -37,45 +44,82 @@
+     return $v
+ }
+ 
++function Expand-PathInput([string]$PathText) {
++    if ([string]::IsNullOrWhiteSpace($PathText)) { return $PathText }
++    $p = [Environment]::ExpandEnvironmentVariables($PathText.Trim())
++    if ($p -eq "~") { return $env:USERPROFILE }
++    if ($p.StartsWith("~\") -or $p.StartsWith("~/")) {
++        return (Join-Path $env:USERPROFILE $p.Substring(2))
++    }
++    return $p
++}
++
++function Get-JsonProperty($obj, [string]$name) {
++    if ($null -eq $obj) { return $null }
++    $prop = $obj.PSObject.Properties | Where-Object { $_.Name -eq $name } | Select-Object -First 1
++    if ($prop) { return $prop.Value }
++    return $null
++}
++
+ function Get-SettingsProvider($settings, [string]$providerName, [string]$modelNameOverride) {
+     $selectedType = "openai"
+-    if ($settings.security -and $settings.security.auth -and $settings.security.auth.selectedType) {
+-        $selectedType = [string]$settings.security.auth.selectedType
++    $security = Get-JsonProperty $settings "security"
++    $auth = Get-JsonProperty $security "auth"
++    $selected = Get-JsonProperty $auth "selectedType"
++    if (-not [string]::IsNullOrWhiteSpace([string]$selected)) { $selectedType = [string]$selected }
++
++    $modelProviders = Get-JsonProperty $settings "modelProviders"
++    $providerListRaw = Get-JsonProperty $modelProviders $selectedType
++    if ($null -eq $providerListRaw) {
++        throw "settings.json에서 modelProviders.$selectedType 항목을 찾지 못했습니다."
+     }
+ 
+-    $providers = @($settings.modelProviders.$selectedType)
++    $providers = @($providerListRaw) | Where-Object { $null -ne $_ }
+     if ($providers.Count -eq 0) {
+-        throw "settings.json에서 modelProviders.$selectedType 항목을 찾지 못했습니다."
++        throw "settings.json의 modelProviders.$selectedType 목록이 비어 있습니다."
+     }
+ 
+     $target = $providerName
+-    if ([string]::IsNullOrWhiteSpace($target) -and $settings.model -and $settings.model.name) {
+-        $target = [string]$settings.model.name
++    $model = Get-JsonProperty $settings "model"
++    $settingsModelName = Get-JsonProperty $model "name"
++    if ([string]::IsNullOrWhiteSpace($target) -and -not [string]::IsNullOrWhiteSpace([string]$settingsModelName)) {
++        $target = [string]$settingsModelName
+     }
+ 
+     $provider = $null
+     if (-not [string]::IsNullOrWhiteSpace($target)) {
+-        $provider = $providers | Where-Object { $_.name -eq $target -or $_.id -eq $target } | Select-Object -First 1
++        $provider = $providers | Where-Object {
++            ([string](Get-JsonProperty $_ "name")) -eq $target -or ([string](Get-JsonProperty $_ "id")) -eq $target
++        } | Select-Object -First 1
++        if ($null -eq $provider) {
++            Write-Host "[WARN] provider/model '$target'을 찾지 못해서 첫 번째 provider를 사용합니다." -ForegroundColor Yellow
++        }
+     }
+     if ($null -eq $provider) { $provider = $providers | Select-Object -First 1 }
+ 
+-    $modelId = if ([string]::IsNullOrWhiteSpace($modelNameOverride)) { [string]$provider.id } else { $modelNameOverride }
+-    if ([string]::IsNullOrWhiteSpace($modelId)) { $modelId = [string]$provider.name }
++    $providerNameValue = [string](Get-JsonProperty $provider "name")
++    $providerId = [string](Get-JsonProperty $provider "id")
++    $modelId = if ([string]::IsNullOrWhiteSpace($modelNameOverride)) { $providerId } else { $modelNameOverride }
++    if ([string]::IsNullOrWhiteSpace($modelId)) { $modelId = $providerNameValue }
++
++    $baseUrl = [string](Get-JsonProperty $provider "baseUrl")
++    if ([string]::IsNullOrWhiteSpace($baseUrl)) { throw "선택된 provider에 baseUrl이 없습니다." }
+ 
+     $apiKey = $null
+-    if ($provider.envKey) {
+-        $apiKey = [Environment]::GetEnvironmentVariable([string]$provider.envKey)
+-        if ([string]::IsNullOrWhiteSpace($apiKey) -and $settings.env) {
+-            $prop = $settings.env.PSObject.Properties | Where-Object { $_.Name -eq [string]$provider.envKey } | Select-Object -First 1
+-            if ($prop) { $apiKey = $prop.Value }
++    $envKey = [string](Get-JsonProperty $provider "envKey")
++    if (-not [string]::IsNullOrWhiteSpace($envKey)) {
++        $apiKey = [Environment]::GetEnvironmentVariable($envKey)
++        if ([string]::IsNullOrWhiteSpace($apiKey)) {
++            $settingsEnv = Get-JsonProperty $settings "env"
++            $apiKey = Get-JsonProperty $settingsEnv $envKey
+         }
+     }
+ 
+     return [PSCustomObject]@{
+         Type = $selectedType
+-        ProviderName = [string]$provider.name
++        ProviderName = $providerNameValue
+         ModelId = $modelId
+-        BaseUrl = ([string]$provider.baseUrl).TrimEnd('/')
++        BaseUrl = $baseUrl.TrimEnd('/')
+         ApiKey = (Normalize-ApiKey $apiKey)
+     }
+ }
+@@ -85,7 +129,6 @@
+     $candidates = New-Object System.Collections.Generic.List[string]
+     if ($b -match '/v1$') {
+         $candidates.Add("$b/chat/completions")
+-        $candidates.Add(($b -replace '/v1$', '') + "/v1/chat/completions")
+     } else {
+         $candidates.Add("$b/v1/chat/completions")
+         $candidates.Add("$b/chat/completions")
+@@ -93,33 +136,49 @@
+     return $candidates | Select-Object -Unique
+ }
+ 
++function Read-TextFileUtf8([string]$Path) {
++    return [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
++}
++
+ function Read-ContextBundle([string]$listFile, [int]$maxChars) {
+     if (!(Test-Path $listFile)) { return "" }
+ 
+     $paths = Get-Content -Path $listFile -Encoding UTF8 |
+-        ForEach-Object { $_.Trim() } |
++        ForEach-Object { ($_ -replace '^\uFEFF', '').Trim() } |
+         Where-Object { $_ -and -not $_.StartsWith('#') }
+ 
+-    if ($paths.Count -eq 0) { return "" }
++    if (@($paths).Count -eq 0) { return "" }
+ 
+     $bundleParts = New-Object System.Collections.Generic.List[string]
+     $used = 0
+-    foreach ($p in $paths) {
++    foreach ($p0 in @($paths)) {
++        $p = Expand-PathInput $p0
+         try {
+             $resolved = Resolve-Path $p -ErrorAction Stop | Select-Object -First 1
+-            $raw = Get-Content -Path $resolved.Path -Raw -Encoding UTF8
++            if ((Get-Item $resolved.Path).PSIsContainer) {
++                $bundleParts.Add("`n--- CONTEXT DIRECTORY SKIPPED: $($resolved.Path) ---`n파일 경로를 직접 지정하세요.`n")
++                continue
++            }
++            $raw = Read-TextFileUtf8 $resolved.Path
+             $remaining = $maxChars - $used
+             if ($remaining -le 0) { break }
+             if ($raw.Length -gt $remaining) { $raw = $raw.Substring(0, $remaining) + "`n...[context truncated]..." }
+             $bundleParts.Add("`n--- CONTEXT FILE: $($resolved.Path) ---`n$raw`n--- END CONTEXT FILE ---`n")
+             $used += $raw.Length
+         } catch {
+-            $bundleParts.Add("`n--- CONTEXT FILE LOAD FAILED: $p / $($_.Exception.Message) ---`n")
++            $bundleParts.Add("`n--- CONTEXT FILE LOAD FAILED: $p0 / $($_.Exception.Message) ---`n")
+         }
+     }
+     return ($bundleParts -join "`n")
+ }
+ 
++function Truncate-Text([string]$text, [int]$maxChars) {
++    if ([string]::IsNullOrWhiteSpace($text)) { return "" }
++    if ($maxChars -le 0) { return "" }
++    if ($text.Length -le $maxChars) { return $text }
++    return $text.Substring(0, $maxChars) + "`n...[previous answer truncated]..."
++}
++
+ function Extract-NextQuestion([string]$content) {
+     $lines = $content -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" }
+     foreach ($line in $lines) {
+@@ -127,19 +186,64 @@
+             return $Matches[1].Trim()
+         }
+     }
+-    if ($lines.Count -gt 0) {
+-        $candidate = $lines[0] -replace '^[-#\d\.\s]+', ''
++    if (@($lines).Count -gt 0) {
++        $candidate = [string]$lines[0]
++        $candidate = $candidate -replace '^[-#\d\.\s]+', ''
+         $candidate = $candidate -replace '^다음\s*질문\s*[:：]\s*', ''
+         if ($candidate.Length -gt 300) { $candidate = $candidate.Substring(0, 300) }
+-        return $candidate.Trim()
++        if (-not [string]::IsNullOrWhiteSpace($candidate)) { return $candidate.Trim() }
+     }
+     return "이전 답변을 바탕으로 Java Spring Boot와 React 개발 관점에서 더 깊게 분석해야 할 다음 질문을 만들어줘."
+ }
+ 
++function Invoke-JsonPostUtf8($Uri, $Headers, $BodyObject, [int]$TimeoutSec) {
++    $json = $BodyObject | ConvertTo-Json -Depth 50 -Compress
++    $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
++
++    $request = [System.Net.HttpWebRequest][System.Net.WebRequest]::Create($Uri)
++    $request.Method = "POST"
++    $request.Accept = "application/json"
++    $request.ContentType = "application/json; charset=utf-8"
++    $request.Timeout = $TimeoutSec * 1000
++    $request.ReadWriteTimeout = $TimeoutSec * 1000
++    $request.ContentLength = $bytes.Length
++
++    foreach ($key in $Headers.Keys) {
++        if ($key -eq "Accept") { $request.Accept = [string]$Headers[$key]; continue }
++        if ($key -eq "Content-Type") { $request.ContentType = [string]$Headers[$key]; continue }
++        $request.Headers[$key] = [string]$Headers[$key]
++    }
++
++    $reqStream = $request.GetRequestStream()
++    try { $reqStream.Write($bytes, 0, $bytes.Length) } finally { $reqStream.Dispose() }
++
++    try {
++        $response = [System.Net.HttpWebResponse]$request.GetResponse()
++        try {
++            $reader = New-Object System.IO.StreamReader($response.GetResponseStream(), [System.Text.Encoding]::UTF8)
++            try { $text = $reader.ReadToEnd() } finally { $reader.Dispose() }
++        } finally {
++            $response.Dispose()
++        }
++        if ([string]::IsNullOrWhiteSpace($text)) { throw "빈 응답을 받았습니다." }
++        return $text | ConvertFrom-Json
++    } catch [System.Net.WebException] {
++        $errText = $_.Exception.Message
++        if ($_.Exception.Response) {
++            try {
++                $errResp = [System.Net.HttpWebResponse]$_.Exception.Response
++                $reader = New-Object System.IO.StreamReader($errResp.GetResponseStream(), [System.Text.Encoding]::UTF8)
++                try { $errText = $reader.ReadToEnd() } finally { $reader.Dispose(); $errResp.Dispose() }
++            } catch {}
++        }
++        throw "HTTP 호출 실패: $errText"
++    }
++}
++
+ function Invoke-QwenChat($providerInfo, [string]$systemPrompt, [string]$userPrompt) {
+-    $headers = @{
+-        "Authorization" = "Bearer $($providerInfo.ApiKey)"
+-        "Accept" = "application/json"
++    $headers = @{ "Accept" = "application/json" }
++    if (-not $NoAuthHeader) {
++        $headers["Authorization"] = "Bearer $($providerInfo.ApiKey)"
+     }
+ 
+     $bodyObj = [ordered]@{
+@@ -152,19 +256,18 @@
+         max_tokens = $MaxTokens
+         stream = $false
+     }
+-    $body = $bodyObj | ConvertTo-Json -Depth 20
+ 
+     $lastError = $null
+     foreach ($endpoint in (Get-EndpointCandidates $providerInfo.BaseUrl)) {
+         try {
+             Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] POST $endpoint" -ForegroundColor Cyan
+-            $resp = Invoke-RestMethod -Uri $endpoint -Method Post -Headers $headers -ContentType "application/json; charset=utf-8" -Body $body -TimeoutSec $TimeoutSec
++            $resp = Invoke-JsonPostUtf8 -Uri $endpoint -Headers $headers -BodyObject $bodyObj -TimeoutSec $TimeoutSec
+             if ($resp.choices -and $resp.choices.Count -gt 0) {
+-                $msg = $resp.choices[0].message
+-                if ($msg -and $msg.content) { return [string]$msg.content }
+-                if ($resp.choices[0].text) { return [string]$resp.choices[0].text }
++                $choice = $resp.choices[0]
++                if ($choice.message -and $choice.message.content) { return [string]$choice.message.content }
++                if ($choice.text) { return [string]$choice.text }
+             }
+-            return ($resp | ConvertTo-Json -Depth 20)
++            return ($resp | ConvertTo-Json -Depth 50)
+         } catch {
+             $lastError = $_.Exception.Message
+             Write-Host "Endpoint failed: $endpoint" -ForegroundColor Yellow
+@@ -174,22 +277,28 @@
+     throw "모든 endpoint 호출 실패. 마지막 오류: $lastError"
+ }
+ 
++$SettingsPath = Expand-PathInput $SettingsPath
++$SeedFile = Expand-PathInput $SeedFile
++$ContextListFile = Expand-PathInput $ContextListFile
++$WorkDir = Expand-PathInput $WorkDir
++
+ if (!(Test-Path $SettingsPath)) {
+     throw "settings.json을 찾지 못했습니다: $SettingsPath"
+ }
+ 
+ New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
+-$settings = Get-Content -Path $SettingsPath -Raw -Encoding UTF8 | ConvertFrom-Json
++$settings = Read-TextFileUtf8 $SettingsPath | ConvertFrom-Json
+ $providerInfo = Get-SettingsProvider $settings $ProviderName $ModelName
+ 
+ $nextQuestionPath = Join-Path $WorkDir "next_question.txt"
++$lastAnswerPath = Join-Path $WorkDir "last_answer.txt"
+ $transcriptPath = Join-Path $WorkDir "transcript.md"
+ $jsonlPath = Join-Path $WorkDir "transcript.jsonl"
+ $errorLogPath = Join-Path $WorkDir "error.log"
+ 
+ $seedQuestion = "Java Spring Boot와 React 프로젝트를 장기적으로 개선하기 위해, 먼저 백엔드 구조와 프론트엔드 연동 구조를 어떤 순서로 분석해야 하는지 알려줘."
+ if (Test-Path $SeedFile) {
+-    $seedQuestion = (Get-Content -Path $SeedFile -Raw -Encoding UTF8).Trim()
++    $seedQuestion = (Read-TextFileUtf8 $SeedFile).Trim()
+ }
+ if (!(Test-Path $nextQuestionPath)) {
+     Write-Utf8File $nextQuestionPath $seedQuestion
+@@ -211,28 +320,47 @@
+ 7. 토큰을 아끼기 위해 너무 짧게 답하지 말고, 가능한 한 깊이 있는 분석, 체크리스트, 예시, 반례, 검증 방법을 포함한다.
+ "@
+ 
+-Write-Host "=== Qwen Loop Scheduler ===" -ForegroundColor Green
++Write-Host "=== Qwen Loop Scheduler v2 ===" -ForegroundColor Green
+ Write-Host "SettingsPath : $SettingsPath"
+ Write-Host "Provider     : $($providerInfo.ProviderName)"
+ Write-Host "BaseUrl      : $($providerInfo.BaseUrl)"
+ Write-Host "Model        : $($providerInfo.ModelId)"
++Write-Host "Endpoints    : $((Get-EndpointCandidates $providerInfo.BaseUrl) -join ', ')"
+ Write-Host "IntervalSec  : $IntervalSeconds"
+ Write-Host "MaxTokens    : $MaxTokens"
+ Write-Host "WorkDir      : $WorkDir"
++Write-Host "MaxRuns      : $MaxRuns (0 = infinite)"
+ Write-Host "Stop         : Ctrl+C"
+-Write-Host "===========================" -ForegroundColor Green
++Write-Host "===============================" -ForegroundColor Green
+ 
++if ($DryRun) {
++    Write-Host "DryRun mode: 설정 파싱만 확인하고 종료합니다." -ForegroundColor Cyan
++    exit 0
++}
++
++$runCount = 0
+ while ($true) {
++    $runCount++
+     $started = Get-Date
+     try {
+-        $question = (Get-Content -Path $nextQuestionPath -Raw -Encoding UTF8).Trim()
++        $question = (Read-TextFileUtf8 $nextQuestionPath).Trim()
+         if ([string]::IsNullOrWhiteSpace($question)) { $question = $seedQuestion }
+ 
+         $contextBundle = Read-ContextBundle $ContextListFile $MaxContextChars
++        $previousAnswer = ""
++        if (Test-Path $lastAnswerPath) {
++            $previousAnswer = Truncate-Text ((Read-TextFileUtf8 $lastAnswerPath).Trim()) $IncludePreviousAnswerChars
++        }
++
+         $userPrompt = @"
++현재 루프 번호: $runCount
++
+ 현재 루프 질문:
+ $question
+ 
++직전 답변 발췌:
++$previousAnswer
++
+ 공통 컨텍스트:
+ $contextBundle
+ 
+@@ -241,7 +369,7 @@
+ 반드시 첫 번째 줄에는 NEXT_QUESTION: 으로 시작하는 다음 후속 질문을 한 줄로 작성하고, 그 뒤에 현재 질문에 대한 상세 답변을 작성해줘.
+ "@
+ 
+-        Write-Host "`n[$($started.ToString('yyyy-MM-dd HH:mm:ss'))] QUESTION:" -ForegroundColor Green
++        Write-Host "`n[$($started.ToString('yyyy-MM-dd HH:mm:ss'))] RUN #$runCount QUESTION:" -ForegroundColor Green
+         Write-Host $question
+ 
+         $answer = Invoke-QwenChat $providerInfo $systemPrompt $userPrompt
+@@ -249,12 +377,13 @@
+         $ended = Get-Date
+ 
+         Write-Utf8File $nextQuestionPath $nextQuestion
++        Write-Utf8File $lastAnswerPath $answer
+ 
+         $md = @"
+ 
+ ---
+ 
+-# $($started.ToString('yyyy-MM-dd HH:mm:ss'))
++# $($started.ToString('yyyy-MM-dd HH:mm:ss')) / Run #$runCount
+ 
+ ## Question
+ 
+@@ -274,6 +403,7 @@
+         $record = [ordered]@{
+             started = $started.ToString("o")
+             ended = $ended.ToString("o")
++            run = $runCount
+             provider = $providerInfo.ProviderName
+             baseUrl = $providerInfo.BaseUrl
+             model = $providerInfo.ModelId
+@@ -281,20 +411,26 @@
+             nextQuestion = $nextQuestion
+             answer = $answer
+         }
+-        Append-Utf8File $jsonlPath (($record | ConvertTo-Json -Compress -Depth 20) + "`n")
++        Append-Utf8File $jsonlPath (($record | ConvertTo-Json -Compress -Depth 50) + "`n")
+ 
+         Write-Host "`nNEXT QUESTION:" -ForegroundColor Magenta
+         Write-Host $nextQuestion
+         Write-Host "`nSaved:" -ForegroundColor DarkGreen
+         Write-Host "- $nextQuestionPath"
++        Write-Host "- $lastAnswerPath"
+         Write-Host "- $transcriptPath"
+         Write-Host "- $jsonlPath"
+     } catch {
+-        $msg = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ERROR: $($_.Exception.Message)`n$($_.ScriptStackTrace)`n"
++        $msg = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] RUN #$runCount ERROR: $($_.Exception.Message)`n$($_.ScriptStackTrace)`n"
+         Append-Utf8File $errorLogPath $msg
+         Write-Host $msg -ForegroundColor Red
+     }
+ 
++    if ($MaxRuns -gt 0 -and $runCount -ge $MaxRuns) {
++        Write-Host "MaxRuns=$MaxRuns reached. 종료합니다." -ForegroundColor Cyan
++        break
++    }
++
+     Write-Host "`nWaiting $IntervalSeconds seconds... Ctrl+C to stop." -ForegroundColor DarkGray
+     Start-Sleep -Seconds $IntervalSeconds
+ }
+diff -ruN /mnt/data/qwen_v1/qwen_loop_scheduler/run-qwen-loop.bat /mnt/data/qwen_v2/qwen_loop_scheduler_v2/run-qwen-loop.bat
+--- /mnt/data/qwen_v1/qwen_loop_scheduler/run-qwen-loop.bat	2026-07-03 08:43:32.000000000 +0000
++++ /mnt/data/qwen_v2/qwen_loop_scheduler_v2/run-qwen-loop.bat	2026-07-03 08:58:10.000000000 +0000
+@@ -1,18 +1,26 @@
+ @echo off
+ chcp 65001 >nul
+-setlocal
++setlocal EnableExtensions
+ 
+-REM Qwen self-questioning loop runner
+-REM Stop: press Ctrl+C, then Y
++REM Qwen self-questioning loop runner for Windows 11
++REM Stop: press Ctrl+C, then Y if prompted.
+ 
+ set "SCRIPT_DIR=%~dp0"
++set "SETTINGS_PATH=%USERPROFILE%\.qwen\settings.json"
+ 
+-powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%qwen-loop.ps1" ^
+-  -SettingsPath "C:\Users\KB099\.qwen\settings.json" ^
++if not exist "%SETTINGS_PATH%" (
++  echo [ERROR] settings.json not found: %SETTINGS_PATH%
++  pause
++  exit /b 1
++)
++
++powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%qwen-loop.ps1" ^
++  -SettingsPath "%SETTINGS_PATH%" ^
+   -IntervalSeconds 600 ^
+   -MaxTokens 8192 ^
+   -Temperature 0.35 ^
+   -TimeoutSec 900 ^
++  -IncludePreviousAnswerChars 12000 ^
+   -WorkDir "%SCRIPT_DIR%qwen-loop-data" ^
+   -SeedFile "%SCRIPT_DIR%seed_prompt.txt" ^
+   -ContextListFile "%SCRIPT_DIR%context_files.txt"

@@ -1,0 +1,75 @@
+{
+  "modelProviders": {
+    "openai": [
+      {
+        "id": "qwen3.6-agent",
+        "name": "qwen3.6-agent",
+        "baseUrl": "http://10.32.64.116:8002",
+        "envKey": "QWEN_CUSTOM_API_KEY_OPENAI_HTTP_10_32_64_116_8002_6B7D16BE4284",
+        "generationConfig": {
+          "modalities": {
+            "image": true
+          }
+        }
+      },
+      {
+        "id": "qwen3.6-agent",
+        "name": "qwen3.6-agent_test",
+        "baseUrl": "http://10.32.64.116:8510",
+        "envKey": "QWEN_CUSTOM_API_KEY_OPENAI_HTTP_10_32_64_116_8002_6B7D16BE4284",
+        "generationConfig": {
+          "modalities": {
+            "image": true
+          }
+        }
+      }
+    ]
+  },
+  "env": {
+    "QWEN_CUSTOM_API_KEY_OPENAI_HTTP_10_32_64_116_8002_6B7D16BE4284": "\"\"",
+    "OLLAMA_API_KEYS": "not-needed"
+  },
+  "security": {
+    "auth": {
+      "selectedType": "openai"
+    }
+  },
+  "$version": 4,
+  "model": {
+    "name": "qwen3.6-agent"
+  },
+  "general": {
+    "outputLanguage": "한국"
+  },
+  "permissions": {
+    "allow": [
+      "Read(C:\\kv3biz\\workspace\\kv3_app_cor\\web\\WEB-INF\\devonhome\\xmlquery/**)",
+      "Bash(dir *)",
+      "Bash(node *)",
+      "Bash(ping *)",
+      "Bash(powershell *)",
+      "Agent(Explore)",
+      "Bash(npm init *)",
+      "Bash(npm install *)",
+      "Skill(wui-to-db-trace)",
+      "Read(C:\\Users\\KB099\\.qwen/**)",
+      "Bash(npm *)"
+    ]
+  },
+  "ui": {
+    "autoModeAcknowledged": true,
+    "feedbackLastShownTimestamp": 1782171739632,
+    "statusLine": {
+      "type": "preset",
+      "useThemeColors": true,
+      "items": [
+        "model-with-reasoning",
+        "git-branch",
+        "context-remaining",
+        "total-input-tokens",
+        "total-output-tokens",
+        "context-used"
+      ]
+    }
+  }
+}

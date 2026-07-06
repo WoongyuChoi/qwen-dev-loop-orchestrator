@@ -1,0 +1,6 @@
+qwen-loop-data/
+*.log
+.DS_Store
+__pycache__/
+.env
+.env.*

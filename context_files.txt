@@ -1,0 +1,6 @@
+# 매 루프마다 함께 넣을 문서 파일 경로를 한 줄에 하나씩 작성하세요.
+# 폴더 경로는 자동으로 읽지 않습니다. 토큰 폭주 방지를 위해 문서 파일만 넣는 것을 권장합니다.
+# 예:
+# C:\workspace\kv3_app_cor\docs\AI_PROJECT_MAP.md
+# C:\workspace\kv3_app_cor\.continue\rules\project.md
+# C:\workspace\kv3_app_cor\docs\tasks\current-feature.md
