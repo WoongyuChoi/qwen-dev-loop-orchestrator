@@ -14,6 +14,7 @@ Windows 11에서 Qwen Code용 `settings.json`을 기반으로 Qwen/OpenAI-compat
 - 한글 질문/응답/로그가 깨지지 않도록 UTF-8을 강제한다.
 - 매 호출 후 8-15분 사이의 랜덤 대기시간을 새로 뽑아 질문 → 답변 → 다음 질문 추출 → 다음 루프를 반복한다.
 - 실제 전송 헤더와 바디를 로그로 확인할 수 있게 한다.
+- 오래 켜둬도 `qwen-loop-data`가 무한정 커지지 않도록 상태 파일은 보존하고 오래된 산출물/큰 로그는 자동 정리한다.
 
 ## Qwen Code 호환 전송 기준
 
@@ -43,6 +44,8 @@ Windows 11에서 Qwen Code용 `settings.json`을 기반으로 Qwen/OpenAI-compat
 서버가 OpenAI-compatible `usage` 값을 반환하면 CMD에 `TokenUse`도 표시합니다. 기본 기준은 출력 토큰이 `1000` 미만이면 초록색 `light`, `1000-3999`면 노란색 `balanced`, `4000` 이상이면 마젠타색 `rich`입니다. 이 루프는 깊은 답변을 의도하므로 `rich`는 경고가 아니라 분석량이 충분하다는 신호에 가깝고, 대신 응답 시간과 비용은 늘 수 있습니다. 기준은 `-TokenLowThreshold`, `-TokenRichThreshold`로 조정합니다.
 
 통신 실패 시 기본 `-MaxRetries 3`으로 즉시 재시도합니다. 네트워크/타임아웃 오류와 HTTP `408`, `409`, `429`, `5xx`는 retry 대상이고, `400`, `401`, `403`, `404`처럼 요청/인증/경로가 틀린 오류는 같은 endpoint에서 반복해도 회복 가능성이 낮아 재시도하지 않습니다. 각 retry 요청의 `X-Stainless-Retry-Count` header는 `0`, `1`, `2`, `3`처럼 실제 시도 횟수에 맞춰 증가합니다.
+
+`qwen-loop-data` 자동정리는 기본으로 켜져 있습니다. 기본값은 전체 WorkDir `100 MB`, `transcript.md`/`transcript.jsonl` 각각 `25 MB`, `error.log` `5 MB`, 오래된 check/DryRun 산출물 `14일`, 최근 대화 `30 turn` 보존입니다. `next_question.txt`, `last_turn.txt`, 최신 request/response 로그처럼 루프 재시작에 필요한 상태 파일은 삭제하지 않습니다. 필요하면 `-MaxWorkDirMB`, `-MaxTranscriptMB`, `-MaxErrorLogMB`, `-CleanupKeepDays`, `-CleanupKeepTurns`로 조정하고, 완전히 끄려면 `-NoAutoCleanup`을 사용합니다.
 
 ## 호출 간격
 
@@ -147,6 +150,8 @@ TokenUse     : light < 1000, rich >= 4000 output tokens
 HeaderLog    : unmasked
 QuestionSrc  : question_bank.txt
 AnswerPreview: 4 lines / 1000 chars
+AutoCleanup  : folder <= 100 MB, transcript <= 25 MB, error <= 5 MB, keep 30 turns, stale check > 14 days
+Cleanup     : ok, current 182.3 KB
 IntervalMode : random
 IntervalRange: 8 min (480 sec) - 15 min (900 sec)
 Countdown    : live every 1 sec
@@ -212,6 +217,8 @@ Retry 1/3 in 1.4 sec...
 실행 후 `qwen-loop-data` 폴더에 생성됩니다. 이 폴더는 `.gitignore` 대상인 런타임 상태/검증 출력이며 설정 원천이 아닙니다. 다른 PC에서 실행하면 그 PC의 `%USERPROFILE%`, settings 경로, 질문 상태에 맞춰 새로 생성됩니다.
 
 기본 실행에서는 Qwen Code CLI 전송 모양을 해치지 않도록 PC명, 사용자명, 도메인, TCP local IP, target host 같은 `X-Qwen-Loop-*` 진단값을 조회하거나 보내지 않습니다. 수신자 추적이 필요할 때만 `-LoopDiagnosticHeaders`를 켜며, 이때 생성되는 `clientNetworkIdentity` 값은 해당 실행 환경에서 동적으로 계산된 진단 로그입니다.
+
+자동정리는 시작 시 한 번, 각 루프 저장 후 한 번 실행됩니다. 크기 임계치를 넘으면 `transcript.md`는 최근 turn 중심으로 compact하고, `transcript.jsonl`은 최근 record와 짧은 답변 preview만 남깁니다. `error.log`는 최근 tail만 남기며, 오래된 check/DryRun 파일은 날짜 기준으로 제거합니다.
 
 ```text
 settings_effective_summary.json

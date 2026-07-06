@@ -25,5 +25,6 @@
 - 대기 중 CMD 같은 줄 countdown으로 남은 시간과 다음 호출 예정 시각을 표시.
 - 실제 응답 수신 후 CMD에 답변 본문 preview와 다음 질문, 저장 경로, 사이클 완료 상태를 표시.
 - 서버가 usage를 반환하면 입력/출력/전체 token 수와 light/balanced/rich 색상 등급을 표시.
+- `qwen-loop-data` 자동정리를 추가해 큰 transcript/error 로그와 오래된 check 산출물을 임계치 기준으로 정리.
 - last_request_headers/body 로그 생성.
 - 더블클릭 BAT 기반 실행 흐름 제공.

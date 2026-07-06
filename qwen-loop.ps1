@@ -20,6 +20,11 @@
     [int]$AnswerPreviewChars = 1000,
     [int]$TokenLowThreshold = 1000,
     [int]$TokenRichThreshold = 4000,
+    [int]$MaxWorkDirMB = 100,
+    [int]$MaxTranscriptMB = 25,
+    [int]$MaxErrorLogMB = 5,
+    [int]$CleanupKeepDays = 14,
+    [int]$CleanupKeepTurns = 30,
     [int]$MaxRuns = 0,
     [int]$MaxRetries = 3,
     [int]$RetryInitialDelaySeconds = 1,
@@ -38,6 +43,7 @@
     [switch]$NoBanner,
     [switch]$NoCountdown,
     [switch]$NoAnswerPreview,
+    [switch]$NoAutoCleanup,
     [switch]$MaskSensitiveLogs,
     [switch]$LogSensitive
 )
@@ -67,6 +73,331 @@ function Append-Utf8File($Path, $Text) {
 
 function Read-Utf8File($Path) {
     return [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8).TrimStart([char]0xFEFF)
+}
+
+function Format-ByteSize([long]$Bytes) {
+    if ($Bytes -ge 1GB) { return ("{0:N1} GB" -f ($Bytes / 1GB)) }
+    if ($Bytes -ge 1MB) { return ("{0:N1} MB" -f ($Bytes / 1MB)) }
+    if ($Bytes -ge 1KB) { return ("{0:N1} KB" -f ($Bytes / 1KB)) }
+    return "$Bytes B"
+}
+
+function Get-DirectorySizeBytes([string]$Path) {
+    if (!(Test-Path -LiteralPath $Path -PathType Container)) { return 0 }
+
+    $total = [int64]0
+    Get-ChildItem -LiteralPath $Path -Recurse -File -Force -ErrorAction SilentlyContinue | ForEach-Object {
+        $total += [int64]$_.Length
+    }
+    return $total
+}
+
+function Get-RelativeWorkPath([string]$Root, [string]$Path) {
+    try {
+        $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd([char[]]@('\', '/'))
+        $pathFull = [System.IO.Path]::GetFullPath($Path)
+        if ($pathFull.StartsWith($rootFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $pathFull.Substring($rootFull.Length).TrimStart([char[]]@('\', '/'))
+        }
+    } catch { }
+    return $Path
+}
+
+function Add-CleanupAction($Actions, [string]$Kind, [string]$Path, [long]$BeforeBytes, [long]$AfterBytes, [string]$Note) {
+    $null = $Actions.Add([PSCustomObject]@{
+        kind = $Kind
+        path = $Path
+        beforeBytes = $BeforeBytes
+        afterBytes = $AfterBytes
+        note = $Note
+    })
+}
+
+function Assert-CleanupConfig() {
+    if ($MaxWorkDirMB -lt 0) { throw "MaxWorkDirMB는 0 이상이어야 합니다. 0은 전체 폴더 크기 제한을 끕니다." }
+    if ($MaxTranscriptMB -lt 0) { throw "MaxTranscriptMB는 0 이상이어야 합니다. 0은 transcript compact를 끕니다." }
+    if ($MaxErrorLogMB -lt 0) { throw "MaxErrorLogMB는 0 이상이어야 합니다. 0은 error.log compact를 끕니다." }
+    if ($CleanupKeepDays -lt 0) { throw "CleanupKeepDays는 0 이상이어야 합니다. 0은 날짜 기준 삭제를 끕니다." }
+    if ($CleanupKeepTurns -lt 1) { throw "CleanupKeepTurns는 1 이상이어야 합니다." }
+}
+
+function Test-ProtectedWorkFile([string]$Root, [string]$FileFullName) {
+    $relative = Get-RelativeWorkPath $Root $FileFullName
+    if ($relative -match '[\\/]') { return $false }
+
+    $name = [System.IO.Path]::GetFileName($relative)
+    $protected = @(
+        "next_question.txt",
+        "last_turn.txt",
+        "transcript.md",
+        "transcript.jsonl",
+        "error.log",
+        "settings_effective_summary.json",
+        "last_request_headers.json",
+        "last_request_headers_sensitive.json",
+        "last_request_body.json",
+        "last_response_status.json"
+    )
+    return ($protected -contains $name)
+}
+
+function Test-StaleCleanupCandidate([string]$Root, $File) {
+    if (Test-ProtectedWorkFile $Root $File.FullName) { return $false }
+
+    $relative = Get-RelativeWorkPath $Root $File.FullName
+    if ($relative -match '(^|[\\/])check([\\/]|$)') { return $true }
+    if ($File.Name -match '^(dry_run_request_|settings_effective_summary).*\.json$') { return $true }
+    if ($File.Name -match '\.(old|bak|tmp)$') { return $true }
+    return $false
+}
+
+function Compact-TranscriptMarkdown([string]$Path, [int]$MaxMB, [int]$KeepTurns, $Actions, [string]$Root) {
+    if ($MaxMB -le 0) { return }
+    if (!(Test-Path -LiteralPath $Path -PathType Leaf)) { return }
+
+    $item = Get-Item -LiteralPath $Path -ErrorAction SilentlyContinue
+    if ($null -eq $item) { return }
+
+    $maxBytes = [int64]$MaxMB * 1MB
+    $beforeBytes = [int64]$item.Length
+    if ($beforeBytes -le $maxBytes) { return }
+
+    $raw = Read-Utf8File $Path
+    $matches = [regex]::Matches($raw, '(?m)^---\s*$')
+    $note = "kept recent transcript content"
+
+    if ($matches.Count -gt $KeepTurns) {
+        $start = $matches[$matches.Count - $KeepTurns].Index
+        $kept = $raw.Substring($start).TrimStart()
+        $note = "kept last $KeepTurns turns"
+    } else {
+        $targetChars = [Math]::Max(1000, [int]($maxBytes / 4))
+        if ($raw.Length -le $targetChars) { return }
+        $kept = $raw.Substring($raw.Length - $targetChars)
+        $note = "kept size-limited tail"
+    }
+
+    $header = "<!-- qwen-loop auto-cleanup: compacted at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'); $note. -->`n`n"
+    Write-Utf8File $Path ($header + $kept)
+
+    $afterBytes = [int64](Get-Item -LiteralPath $Path).Length
+    if ($afterBytes -gt $maxBytes) {
+        $raw = Read-Utf8File $Path
+        $targetChars = [Math]::Max(1000, [int]($maxBytes / 4))
+        if ($raw.Length -gt $targetChars) {
+            $tail = $raw.Substring($raw.Length - $targetChars)
+            $header = "<!-- qwen-loop auto-cleanup: compacted at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'); kept size-limited tail. -->`n`n"
+            Write-Utf8File $Path ($header + $tail)
+            $afterBytes = [int64](Get-Item -LiteralPath $Path).Length
+            $note = "kept size-limited tail"
+        }
+    }
+
+    Add-CleanupAction $Actions "compacted" (Get-RelativeWorkPath $Root $Path) $beforeBytes $afterBytes $note
+}
+
+function Convert-JsonlLineForCleanup([string]$Line, [int]$AnswerChars) {
+    try {
+        $record = $Line | ConvertFrom-Json
+        $plain = ConvertTo-PlainObject $record
+        if ($plain -is [System.Collections.IDictionary] -and $plain.Contains("answer")) {
+            $plain["answer"] = Get-TextPrefix ([string]$plain["answer"]) $AnswerChars
+        }
+        return ($plain | ConvertTo-Json -Compress -Depth 50)
+    } catch {
+        return (Get-TextPrefix $Line $AnswerChars)
+    }
+}
+
+function Compact-TranscriptJsonl([string]$Path, [int]$MaxMB, [int]$KeepTurns, $Actions, [string]$Root) {
+    if ($MaxMB -le 0) { return }
+    if (!(Test-Path -LiteralPath $Path -PathType Leaf)) { return }
+
+    $item = Get-Item -LiteralPath $Path -ErrorAction SilentlyContinue
+    if ($null -eq $item) { return }
+
+    $maxBytes = [int64]$MaxMB * 1MB
+    $beforeBytes = [int64]$item.Length
+    if ($beforeBytes -le $maxBytes) { return }
+
+    $lines = @(Get-Content -LiteralPath $Path -Encoding UTF8 | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($lines.Count -gt $KeepTurns) {
+        $lines = @($lines | Select-Object -Last $KeepTurns)
+    }
+
+    $processed = @($lines | ForEach-Object { Convert-JsonlLineForCleanup $_ 2000 })
+    Write-Utf8File $Path (($processed -join "`n") + "`n")
+
+    $afterBytes = [int64](Get-Item -LiteralPath $Path).Length
+    $note = "kept last $($lines.Count) records with compact answers"
+
+    if ($afterBytes -gt $maxBytes) {
+        $fallbackCount = [Math]::Min(10, $processed.Count)
+        $processed = @($lines | Select-Object -Last $fallbackCount | ForEach-Object { Convert-JsonlLineForCleanup $_ 500 })
+        Write-Utf8File $Path (($processed -join "`n") + "`n")
+        $afterBytes = [int64](Get-Item -LiteralPath $Path).Length
+        $note = "kept last $fallbackCount records with short answers"
+    }
+
+    Add-CleanupAction $Actions "compacted" (Get-RelativeWorkPath $Root $Path) $beforeBytes $afterBytes $note
+}
+
+function Compact-TextTailFile([string]$Path, [int]$MaxMB, [string]$Label, $Actions, [string]$Root) {
+    if ($MaxMB -le 0) { return }
+    if (!(Test-Path -LiteralPath $Path -PathType Leaf)) { return }
+
+    $item = Get-Item -LiteralPath $Path -ErrorAction SilentlyContinue
+    if ($null -eq $item) { return }
+
+    $maxBytes = [int64]$MaxMB * 1MB
+    $beforeBytes = [int64]$item.Length
+    if ($beforeBytes -le $maxBytes) { return }
+
+    $raw = Read-Utf8File $Path
+    $targetChars = [Math]::Max(1000, [int]($maxBytes / 4))
+    if ($raw.Length -gt $targetChars) {
+        $raw = $raw.Substring($raw.Length - $targetChars)
+    }
+
+    $header = "# qwen-loop auto-cleanup: compacted $Label at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'); kept recent tail only.`n"
+    Write-Utf8File $Path ($header + $raw)
+    $afterBytes = [int64](Get-Item -LiteralPath $Path).Length
+    Add-CleanupAction $Actions "compacted" (Get-RelativeWorkPath $Root $Path) $beforeBytes $afterBytes "kept recent tail"
+}
+
+function Remove-StaleCleanupFiles([string]$Root, [int]$KeepDays, $Actions) {
+    if ($KeepDays -le 0) { return }
+    if (!(Test-Path -LiteralPath $Root -PathType Container)) { return }
+
+    $cutoff = (Get-Date).AddDays(-$KeepDays)
+    $files = @(Get-ChildItem -LiteralPath $Root -Recurse -File -Force -ErrorAction SilentlyContinue)
+    foreach ($file in $files) {
+        if ($file.LastWriteTime -ge $cutoff) { continue }
+        if (-not (Test-StaleCleanupCandidate $Root $file)) { continue }
+
+        $beforeBytes = [int64]$file.Length
+        $relative = Get-RelativeWorkPath $Root $file.FullName
+        try {
+            Remove-Item -LiteralPath $file.FullName -Force
+            Add-CleanupAction $Actions "deleted" $relative $beforeBytes 0 "older than $KeepDays days"
+        } catch {
+            Add-CleanupAction $Actions "failed" $relative $beforeBytes $beforeBytes $_.Exception.Message
+        }
+    }
+}
+
+function Remove-EmptyWorkDirectories([string]$Root) {
+    if (!(Test-Path -LiteralPath $Root -PathType Container)) { return }
+
+    $dirs = @(Get-ChildItem -LiteralPath $Root -Recurse -Directory -Force -ErrorAction SilentlyContinue | Sort-Object { $_.FullName.Length } -Descending)
+    foreach ($dir in $dirs) {
+        try {
+            $children = @(Get-ChildItem -LiteralPath $dir.FullName -Force -ErrorAction SilentlyContinue)
+            if ($children.Count -eq 0) { Remove-Item -LiteralPath $dir.FullName -Force }
+        } catch { }
+    }
+}
+
+function Enforce-WorkDirSize([string]$Root, [int]$MaxMB, $Actions) {
+    if ($MaxMB -le 0) { return "" }
+    if (!(Test-Path -LiteralPath $Root -PathType Container)) { return "" }
+
+    $maxBytes = [int64]$MaxMB * 1MB
+    $total = Get-DirectorySizeBytes $Root
+    if ($total -le $maxBytes) { return "" }
+
+    $candidates = @(Get-ChildItem -LiteralPath $Root -Recurse -File -Force -ErrorAction SilentlyContinue |
+        Where-Object { -not (Test-ProtectedWorkFile $Root $_.FullName) } |
+        Sort-Object LastWriteTimeUtc, Length)
+
+    foreach ($file in $candidates) {
+        if ($total -le $maxBytes) { break }
+        $beforeBytes = [int64]$file.Length
+        $relative = Get-RelativeWorkPath $Root $file.FullName
+        try {
+            Remove-Item -LiteralPath $file.FullName -Force
+            $total -= $beforeBytes
+            Add-CleanupAction $Actions "deleted" $relative $beforeBytes 0 "folder size cap"
+        } catch {
+            Add-CleanupAction $Actions "failed" $relative $beforeBytes $beforeBytes $_.Exception.Message
+        }
+    }
+
+    if ($total -gt $maxBytes) {
+        return "WorkDir is still above limit: $(Format-ByteSize $total) / $(Format-ByteSize $maxBytes). Protected state files were kept."
+    }
+    return ""
+}
+
+function Invoke-WorkDirCleanup([string]$Root, [string]$TranscriptPath, [string]$JsonlPath, [string]$ErrorLogPath) {
+    $actions = New-Object System.Collections.Generic.List[object]
+    $beforeBytes = Get-DirectorySizeBytes $Root
+    $warning = ""
+
+    if ($NoAutoCleanup) {
+        return [PSCustomObject]@{
+            enabled = $false
+            beforeBytes = $beforeBytes
+            afterBytes = $beforeBytes
+            actions = [object[]]@()
+            warning = ""
+        }
+    }
+
+    Compact-TranscriptMarkdown $TranscriptPath $MaxTranscriptMB $CleanupKeepTurns $actions $Root
+    Compact-TranscriptJsonl $JsonlPath $MaxTranscriptMB $CleanupKeepTurns $actions $Root
+    Compact-TextTailFile $ErrorLogPath $MaxErrorLogMB "error.log" $actions $Root
+    Remove-StaleCleanupFiles $Root $CleanupKeepDays $actions
+    $warning = Enforce-WorkDirSize $Root $MaxWorkDirMB $actions
+    Remove-EmptyWorkDirectories $Root
+
+    $afterBytes = Get-DirectorySizeBytes $Root
+    return [PSCustomObject]@{
+        enabled = $true
+        beforeBytes = $beforeBytes
+        afterBytes = $afterBytes
+        actions = [object[]]$actions.ToArray()
+        warning = $warning
+    }
+}
+
+function Get-CleanupPolicyText() {
+    if ($NoAutoCleanup) { return "disabled" }
+
+    $folder = if ($MaxWorkDirMB -gt 0) { "folder <= $MaxWorkDirMB MB" } else { "folder cap off" }
+    $transcript = if ($MaxTranscriptMB -gt 0) { "transcript <= $MaxTranscriptMB MB" } else { "transcript compact off" }
+    $error = if ($MaxErrorLogMB -gt 0) { "error <= $MaxErrorLogMB MB" } else { "error compact off" }
+    $days = if ($CleanupKeepDays -gt 0) { "stale check > $CleanupKeepDays days" } else { "stale check cleanup off" }
+    return "$folder, $transcript, $error, keep $CleanupKeepTurns turns, $days"
+}
+
+function Write-WorkDirCleanupStatus($Summary, [bool]$Always) {
+    if ($null -eq $Summary) { return }
+
+    if (-not $Summary.enabled) {
+        if ($Always) { Write-Host "Cleanup     : disabled" -ForegroundColor DarkGray }
+        return
+    }
+
+    $actions = @($Summary.actions)
+    if ($actions.Count -eq 0) {
+        if ($Always) {
+            Write-Host "Cleanup     : ok, current $(Format-ByteSize $Summary.afterBytes)" -ForegroundColor DarkGray
+        }
+    } else {
+        Write-Host "Cleanup     : $($actions.Count) action(s), $(Format-ByteSize $Summary.beforeBytes) -> $(Format-ByteSize $Summary.afterBytes)" -ForegroundColor DarkYellow
+        foreach ($action in @($actions | Select-Object -First 6)) {
+            $sizeText = if ($action.beforeBytes -gt 0 -or $action.afterBytes -gt 0) { " ($(Format-ByteSize $action.beforeBytes) -> $(Format-ByteSize $action.afterBytes))" } else { "" }
+            Write-Host "  - $($action.kind) $($action.path)$sizeText; $($action.note)" -ForegroundColor DarkGray
+        }
+        if ($actions.Count -gt 6) {
+            Write-Host "  - ... $($actions.Count - 6) more cleanup action(s)" -ForegroundColor DarkGray
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($Summary.warning)) {
+        Write-Host "CleanupWarn : $($Summary.warning)" -ForegroundColor Yellow
+    }
 }
 
 function Remove-BomAndTrim([string]$Text) {
@@ -1351,6 +1682,7 @@ $EffectiveTimeoutSec = Get-EffectiveTimeoutSeconds $providerInfo
 $intervalPlan = Get-IntervalPlan
 Assert-RetryConfig
 Assert-TokenUsageConfig
+Assert-CleanupConfig
 $networkIdentity = $null
 if ($LoopDiagnosticHeaders) {
     $networkIdentity = Get-ClientNetworkIdentity $providerInfo.BaseUrl
@@ -1364,6 +1696,7 @@ $errorLogPath = Join-Path $WorkDir "error.log"
 
 $initialQuestion = Initialize-NextQuestion $nextQuestionPath $jsonlPath $transcriptPath $lastTurnPath $SeedFile $QuestionBankFile $QuestionTrack
 $seedQuestion = $initialQuestion.Question
+$startupCleanup = Invoke-WorkDirCleanup $WorkDir $transcriptPath $jsonlPath $errorLogPath
 
 $systemPrompt = Build-SettingsAwareSystemPrompt $settings $providerInfo
 
@@ -1397,6 +1730,8 @@ Write-Host "HeaderLog    : $(if ($MaskSensitiveLogs -and -not $LogSensitive) { '
 Write-Host "QuestionSrc  : $($initialQuestion.Source)"
 $answerPreviewText = if ($NoAnswerPreview) { "disabled" } else { "$AnswerPreviewLines lines / $AnswerPreviewChars chars" }
 Write-Host "AnswerPreview: $answerPreviewText"
+Write-Host "AutoCleanup  : $(Get-CleanupPolicyText)"
+Write-WorkDirCleanupStatus $startupCleanup $true
 Write-Host "IntervalMode : $($intervalPlan.Mode)"
 if ($intervalPlan.Mode -eq "fixed") {
     Write-Host "Interval     : $(Format-IntervalDuration $intervalPlan.FixedSeconds)"
@@ -1449,6 +1784,17 @@ $settingsSummary = [ordered]@{
         enabled = (-not [bool]$NoAnswerPreview)
         lines = $AnswerPreviewLines
         chars = $AnswerPreviewChars
+    }
+    autoCleanup = [ordered]@{
+        enabled = (-not [bool]$NoAutoCleanup)
+        maxWorkDirMB = $MaxWorkDirMB
+        maxTranscriptMB = $MaxTranscriptMB
+        maxErrorLogMB = $MaxErrorLogMB
+        cleanupKeepDays = $CleanupKeepDays
+        cleanupKeepTurns = $CleanupKeepTurns
+        policy = (Get-CleanupPolicyText)
+        startup = ConvertTo-PlainObject $startupCleanup
+        note = "Preserves active state files such as next_question.txt and last_turn.txt; compacts large transcripts/error.log and removes stale dry-run/check artifacts."
     }
     interval = [ordered]@{
         mode = $intervalPlan.Mode
@@ -1630,6 +1976,9 @@ $answer
         Append-Utf8File $errorLogPath $msg
         Write-Host $msg -ForegroundColor Red
     }
+
+    $loopCleanup = Invoke-WorkDirCleanup $WorkDir $transcriptPath $jsonlPath $errorLogPath
+    Write-WorkDirCleanupStatus $loopCleanup $false
 
     if ($Once -or ($MaxRuns -gt 0 -and $runCount -ge $MaxRuns)) {
         Write-Host "`n지정된 실행 횟수만큼 실행 후 종료합니다." -ForegroundColor DarkGray
