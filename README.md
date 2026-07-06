@@ -40,6 +40,8 @@ Windows 11에서 Qwen Code용 `settings.json`을 기반으로 Qwen/OpenAI-compat
 
 응답을 받은 뒤에는 `ANSWER PREVIEW`로 실제 답변 본문 앞부분을 기본 4줄/1000자까지 CMD에 보여줍니다. 전체 답변은 `transcript.md`와 `transcript.jsonl`에 저장됩니다. preview가 너무 길거나 불필요하면 `-AnswerPreviewLines`, `-AnswerPreviewChars`, `-NoAnswerPreview`로 조정합니다.
 
+서버가 OpenAI-compatible `usage` 값을 반환하면 CMD에 `TokenUse`도 표시합니다. 기본 기준은 출력 토큰이 `1000` 미만이면 초록색 `light`, `1000-3999`면 노란색 `balanced`, `4000` 이상이면 마젠타색 `rich`입니다. 이 루프는 깊은 답변을 의도하므로 `rich`는 경고가 아니라 분석량이 충분하다는 신호에 가깝고, 대신 응답 시간과 비용은 늘 수 있습니다. 기준은 `-TokenLowThreshold`, `-TokenRichThreshold`로 조정합니다.
+
 통신 실패 시 기본 `-MaxRetries 3`으로 즉시 재시도합니다. 네트워크/타임아웃 오류와 HTTP `408`, `409`, `429`, `5xx`는 retry 대상이고, `400`, `401`, `403`, `404`처럼 요청/인증/경로가 틀린 오류는 같은 endpoint에서 반복해도 회복 가능성이 낮아 재시도하지 않습니다. 각 retry 요청의 `X-Stainless-Retry-Count` header는 `0`, `1`, `2`, `3`처럼 실제 시도 횟수에 맞춰 증가합니다.
 
 ## 호출 간격
@@ -53,11 +55,11 @@ Windows 11에서 Qwen Code용 `settings.json`을 기반으로 Qwen/OpenAI-compat
 ## 먼저 볼 파일
 
 ```text
+README.md                         실행 방법, 콘솔 출력 예시, 동작 흐름
 AGENTS.md                         Codex 작업 규칙
+CHANGELOG.md                      현재 기능 기준 변경 요약
 settings.json                     스크린샷 기반 재구성 settings.json
 .qwen/settings.json               사용자 .qwen 폴더 구조 미러
-docs/CONVERSATION_SUMMARY.md      지금까지 대화 요약
-docs/CODEX_HANDOFF.md             Codex에게 맡길 작업 지시서
 qwen-loop.ps1                     메인 실행 로직
 seed_prompt.txt                   question_bank.txt가 없거나 비었을 때 쓰는 단일 fallback 질문
 question_bank.txt                 트랙별 초기 질문 seed 모음
@@ -103,6 +105,108 @@ run-qwen-loop.bat                 실제 사용자 settings 기준 메인 루프
 
 프로젝트 내부 settings로 테스트하려면 01/02/03 대신 06/07/08을 사용합니다.
 
+## CMD 출력 예시
+
+아래는 실제 실행값이 아니라 CMD에서 보이는 형태 예시입니다. 경로, endpoint, 응답 시간, token 수, 다음 질문, 랜덤 대기시간은 실행 환경과 서버 응답에 따라 달라집니다.
+
+DryRun 체크를 실행하면 실제 API는 호출하지 않고 settings 해석 결과와 전송 예정 header/body 파일만 만듭니다.
+
+```text
+   ____                         __
+  / __ \__      _____  ____    / /   ____  ____  ____
+ / / / / | /| / / _ \/ __ \  / /   / __ \/ __ \/ __ \
+/ /_/ /| |/ |/ /  __/ / / / / /___/ /_/ / /_/ / /_/ /
+\___\_\|__/|__/\___/_/ /_/ /_____/\____/\____/ .___/
+                                             /_/
+                 S C H E D U L E R   v4
+       +------------------------------------------------+
+       | settings-first OpenAI-compatible API runner    |
+       | random loop / visible status / transcript log  |
+       +--------------------------.---------------------+
+                                  |
+                              [ QWEN ]
+                               (o_o)
+                            ---/|_|\---
+
+=== Runtime Summary: SETTINGS-FIRST ===
+SettingsPath : C:\Users\<user>\.qwen\settings.json
+ProviderType : openai
+ProviderName : qwen3.6-agent
+ProviderId   : qwen3.6-agent
+BaseUrl      : http://10.32.64.116:8002
+Model        : qwen3.6-agent
+EnvKey       : QWEN_CUSTOM_API_KEY_OPENAI_HTTP_10_32_64_116_8002_...
+ApiKeySource : settings.json/env
+Authorization: sent exactly from settings.json/env
+ClientIdent  : disabled; use -LoopDiagnosticHeaders only when receiver-side tracing needs it
+CompatBody   : False
+WireMode     : Qwen Code OpenAI SDK-like headers/body
+Stream       : True
+Retry        : max 3, backoff 1-10 sec
+TokenUse     : light < 1000, rich >= 4000 output tokens
+HeaderLog    : unmasked
+QuestionSrc  : question_bank.txt
+AnswerPreview: 4 lines / 1000 chars
+IntervalMode : random
+IntervalRange: 8 min (480 sec) - 15 min (900 sec)
+Countdown    : live every 1 sec
+TimeoutSec   : 120
+WorkDir      : ...\qwen-loop-data\check\user
+Stop         : Ctrl+C
+==============================================
+DryRun mode: API 호출 없이 settings.json 활용 내역만 확인했습니다.
+Created:
+- ...\qwen-loop-data\check\user\settings_effective_summary.json
+- ...\qwen-loop-data\check\user\dry_run_request_headers.json
+- ...\qwen-loop-data\check\user\dry_run_request_body.json
+Endpoint:
+- http://10.32.64.116:8002/chat/completions
+```
+
+실제 루프에서는 질문 전송, HTTP 상태, 답변 preview, token 사용량, 다음 질문, 저장 경로가 한 사이클 안에서 이어서 보입니다.
+
+```text
+[2026-07-06 13:50:15] RUN #1 QUESTION:
+현재 Spring Boot 백엔드의 핵심 도메인 서비스 레이어에서 트랜잭션 경계가 Repository 호출 시점에 명확히 구분되어 있는지 분석해 줘.
+
+[2026-07-06 13:50:15] POST http://10.32.64.116:8002/chat/completions (attempt 1/4, retry-count=0)
+[2026-07-06 13:50:42] HTTP 200 OK (27091 ms, 18432 bytes, retry-count=0)
+ResponseText : 6280 chars extracted
+TokenUse     : input=2,418, output=1,946, total=4,364 | balanced (reasonable depth and cost)
+
+ANSWER PREVIEW:
+트랜잭션 경계를 검토할 때는 먼저 Service public method 단위에서 업무 유스케이스가 닫히는지 확인해야 합니다.
+그 다음 Repository 호출이 같은 트랜잭션 안에서 필요한 지연 로딩, 변경 감지, 예외 롤백 규칙을 공유하는지 봅니다.
+...
+
+NEXT QUESTION:
+현재 Service 계층에서 읽기 전용 조회와 쓰기 유스케이스가 같은 @Transactional 설정을 공유하면서 불필요한 flush나 lock 경합을 만들 가능성이 있는지 분석해 줘.
+
+Saved:
+- ...\qwen-loop-data\next_question.txt
+- ...\qwen-loop-data\last_turn.txt
+- ...\qwen-loop-data\transcript.md
+- ...\qwen-loop-data\transcript.jsonl
+- ...\qwen-loop-data\last_request_headers.json
+- ...\qwen-loop-data\last_request_body.json
+- ...\qwen-loop-data\last_response_status.json
+
+RUN #1 complete. Full answer saved to transcript.md.
+Waiting 11 min 50 sec | next request around 14:02:32 | next wait will be randomized again after the next request | Ctrl+C to stop
+```
+
+통신이 불안정하면 retry 대상 오류만 다시 시도합니다. `404`나 인증 오류처럼 같은 요청을 반복해도 해결되지 않는 오류는 retry 없이 실패 로그를 남깁니다.
+
+```text
+[2026-07-06 14:10:04] POST http://10.32.64.116:8002/chat/completions (attempt 1/4, retry-count=0)
+Endpoint failed: http://10.32.64.116:8002/chat/completions (attempt 1/4, retryable=True)
+HTTP 호출 실패 after 120013 ms: The operation has timed out.
+Retry 1/3 in 1.4 sec...
+
+[2026-07-06 14:10:06] POST http://10.32.64.116:8002/chat/completions (attempt 2/4, retry-count=1)
+[2026-07-06 14:10:29] HTTP 200 OK (22841 ms, 15320 bytes, retry-count=1)
+```
+
 ## 로그 파일
 
 실행 후 `qwen-loop-data` 폴더에 생성됩니다. 이 폴더는 `.gitignore` 대상인 런타임 상태/검증 출력이며 설정 원천이 아닙니다. 다른 PC에서 실행하면 그 PC의 `%USERPROFILE%`, settings 경로, 질문 상태에 맞춰 새로 생성됩니다.
@@ -122,6 +226,12 @@ transcript.md
 transcript.jsonl
 error.log
 ```
+
+## 문서/산출물 정리 기준
+
+현재 유지하는 기준 문서는 `README.md`, `AGENTS.md`, `CHANGELOG.md`입니다. 과거 대화 요약, 일회성 인수인계 문서, 이전 배포 zip/diff 같은 reference artifact는 현재 실행 기준과 충돌하거나 중복되면 보관하지 않습니다.
+
+`qwen-loop-data`는 예외입니다. 이 폴더는 실행할 때마다 생기는 상태/검증 출력이므로 git에 올리지 않지만, 루프 재시작과 API 검증에는 실제로 사용됩니다.
 
 ## 질문 루프
 

@@ -7,8 +7,8 @@
 - 스크린샷 기반 `settings.json` 파일 추가.
 - `.qwen/settings.json` 미러 추가.
 - Codex용 `AGENTS.md` 추가.
-- 대화 요약 문서 `docs/CONVERSATION_SUMMARY.md` 추가.
-- Codex 작업 요청서 `docs/CODEX_HANDOFF.md` 추가.
+- README에 실행 방법, CMD 출력 예시, 질문 루프 흐름을 통합.
+- 과거 대화 요약/인수인계 문서와 이전 배포 reference artifact는 현재 기준 문서로 흡수 후 제거.
 - 프로젝트 내부 settings를 직접 쓰는 더블클릭 BAT 3개 추가.
 - `context_files.txt` 예시 경로의 백슬래시 오류 보정.
 
@@ -24,5 +24,6 @@
 - 기본 루프 간격은 매 호출 후 8-15분 사이 랜덤 대기시간을 새로 샘플링.
 - 대기 중 CMD 같은 줄 countdown으로 남은 시간과 다음 호출 예정 시각을 표시.
 - 실제 응답 수신 후 CMD에 답변 본문 preview와 다음 질문, 저장 경로, 사이클 완료 상태를 표시.
+- 서버가 usage를 반환하면 입력/출력/전체 token 수와 light/balanced/rich 색상 등급을 표시.
 - last_request_headers/body 로그 생성.
 - 더블클릭 BAT 기반 실행 흐름 제공.

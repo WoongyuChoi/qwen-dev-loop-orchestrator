@@ -18,6 +18,8 @@
     [int]$CountdownRefreshSeconds = 1,
     [int]$AnswerPreviewLines = 4,
     [int]$AnswerPreviewChars = 1000,
+    [int]$TokenLowThreshold = 1000,
+    [int]$TokenRichThreshold = 4000,
     [int]$MaxRuns = 0,
     [int]$MaxRetries = 3,
     [int]$RetryInitialDelaySeconds = 1,
@@ -88,6 +90,11 @@ function Get-JsonProperty($obj, [string]$name) {
 function ConvertTo-PlainObject($obj) {
     if ($null -eq $obj) { return $null }
     if ($obj -is [string] -or $obj.GetType().IsPrimitive -or $obj -is [decimal]) { return $obj }
+    if ($obj -is [System.Collections.IDictionary]) {
+        $h = [ordered]@{}
+        foreach ($key in $obj.Keys) { $h[[string]$key] = ConvertTo-PlainObject $obj[$key] }
+        return $h
+    }
     if ($obj -is [System.Collections.IEnumerable] -and -not ($obj -is [string]) -and -not ($obj -is [System.Management.Automation.PSCustomObject])) {
         $arr = @()
         foreach ($i in $obj) { $arr += ,(ConvertTo-PlainObject $i) }
@@ -987,6 +994,153 @@ function Format-Milliseconds([int]$milliseconds) {
     return ("{0:N1} sec" -f ($milliseconds / 1000.0))
 }
 
+function Assert-TokenUsageConfig() {
+    if ($TokenLowThreshold -lt 0) { throw "TokenLowThreshold는 0 이상이어야 합니다." }
+    if ($TokenRichThreshold -le $TokenLowThreshold) {
+        throw "TokenRichThreshold는 TokenLowThreshold보다 커야 합니다."
+    }
+}
+
+function Get-UsageNumber($usage, [string[]]$names) {
+    if ($null -eq $usage) { return $null }
+    foreach ($name in $names) {
+        $value = Get-JsonProperty $usage $name
+        if ($null -eq $value) { continue }
+        try { return [int64]$value } catch { }
+    }
+    return $null
+}
+
+function Convert-OpenAIUsageObject($usage) {
+    if ($null -eq $usage) { return $null }
+
+    $inputTokens = Get-UsageNumber $usage @("prompt_tokens", "input_tokens")
+    $outputTokens = Get-UsageNumber $usage @("completion_tokens", "output_tokens")
+    $totalTokens = Get-UsageNumber $usage @("total_tokens")
+    if ($null -eq $totalTokens -and $null -ne $inputTokens -and $null -ne $outputTokens) {
+        $totalTokens = $inputTokens + $outputTokens
+    }
+
+    return [PSCustomObject]@{
+        inputTokens = $inputTokens
+        outputTokens = $outputTokens
+        totalTokens = $totalTokens
+        raw = ConvertTo-PlainObject $usage
+    }
+}
+
+function Get-OpenAIUsageFromRaw([string]$raw, [bool]$isStreaming) {
+    if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
+
+    if ($isStreaming) {
+        $lastUsage = $null
+        foreach ($line in ($raw -split "`r?`n")) {
+            $trimmed = $line.Trim()
+            if (-not $trimmed.StartsWith("data:")) { continue }
+
+            $data = $trimmed.Substring(5).Trim()
+            if ([string]::IsNullOrWhiteSpace($data) -or $data -eq "[DONE]") { continue }
+
+            try {
+                $chunk = $data | ConvertFrom-Json
+                $usage = Get-JsonProperty $chunk "usage"
+                if ($usage) { $lastUsage = $usage }
+            } catch { }
+        }
+        return Convert-OpenAIUsageObject $lastUsage
+    }
+
+    try {
+        $resp = $raw | ConvertFrom-Json
+        return Convert-OpenAIUsageObject (Get-JsonProperty $resp "usage")
+    } catch {
+        return $null
+    }
+}
+
+function Format-TokenNumber($value) {
+    if ($null -eq $value) { return "n/a" }
+    return ("{0:N0}" -f [int64]$value)
+}
+
+function Get-TokenUsageProfile($usage) {
+    Assert-TokenUsageConfig
+
+    if ($null -eq $usage) {
+        return [PSCustomObject]@{
+            available = $false
+            level = "unknown"
+            color = "DarkGray"
+            note = "usage not returned by server"
+            basis = "none"
+        }
+    }
+
+    $score = $usage.outputTokens
+    $basis = "output"
+    if ($null -eq $score) {
+        $score = $usage.totalTokens
+        $basis = "total"
+    }
+
+    if ($null -eq $score) {
+        return [PSCustomObject]@{
+            available = $false
+            level = "unknown"
+            color = "DarkGray"
+            note = "usage returned without token counts"
+            basis = $basis
+        }
+    }
+
+    if ($score -lt $TokenLowThreshold) {
+        return [PSCustomObject]@{
+            available = $true
+            level = "light"
+            color = "Green"
+            note = "fast and cheap, but may be shallow"
+            basis = $basis
+        }
+    }
+
+    if ($score -lt $TokenRichThreshold) {
+        return [PSCustomObject]@{
+            available = $true
+            level = "balanced"
+            color = "Yellow"
+            note = "reasonable depth and cost"
+            basis = $basis
+        }
+    }
+
+    return [PSCustomObject]@{
+        available = $true
+        level = "rich"
+        color = "Magenta"
+        note = "deep answer, intentionally higher token use"
+        basis = $basis
+    }
+}
+
+function Write-TokenUsage($usage, $profile) {
+    if ($null -eq $profile) { $profile = Get-TokenUsageProfile $usage }
+
+    if ($null -eq $usage) {
+        Write-Host "TokenUse     : usage not returned by server" -ForegroundColor DarkGray
+        return
+    }
+
+    $line = "TokenUse     : input=$(Format-TokenNumber $usage.inputTokens), output=$(Format-TokenNumber $usage.outputTokens), total=$(Format-TokenNumber $usage.totalTokens) | $($profile.level) ($($profile.note))"
+    Write-Host $line -ForegroundColor $profile.color
+}
+
+function Format-TokenUsageForMarkdown($usage, $profile) {
+    if ($null -eq $profile) { $profile = Get-TokenUsageProfile $usage }
+    if ($null -eq $usage) { return "usage not returned by server" }
+
+    return "input=$(Format-TokenNumber $usage.inputTokens), output=$(Format-TokenNumber $usage.outputTokens), total=$(Format-TokenNumber $usage.totalTokens), level=$($profile.level), note=$($profile.note)"
+}
+
 function Invoke-JsonPostUtf8([string]$Uri, $Headers, [byte[]]$BodyBytes, [int]$TimeoutSeconds) {
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $req = [System.Net.HttpWebRequest]::Create($Uri)
@@ -1122,6 +1276,9 @@ function Invoke-QwenChat($providerInfo, $settings, $networkIdentity, [string]$sy
                 Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] POST $endpoint (attempt $attemptText, retry-count=$attempt)" -ForegroundColor Cyan
                 $response = Invoke-JsonPostUtf8 -Uri $endpoint -Headers $headers -BodyBytes $bodyBytes -TimeoutSeconds $EffectiveTimeoutSec
                 Write-Host ("[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] HTTP {0} {1} ({2} ms, {3} bytes, retry-count={4})" -f $response.StatusCode, $response.StatusDescription, $response.DurationMs, $response.ReceivedBytes, $attempt) -ForegroundColor Green
+                $answerText = Convert-OpenAIResponseToText $response.Body (-not [bool]$NonStreaming)
+                $tokenUsage = Get-OpenAIUsageFromRaw $response.Body (-not [bool]$NonStreaming)
+                $tokenProfile = Get-TokenUsageProfile $tokenUsage
                 Write-Utf8File (Join-Path $WorkDir "last_response_status.json") (([ordered]@{
                     ok = $true
                     endpoint = $endpoint
@@ -1133,11 +1290,17 @@ function Invoke-QwenChat($providerInfo, $settings, $networkIdentity, [string]$sy
                     contentType = $response.ContentType
                     receivedBytes = $response.ReceivedBytes
                     durationMs = $response.DurationMs
+                    usage = ConvertTo-PlainObject $tokenUsage
+                    tokenUse = ConvertTo-PlainObject $tokenProfile
                     completedAt = (Get-Date).ToString("o")
                 }) | ConvertTo-Json -Depth 10)
-                $answerText = Convert-OpenAIResponseToText $response.Body (-not [bool]$NonStreaming)
                 Write-Host ("ResponseText : {0} chars extracted" -f $answerText.Length) -ForegroundColor DarkGreen
-                return $answerText
+                Write-TokenUsage $tokenUsage $tokenProfile
+                return [PSCustomObject]@{
+                    Text = $answerText
+                    Usage = $tokenUsage
+                    TokenUse = $tokenProfile
+                }
             } catch {
                 $lastError = [string]$_.Exception.Message
                 $retryable = Test-RetryableError $lastError
@@ -1187,6 +1350,7 @@ $providerInfo = Get-SettingsProvider $settings $ProviderName $ModelName
 $EffectiveTimeoutSec = Get-EffectiveTimeoutSeconds $providerInfo
 $intervalPlan = Get-IntervalPlan
 Assert-RetryConfig
+Assert-TokenUsageConfig
 $networkIdentity = $null
 if ($LoopDiagnosticHeaders) {
     $networkIdentity = Get-ClientNetworkIdentity $providerInfo.BaseUrl
@@ -1228,6 +1392,7 @@ Write-Host "CompatBody   : $CompatBody"
 Write-Host "WireMode     : Qwen Code OpenAI SDK-like headers/body"
 Write-Host "Stream       : $(-not [bool]$NonStreaming)"
 Write-Host "Retry        : max $MaxRetries, backoff $RetryInitialDelaySeconds-$RetryMaxDelaySeconds sec"
+Write-Host "TokenUse     : light < $TokenLowThreshold, rich >= $TokenRichThreshold output tokens"
 Write-Host "HeaderLog    : $(if ($MaskSensitiveLogs -and -not $LogSensitive) { 'masked' } else { 'unmasked' })"
 Write-Host "QuestionSrc  : $($initialQuestion.Source)"
 $answerPreviewText = if ($NoAnswerPreview) { "disabled" } else { "$AnswerPreviewLines lines / $AnswerPreviewChars chars" }
@@ -1269,6 +1434,15 @@ $settingsSummary = [ordered]@{
         retryMaxDelaySeconds = $RetryMaxDelaySeconds
         retryableStatusCodes = @("408", "409", "429", "5xx")
         note = "Retries transport failures and HTTP 408/409/429/5xx. HTTP 400/401/403/404 are not retried."
+    }
+    tokenUsage = [ordered]@{
+        source = "OpenAI-compatible usage object when returned by the server"
+        displayBasis = "output_tokens, fallback total_tokens"
+        lowThreshold = $TokenLowThreshold
+        richThreshold = $TokenRichThreshold
+        light = "green"
+        balanced = "yellow"
+        rich = "magenta"
     }
     bannerEnabled = (-not [bool]$NoBanner)
     answerPreview = [ordered]@{
@@ -1368,7 +1542,10 @@ $contextBundle
         Write-Host "`n[$($started.ToString('yyyy-MM-dd HH:mm:ss'))] RUN #$runCount QUESTION:" -ForegroundColor Green
         Write-Host $question
 
-        $answer = Invoke-QwenChat $providerInfo $settings $networkIdentity $systemPrompt $userPrompt
+        $chatResult = Invoke-QwenChat $providerInfo $settings $networkIdentity $systemPrompt $userPrompt
+        $answer = [string]$chatResult.Text
+        $tokenUsage = $chatResult.Usage
+        $tokenUse = $chatResult.TokenUse
         $nextQuestion = Extract-NextQuestion $answer
         $ended = Get-Date
 
@@ -1397,6 +1574,10 @@ $question
 
 $nextQuestion
 
+## Token Usage
+
+$(Format-TokenUsageForMarkdown $tokenUsage $tokenUse)
+
 ## Answer
 
 $answer
@@ -1417,6 +1598,8 @@ $answer
             clientIp = $networkIdentity.localAddress
             question = $question
             nextQuestion = $nextQuestion
+            usage = ConvertTo-PlainObject $tokenUsage
+            tokenUse = ConvertTo-PlainObject $tokenUse
             answer = $answer
         }
         Append-Utf8File $jsonlPath (($record | ConvertTo-Json -Compress -Depth 50) + "`n")
