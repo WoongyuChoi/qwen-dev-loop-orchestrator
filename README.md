@@ -190,7 +190,7 @@ run_history.md
 run_history.jsonl
 ```
 
-Project mode reuses the same project work folder so logs do not create git changes in the scanned target project. If `next_question.txt` already contains a real follow-up for that project, the loop continues from it. If the file is missing or still contains the scan bootstrap question, the script first tries to recover the latest follow-up from `transcript.jsonl`, `transcript.md`, or `last_turn.txt`; only then does it fall back to the fresh scan-based seed question. Automatic cleanup compacts large transcripts/error logs and enforces the configured work-folder size cap.
+Project mode reuses the same project work folder so logs do not create git changes in the scanned target project. If `next_question.txt` already contains a real follow-up for that project, the loop continues from it. If the file is missing or still contains a scan bootstrap question, the script first tries to recover the latest follow-up from `transcript.jsonl`, `transcript.md`, or `last_turn.txt`. If the previous scan bootstrap was already sent but no completed answer was saved, `pending_question.txt` makes the next launch ask a narrower interrupted-run recovery question instead of repeating the same broad bootstrap. Fresh scan seeds and interrupted-run recovery questions sample from the top project candidates instead of always using the same first files. Only then does it fall back to the fresh scan-based seed question. Automatic cleanup compacts large transcripts/error logs and enforces the configured work-folder size cap.
 
 ## How It Works
 

@@ -139,6 +139,7 @@ function Test-ProtectedWorkFile([string]$Root, [string]$FileFullName) {
         "run_history.jsonl",
         "project_scan_summary.md",
         "project_scan_summary.json",
+        "pending_question.txt",
         "error.log",
         "settings_effective_summary.json",
         "last_request_headers.json",
@@ -1213,6 +1214,29 @@ function Get-DetectedProjectStack($Files) {
     return @($stack)
 }
 
+function Select-ProjectQuestionCandidates($Files, [int]$Count, [int]$PoolSize) {
+    $items = @($Files | Where-Object { $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.path) })
+    if ($items.Count -eq 0 -or $Count -lt 1) { return @() }
+
+    $effectivePoolSize = [Math]::Min([Math]::Max($PoolSize, $Count), $items.Count)
+    $pool = @($items | Select-Object -First $effectivePoolSize)
+    if ($pool.Count -le $Count) { return @($pool) }
+
+    return @($pool | Get-Random -Count $Count)
+}
+
+function Test-ProjectScanBootstrapQuestion([string]$Question) {
+    $q = ([string]$Question).Trim() -replace '\s+', ' '
+    if ([string]::IsNullOrWhiteSpace($q)) { return $false }
+
+    if ($q -match '^프로젝트 핵심 후보 파일\(.+\)을 바탕으로,') { return $true }
+    if ($q -match '^아래 프로젝트 스캔 결과의 핵심 파일과 코드 조각을 바탕으로,') { return $true }
+    if ($q -match '^이전 실행에서 프로젝트 전체 핵심 후보를 고르는 초기 질문이 이미 전송됐지만 완료 기록이 없습니다\.') { return $true }
+    if ($q -match '^이전 실행에서 프로젝트 스캔 기반 초기 질문이 이미 전송됐지만 완료 기록이 없습니다\.') { return $true }
+
+    return $false
+}
+
 function New-ProjectScanContext([string]$Root) {
     if ([string]::IsNullOrWhiteSpace($Root)) { return $null }
 
@@ -1263,10 +1287,12 @@ $excerpt
 
     $promptContext = Get-TextPrefix (($contextParts -join "`n") + "`n") $ProjectScanMaxTotalChars
 
-    $seedQuestion = "아래 프로젝트 스캔 결과의 핵심 파일과 코드 조각을 바탕으로, 실제 업무 흐름에 영향을 주는 로직 하나를 골라 구조, 동작 방식, 실패 가능성, 다음에 확인해야 할 파일을 구체적으로 분석해줘."
+    $questionCandidates = @(Select-ProjectQuestionCandidates $selected 5 20)
+
+    $seedQuestion = "아래 프로젝트 스캔 결과의 핵심 파일과 코드 조각을 바탕으로, 이번 실행에서 실제 업무 흐름에 영향을 주는 로직 하나를 새롭게 골라 구조, 동작 방식, 실패 가능성, 다음에 확인해야 할 파일을 구체적으로 분석해줘."
     if ($selected.Count -gt 0) {
-        $topNames = (($selected | Select-Object -First 5 | ForEach-Object { $_.path }) -join ", ")
-        $seedQuestion = "프로젝트 핵심 후보 파일($topNames)을 바탕으로, 실제 업무 흐름에 영향을 주는 로직 하나를 골라 구조, 동작 방식, 실패 가능성, 다음에 확인해야 할 파일을 구체적으로 분석해줘."
+        $candidateNames = (($questionCandidates | ForEach-Object { $_.path }) -join ", ")
+        $seedQuestion = "프로젝트 핵심 후보 파일($candidateNames)을 바탕으로, 이번 실행에서는 후보 중 하나를 새롭게 골라 실제 업무 흐름에 영향을 주는 로직 하나의 구조, 동작 방식, 실패 가능성, 다음에 확인해야 할 파일을 구체적으로 분석해줘."
     }
 
     return [PSCustomObject]@{
@@ -1285,6 +1311,7 @@ $excerpt
                 excerptChars = ([string]$_.excerpt).Length
             }
         })
+        questionCandidateFiles = @($questionCandidates | ForEach-Object { $_.path })
         promptContext = $promptContext
         seedQuestion = $seedQuestion
     }
@@ -1302,6 +1329,9 @@ function Write-ProjectScanFiles($Scan, [string]$WorkDirPath) {
         $fileRows += "| $($file.score) | $($file.path) | $reasonText | $(Format-ByteSize ([int64]$file.sizeBytes)) |"
     }
     if ($fileRows.Count -eq 0) { $fileRows = @("|  | no key files selected |  |  |") }
+
+    $questionCandidateRows = @($Scan.questionCandidateFiles | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { "- $_" })
+    if ($questionCandidateRows.Count -eq 0) { $questionCandidateRows = @("- no question candidates selected") }
 
     $md = @"
 # Project Scan Summary
@@ -1321,6 +1351,10 @@ $($fileRows -join "`n")
 ## Initial Project Question
 
 $($Scan.seedQuestion)
+
+## Question Candidate Sample
+
+$($questionCandidateRows -join "`n")
 
 ## Prompt Context Preview
 
@@ -1456,6 +1490,19 @@ function Test-SameQuestionText([string]$Left, [string]$Right) {
     $r = ([string]$Right).Trim() -replace '\s+', ' '
     if ([string]::IsNullOrWhiteSpace($l) -or [string]::IsNullOrWhiteSpace($r)) { return $false }
     return $l.Equals($r, [System.StringComparison]::Ordinal)
+}
+
+function New-InterruptedProjectSeedQuestion($ProjectScan, [string]$PreviousQuestion) {
+    $selectedFile = $null
+    if ($ProjectScan -and $ProjectScan.selectedFiles) {
+        $selectedFile = @(Select-ProjectQuestionCandidates $ProjectScan.selectedFiles 1 20)[0]
+    }
+
+    if ($selectedFile -and -not [string]::IsNullOrWhiteSpace([string]$selectedFile.path)) {
+        return "이전 실행에서 프로젝트 전체 핵심 후보를 고르는 초기 질문이 이미 전송됐지만 완료 기록이 없습니다. 같은 질문을 반복하지 말고, 이번에 선택된 핵심 후보 파일($($selectedFile.path))을 기준으로 실제 업무 흐름 하나를 좁혀서 구조, 호출 흐름, 실패 가능성, 다음에 확인해야 할 연결 파일을 구체적으로 분석해줘."
+    }
+
+    return "이전 실행에서 프로젝트 스캔 기반 초기 질문이 이미 전송됐지만 완료 기록이 없습니다. 같은 질문을 반복하지 말고, 이번 스캔 결과의 핵심 후보 중 하나를 새롭게 골라 실제 업무 흐름 하나를 좁혀서 구조, 실패 가능성, 다음 확인 파일을 구체적으로 분석해줘."
 }
 
 function Initialize-NextQuestion([string]$nextPath, [string]$jsonlPath, [string]$transcriptPath, [string]$lastTurnPath, [string]$seedFile, [string]$questionBankFile, [string]$trackFilter) {
@@ -2264,6 +2311,7 @@ $jsonlPath = Join-Path $WorkDir "transcript.jsonl"
 $runHistoryPath = Join-Path $WorkDir "run_history.md"
 $runHistoryJsonlPath = Join-Path $WorkDir "run_history.jsonl"
 $errorLogPath = Join-Path $WorkDir "error.log"
+$pendingQuestionPath = Join-Path $WorkDir "pending_question.txt"
 
 $projectScan = $null
 $projectContext = ""
@@ -2273,11 +2321,14 @@ if (-not [string]::IsNullOrWhiteSpace($ProjectRoot)) {
     $projectContext = $projectScan.promptContext
 
     $existingProjectQuestion = ""
-    if (Test-Path -LiteralPath $nextQuestionPath -PathType Leaf) {
+    $hadExistingProjectQuestionFile = Test-Path -LiteralPath $nextQuestionPath -PathType Leaf
+    if ($hadExistingProjectQuestionFile) {
         $existingProjectQuestion = (Read-Utf8File $nextQuestionPath).Trim()
     }
 
-    $hasUsableProjectQuestion = (-not [string]::IsNullOrWhiteSpace($existingProjectQuestion)) -and (-not (Test-SameQuestionText $existingProjectQuestion $projectScan.seedQuestion))
+    $hasUsableProjectQuestion = (-not [string]::IsNullOrWhiteSpace($existingProjectQuestion)) -and `
+        (-not (Test-SameQuestionText $existingProjectQuestion $projectScan.seedQuestion)) -and `
+        (-not (Test-ProjectScanBootstrapQuestion $existingProjectQuestion))
 
     if ($hasUsableProjectQuestion) {
         $initialQuestion = [PSCustomObject]@{
@@ -2287,7 +2338,7 @@ if (-not [string]::IsNullOrWhiteSpace($ProjectRoot)) {
         }
     } else {
         $candidate = Get-LastJsonlNextQuestion $jsonlPath
-        if (-not [string]::IsNullOrWhiteSpace($candidate) -and -not (Test-SameQuestionText $candidate $projectScan.seedQuestion)) {
+        if (-not [string]::IsNullOrWhiteSpace($candidate) -and -not (Test-SameQuestionText $candidate $projectScan.seedQuestion) -and -not (Test-ProjectScanBootstrapQuestion $candidate)) {
             Write-Utf8File $nextQuestionPath $candidate
             $initialQuestion = [PSCustomObject]@{ Question = $candidate; Source = "project-transcript.jsonl"; SeedSource = $jsonlPath }
         }
@@ -2295,7 +2346,7 @@ if (-not [string]::IsNullOrWhiteSpace($ProjectRoot)) {
 
     if ($null -eq $initialQuestion) {
         $candidate = Get-LastTranscriptNextQuestion $transcriptPath
-        if (-not [string]::IsNullOrWhiteSpace($candidate) -and -not (Test-SameQuestionText $candidate $projectScan.seedQuestion)) {
+        if (-not [string]::IsNullOrWhiteSpace($candidate) -and -not (Test-SameQuestionText $candidate $projectScan.seedQuestion) -and -not (Test-ProjectScanBootstrapQuestion $candidate)) {
             Write-Utf8File $nextQuestionPath $candidate
             $initialQuestion = [PSCustomObject]@{ Question = $candidate; Source = "project-transcript.md"; SeedSource = $transcriptPath }
         }
@@ -2306,6 +2357,22 @@ if (-not [string]::IsNullOrWhiteSpace($ProjectRoot)) {
         if (-not [string]::IsNullOrWhiteSpace($candidate)) {
             Write-Utf8File $nextQuestionPath $candidate
             $initialQuestion = [PSCustomObject]@{ Question = $candidate; Source = "project-last_turn.txt"; SeedSource = $lastTurnPath }
+        }
+    }
+
+    if ($null -eq $initialQuestion) {
+        $pendingQuestion = ""
+        if (Test-Path -LiteralPath $pendingQuestionPath -PathType Leaf) {
+            $pendingQuestion = (Read-Utf8File $pendingQuestionPath).Trim()
+        }
+        $hasInterruptedSeed = (-not [string]::IsNullOrWhiteSpace($pendingQuestion) -and ((Test-SameQuestionText $pendingQuestion $projectScan.seedQuestion) -or (Test-ProjectScanBootstrapQuestion $pendingQuestion)))
+        $hasStaleSeedFile = ($hadExistingProjectQuestionFile -and ((Test-SameQuestionText $existingProjectQuestion $projectScan.seedQuestion) -or (Test-ProjectScanBootstrapQuestion $existingProjectQuestion)))
+        if ($hasInterruptedSeed -or $hasStaleSeedFile) {
+            $candidate = New-InterruptedProjectSeedQuestion $projectScan $pendingQuestion
+            Write-Utf8File $nextQuestionPath $candidate
+            $sourceName = if ($hasInterruptedSeed) { "project-pending_question.txt" } else { "project-stale_scan_seed" }
+            $sourcePath = if ($hasInterruptedSeed) { $pendingQuestionPath } else { $nextQuestionPath }
+            $initialQuestion = [PSCustomObject]@{ Question = $candidate; Source = $sourceName; SeedSource = $sourcePath }
         }
     }
 
@@ -2519,6 +2586,7 @@ while ($true) {
     try {
         $question = (Read-Utf8File $nextQuestionPath).Trim()
         if ([string]::IsNullOrWhiteSpace($question)) { $question = $seedQuestion }
+        Write-Utf8File $pendingQuestionPath $question
 
         $contextBundle = Read-ContextBundle $ContextListFile $MaxContextChars
         $lastTurn = ""
