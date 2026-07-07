@@ -32,7 +32,7 @@
 ## 테스트 체크리스트
 
 - `check-qwen-loop.bat` 더블클릭 시 사용자/프로젝트 settings DryRun이 순차적으로 정상 실행되는지 확인한다.
-- `run-qwen-loop.bat` 더블클릭 시 1번/2번 모드 선택 메뉴가 표시되고, 2번에서 입력한 ProjectRoot가 별도 `qwen-loop-data/project/<name>-<timestamp>` WorkDir로 실행되는지 확인한다.
+- `run-qwen-loop.bat` 더블클릭 시 1번/2번 모드 선택 메뉴가 표시되고, 2번에서 입력한 ProjectRoot가 이 오케스트레이터의 고정 `qwen-loop-data/project/<name>` WorkDir로 실행되는지 확인한다.
 - 프로젝트 디렉터리 모드에서 `project_scan_summary.md`와 `project_scan_summary.json`이 생성되고, `settings_effective_summary.json.projectScan`에 root/scanned/selected/stack 정보가 들어가는지 확인한다.
 - 프로젝트 디렉터리 모드는 이전 답변을 이어받지 않는 fresh session이지만, 기존 `qwen-loop-data` 최근 질문은 중복 회피용 히스토리로 prompt에 포함되는지 확인한다.
 - `02_RUN_ONCE_TEST_DOUBLECLICK.bat` 또는 `07_RUN_ONCE_PROJECT_SETTINGS_DOUBLECLICK.bat` 더블클릭 시 `NEXT_QUESTION` 한글이 깨지지 않는지 확인한다.

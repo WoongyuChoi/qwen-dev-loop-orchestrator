@@ -73,8 +73,7 @@ if not exist "%PROJECT_ROOT%\" (
 
 for %%I in ("%PROJECT_ROOT%") do set "PROJECT_NAME=%%~nI"
 if "%PROJECT_NAME%"=="" set "PROJECT_NAME=project"
-for /f %%I in ('powershell.exe -NoLogo -NoProfile -Command "Get-Date -Format yyyyMMdd-HHmmss"') do set "STAMP=%%I"
-set "PROJECT_WORKDIR=%SCRIPT_DIR%qwen-loop-data\project\%PROJECT_NAME%-%STAMP%"
+set "PROJECT_WORKDIR=%SCRIPT_DIR%qwen-loop-data\project\%PROJECT_NAME%"
 
 echo.
 echo ProjectRoot : "%PROJECT_ROOT%"

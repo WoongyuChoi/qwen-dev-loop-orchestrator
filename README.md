@@ -172,10 +172,10 @@ useEffect, @Transactional, Invoke-RestMethod
 
 Selected file excerpts are added to the first prompt within size limits. The full project is not blindly sent.
 
-Project mode writes to a fresh folder:
+Project mode writes to a stable folder inside this orchestrator project, not inside the scanned target project:
 
 ```text
-qwen-loop-data\project\<project-name>-<yyyyMMdd-HHmmss>\
+qwen-loop-data\project\<project-name>\
 ```
 
 Key outputs:
@@ -190,7 +190,7 @@ run_history.md
 run_history.jsonl
 ```
 
-Unlike random mode, project mode does not resume the previous project answer. It starts fresh each time, while still using recent global questions only as duplicate-avoidance hints.
+Project mode starts from a fresh scan-based question each time, but reuses the same project work folder so logs do not create git changes in the scanned target project. Automatic cleanup compacts large transcripts/error logs and enforces the configured work-folder size cap.
 
 ## How It Works
 
