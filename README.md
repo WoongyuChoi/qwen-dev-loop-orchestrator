@@ -1,277 +1,287 @@
 # qwen-dev-loop-orchestrator
 
-Windows 11에서 Qwen Code용 `settings.json`을 기반으로 Qwen/OpenAI-compatible 서버에 주기적으로 질문을 보내는 개발 분석 루프 스케줄러 프로젝트입니다.
+![Shell](https://img.shields.io/badge/Shell-Windows%20Batch-2b2b2b)
+![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-5391FE)
+![Platform](https://img.shields.io/badge/platform-Windows%2011-blue)
+![Qwen](https://img.shields.io/badge/Qwen%20Code-settings--first-7c3aed)
 
-이 프로젝트는 기존 `qwen_loop_scheduler_v4_settings_first` 최신 파일을 기반으로 따로 분리한 Codex 작업용 프로젝트입니다.
+> Windows double-click runner that repeatedly calls an OpenAI-compatible Qwen endpoint using a Qwen Code-style `settings.json`, saves the answer, extracts `NEXT_QUESTION`, and continues the loop.
 
-더블클릭 실행 시 CMD 상단에 `Qwen Loop Scheduler` ASCII 배너와 작은 터미널 아바타가 표시됩니다. 조용한 로그가 필요하면 `qwen-loop.ps1` 실행 옵션에 `-NoBanner`를 추가합니다.
+This project is useful when you want to test or observe a Qwen/OpenAI-compatible server as if the request came from a Qwen Code-like client, while keeping a visible local transcript and run history.
 
-## 핵심 목표
+It is an independent helper script, not an official Qwen project.
 
-- `%USERPROFILE%\.qwen\settings.json` 설정을 최대한 존중한다.
-- `envKey`, `generationConfig`, `permissions`, `general`, `ui`, `$version` 등을 임의로 버리지 않는다.
-- Windows 11에서 더블클릭 BAT 파일로 실행한다.
-- 한글 질문/응답/로그가 깨지지 않도록 UTF-8을 강제한다.
-- 매 호출 후 8-15분 사이의 랜덤 대기시간을 새로 뽑아 질문 → 답변 → 다음 질문 추출 → 다음 루프를 반복한다.
-- 실제 전송 헤더와 바디를 로그로 확인할 수 있게 한다.
-- 오래 켜둬도 `qwen-loop-data`가 무한정 커지지 않도록 상태 파일은 보존하고 오래된 산출물/큰 로그는 자동 정리한다.
+## Overview
 
-## Qwen Code 호환 전송 기준
+`qwen-dev-loop-orchestrator` is a small Windows automation tool made of one main PowerShell script and a few double-click `.bat` entry points.
 
-이 프로젝트는 `settings.json`을 주 설정 원천으로 사용하지만, OpenAI-compatible HTTP 요청 바디에 설정 객체 전체를 그대로 넣지는 않습니다. Qwen Code CLI의 기본 OpenAI-compatible provider 동작에 맞춰 다음 필드만 전송 형태에 직접 매핑합니다.
+It can run in two modes:
 
-- `generationConfig.customHeaders`: HTTP header로 병합
-- `generationConfig.samplingParams`: request body의 sampling parameter로 병합
-- `generationConfig.extra_body`: request body에 마지막으로 병합
-- `envKey`: OS 환경변수, `.env`, `settings.json.env` 순서로 API key를 찾아 `Authorization` header에 사용
+- **Random question loop**: starts from `question_bank.txt` or resumes `qwen-loop-data\next_question.txt`.
+- **Project directory loop**: scans a local Java/Spring, React/TypeScript, SQL/MyBatis, or script-based project and starts a fresh project-specific analysis loop.
 
-`generationConfig.modalities`, `generationConfig.contextWindowSize`, `generationConfig.timeout`, `general`, `permissions`, `security`, `ui`, `$version` 등은 버리지 않고 provider 선택, system prompt, 요약 로그, 검증 파일에 반영합니다. 다만 Qwen Code CLI가 raw body field로 보내지 않는 값은 기본 요청 바디에 임의로 추가하지 않습니다.
+Core behavior:
 
-기본 전송은 Qwen Code가 사용하는 OpenAI Node SDK 경로를 더 가깝게 흉내냅니다. `X-Stainless-*` SDK fingerprint header를 포함하고, `User-Agent: QwenCode/<version> (win32; x64)`가 SDK 기본 User-Agent를 덮어쓰는 순서를 따릅니다. `<version>`은 수신측 서버 버전이 아니라 요청을 보내는 Qwen Code CLI 클라이언트 버전입니다. 실제 CLI 버전을 모르면 공식 fallback과 같은 `unknown`을 사용하고, 정확한 버전을 알고 있으면 `QWEN_CODE_VERSION` 환경변수나 `-QwenCodeVersion` 인자로 지정합니다. Qwen Code가 실제로 사용하는 Node 런타임 버전을 모르면 `X-Stainless-Runtime-Version`도 `unknown`으로 두며, 정확히 알 때만 `QWEN_CODE_NODE_VERSION` 환경변수나 `-NodeRuntimeVersion` 인자로 지정합니다.
+- Reads `%USERPROFILE%\.qwen\settings.json` as the main configuration source.
+- Sends OpenAI-compatible `/chat/completions` requests with Qwen Code-like headers and streaming body.
+- Preserves `envKey`, provider config, generation config, output language, and permission hints.
+- Extracts the first `NEXT_QUESTION:` line from each answer and uses it as the next prompt.
+- Saves request logs, response status, answer preview, token usage, transcript, and run history.
+- Waits a randomized 8-15 minutes between loop calls by default.
+- Keeps `qwen-loop-data` lightweight with automatic cleanup.
 
-기본 요청은 `stream: true`, `stream_options.include_usage: true`이며, endpoint도 OpenAI SDK처럼 `baseUrl + /chat/completions` 한 곳만 사용합니다. 예전처럼 `/v1/chat/completions`를 먼저 시도하는 fallback은 `-EndpointFallbacks`를 켰을 때만 사용합니다.
+## Download
 
-`temperature: 0.35`나 `max_tokens: 8192` 같은 스케줄러 임의값은 기본으로 보내지 않습니다. `samplingParams`가 없으면 Qwen Code의 token limit 로직에 맞춰 모델명 기반 `max_tokens`만 계산합니다. 임의 sampling 기본값을 일부러 보내야 할 때만 `-UseSchedulerSamplingDefaults`를 사용합니다.
+Main files:
 
-`X-Qwen-Loop-*` 진단 header는 기본으로 보내지 않습니다. 수신자 추적이 필요할 때만 `qwen-loop.ps1` 실행 시 `-LoopDiagnosticHeaders`를 추가합니다. PC명, 사용자명, local IP 같은 식별 header만 빼려면 `-LoopDiagnosticHeaders -NoClientIdentityHeaders`를 함께 사용합니다.
+- [`run-qwen-loop.bat`](run-qwen-loop.bat) - main double-click launcher
+- [`check-qwen-loop.bat`](check-qwen-loop.bat) - dry-run settings checker
+- [`qwen-loop.ps1`](qwen-loop.ps1) - main loop implementation
+- [`question_bank.txt`](question_bank.txt) - initial question seeds
+- [`seed_prompt.txt`](seed_prompt.txt) - fallback seed question
+- [`context_files.txt`](context_files.txt) - optional context file list
 
-`dry_run_request_headers.json`과 `last_request_headers.json`은 내부 API 테스트용으로 기본 비마스킹 저장합니다. 민감값 마스킹이 필요한 경우에만 `-MaskSensitiveLogs`를 추가합니다.
+## Requirements
 
-실제 호출 성공 시 CMD에는 `HTTP 200 OK (... ms, ... bytes)` 형식의 응답 상태가 출력되고, 추출된 응답 글자 수도 함께 표시됩니다. 404/500 같은 HTTP 오류나 연결 실패는 `Endpoint failed`와 함께 상태 코드/응답 body 일부가 콘솔과 `error.log`에 남습니다.
+- Windows 10/11
+- Windows PowerShell 5.1 or later
+- A Qwen/OpenAI-compatible chat completions endpoint
+- A Qwen Code-style `settings.json`
 
-응답을 받은 뒤에는 `ANSWER PREVIEW`로 실제 답변 본문 앞부분을 기본 4줄/1000자까지 CMD에 보여줍니다. 전체 답변은 `transcript.md`와 `transcript.jsonl`에 저장됩니다. preview가 너무 길거나 불필요하면 `-AnswerPreviewLines`, `-AnswerPreviewChars`, `-NoAnswerPreview`로 조정합니다.
+No npm, Python, or external package install is required.
 
-각 호출 생명주기는 `run_history.md`와 `run_history.jsonl`에 별도로 누적됩니다. `transcript`가 답변 본문 중심이라면, `run_history`는 `Seq`, `Session`, `Status`, `Started`, `Request`, `Response`, `HTTP`, `Next Wait`, `Next Run`을 테이블처럼 남겨 “정말 다음 순번까지 쐈는지” 확인하는 용도입니다.
+## Configuration
 
-서버가 OpenAI-compatible `usage` 값을 반환하면 CMD에 `TokenUse`도 표시합니다. 기본 기준은 출력 토큰이 `1000` 미만이면 초록색 `light`, `1000-3999`면 노란색 `balanced`, `4000` 이상이면 마젠타색 `rich`입니다. 이 루프는 깊은 답변을 의도하므로 `rich`는 경고가 아니라 분석량이 충분하다는 신호에 가깝고, 대신 응답 시간과 비용은 늘 수 있습니다. 기준은 `-TokenLowThreshold`, `-TokenRichThreshold`로 조정합니다.
-
-통신 실패 시 기본 `-MaxRetries 3`으로 즉시 재시도합니다. 네트워크/타임아웃 오류와 HTTP `408`, `409`, `429`, `5xx`는 retry 대상이고, `400`, `401`, `403`, `404`처럼 요청/인증/경로가 틀린 오류는 같은 endpoint에서 반복해도 회복 가능성이 낮아 재시도하지 않습니다. 각 retry 요청의 `X-Stainless-Retry-Count` header는 `0`, `1`, `2`, `3`처럼 실제 시도 횟수에 맞춰 증가합니다.
-
-`qwen-loop-data` 자동정리는 기본으로 켜져 있습니다. 기본값은 전체 WorkDir `100 MB`, `transcript.md`/`transcript.jsonl` 각각 `25 MB`, `error.log` `5 MB`, 오래된 check/DryRun 산출물 `14일`, 최근 대화 `30 turn` 보존입니다. `next_question.txt`, `last_turn.txt`, 최신 request/response 로그처럼 루프 재시작에 필요한 상태 파일은 삭제하지 않습니다. 필요하면 `-MaxWorkDirMB`, `-MaxTranscriptMB`, `-MaxErrorLogMB`, `-CleanupKeepDays`, `-CleanupKeepTurns`로 조정하고, 완전히 끄려면 `-NoAutoCleanup`을 사용합니다.
-
-## 호출 간격
-
-기본 루프는 고정 10분 타이머가 아니라 `-MinIntervalMinutes 8 -MaxIntervalMinutes 15` 범위에서 매 호출 후 새 랜덤 대기시간을 뽑습니다. 예를 들어 한 번 호출한 뒤 11분 20초를 기다렸다면, 다음 호출 뒤에는 다시 8-15분 범위에서 새 값을 뽑습니다.
-
-기존처럼 고정 간격 테스트가 필요하면 `qwen-loop.ps1`에 `-IntervalSeconds 600`만 단독으로 넘깁니다. `-MinIntervalMinutes`/`-MaxIntervalMinutes`를 함께 넘기면 랜덤 범위가 우선입니다.
-
-대기 중에는 CMD의 같은 줄에서 `Wait 07:30 (450s) | next 15:23:29 | random | Ctrl+C`처럼 짧은 countdown이 기본 1초마다 갱신됩니다. 너무 번잡하면 `-CountdownRefreshSeconds 60`으로 1분마다 갱신하거나, `-NoCountdown`으로 예전처럼 한 번만 출력하고 조용히 대기할 수 있습니다.
-
-## 먼저 볼 파일
+The default launcher reads:
 
 ```text
-README.md                         실행 방법, 콘솔 출력 예시, 동작 흐름
-AGENTS.md                         Codex 작업 규칙
-CHANGELOG.md                      현재 기능 기준 변경 요약
-settings.json                     스크린샷 기반 재구성 settings.json
-.qwen/settings.json               사용자 .qwen 폴더 구조 미러
-qwen-loop.ps1                     메인 실행 로직
-seed_prompt.txt                   question_bank.txt가 없거나 비었을 때 쓰는 단일 fallback 질문
-question_bank.txt                 트랙별 초기 질문 seed 모음
+%USERPROFILE%\.qwen\settings.json
 ```
 
-## 더블클릭 실행 파일
+The script expects an OpenAI-compatible provider entry similar to:
 
-권장 진입점:
+```json
+{
+  "modelProviders": {
+    "openai": [
+      {
+        "id": "qwen-agent",
+        "name": "qwen-agent",
+        "baseUrl": "http://localhost:8000",
+        "envKey": "QWEN_API_KEY",
+        "generationConfig": {
+          "samplingParams": {
+            "temperature": 0.7
+          }
+        }
+      }
+    ]
+  },
+  "env": {
+    "QWEN_API_KEY": ""
+  },
+  "model": {
+    "name": "qwen-agent"
+  },
+  "general": {
+    "outputLanguage": "Korean"
+  }
+}
+```
+
+API key lookup order:
+
+1. OS environment variable named by `envKey`
+2. `.env` candidates near the settings/script/user profile
+3. `settings.json.env[envKey]`
+
+Do not commit real API keys. For public repositories, keep `settings.json` sanitized or provide a separate example file.
+
+## Usage
+
+### 1. Check settings without calling the API
+
+Double-click:
+
+```bat
+check-qwen-loop.bat
+```
+
+This creates dry-run files under `qwen-loop-data\check\...`:
 
 ```text
-check-qwen-loop.bat               실제 호출 없이 사용자/프로젝트 settings를 순차 DryRun
-run-qwen-loop.bat                 실제 사용자 settings 기준 메인 루프 실행, 1/2 모드 선택
-05_OPEN_LOG_FOLDER.bat            로그 폴더 열기
+settings_effective_summary.json
+dry_run_request_headers.json
+dry_run_request_body.json
 ```
 
-`run-qwen-loop.bat`을 실행하면 먼저 모드를 고릅니다.
+Use these files to verify the actual headers/body that would be sent.
 
-```text
-1. Random question loop
-   기존처럼 qwen-loop-data\next_question.txt와 transcript를 이어서 사용합니다.
+### 2. Start the loop
 
-2. Project directory loop
-   사용자가 입력한 프로젝트 디렉터리를 스캔하고, 새 WorkDir에서 프로젝트 기반 첫 질문을 만듭니다.
+Double-click:
+
+```bat
+run-qwen-loop.bat
 ```
 
-2번 모드는 이전 답변을 이어받지 않는 새 세션입니다. 대신 기존 `qwen-loop-data`의 최근 질문은 중복 회피용 히스토리로만 프롬프트에 넣습니다.
-
-세부 검증용 파일:
-
-`10MIN`이 들어간 파일명은 기존 호환 이름이며, 현재 루프 BAT의 실제 기본 대기시간은 8-15분 랜덤입니다.
-
-실제 사용자 경로 `%USERPROFILE%\.qwen\settings.json`을 읽는 파일:
-
-```text
-01_CHECK_SETTINGS_DOUBLECLICK.bat
-02_RUN_ONCE_TEST_DOUBLECLICK.bat
-03_RUN_LOOP_10MIN_DOUBLECLICK.bat
-04_RUN_LOOP_10MIN_COMPAT_BODY_IF_SERVER_REJECTS.bat
-```
-
-프로젝트 내부 `settings.json`을 읽는 파일:
-
-```text
-06_CHECK_PROJECT_SETTINGS_DOUBLECLICK.bat
-07_RUN_ONCE_PROJECT_SETTINGS_DOUBLECLICK.bat
-08_RUN_LOOP_10MIN_PROJECT_SETTINGS_DOUBLECLICK.bat
-```
-
-## 추천 실행 순서
-
-1. `check-qwen-loop.bat` 더블클릭
-2. 사용자/프로젝트 settings DryRun 결과 확인
-3. `qwen-loop-data\check\...\dry_run_request_headers.json`과 `dry_run_request_body.json` 확인
-4. 정상이라면 `run-qwen-loop.bat` 실행 후 1번 또는 2번 모드 선택
-
-프로젝트 내부 settings로 테스트하려면 01/02/03 대신 06/07/08을 사용합니다.
-
-## CMD 출력 예시
-
-아래는 실제 실행값이 아니라 CMD에서 보이는 형태 예시입니다. 경로, endpoint, 응답 시간, token 수, 다음 질문, 랜덤 대기시간은 실행 환경과 서버 응답에 따라 달라집니다.
-
-DryRun 체크를 실행하면 실제 API는 호출하지 않고 settings 해석 결과와 전송 예정 header/body 파일만 만듭니다.
-
-```text
-   ____                         __
-  / __ \__      _____  ____    / /   ____  ____  ____
- / / / / | /| / / _ \/ __ \  / /   / __ \/ __ \/ __ \
-/ /_/ /| |/ |/ /  __/ / / / / /___/ /_/ / /_/ / /_/ /
-\___\_\|__/|__/\___/_/ /_/ /_____/\____/\____/ .___/
-                                             /_/
-                 S C H E D U L E R   v4
-       +------------------------------------------------+
-       | settings-first OpenAI-compatible API runner    |
-       | random loop / visible status / transcript log  |
-       +--------------------------.---------------------+
-                                  |
-                              [ QWEN ]
-                               (o_o)
-                            ---/|_|\---
-
-=== Runtime Summary: SETTINGS-FIRST ===
-SettingsPath : C:\Users\<user>\.qwen\settings.json
-ProviderType : openai
-ProviderName : qwen3.6-agent
-ProviderId   : qwen3.6-agent
-BaseUrl      : http://10.32.64.116:8002
-Model        : qwen3.6-agent
-EnvKey       : QWEN_CUSTOM_API_KEY_OPENAI_HTTP_10_32_64_116_8002_...
-ApiKeySource : settings.json/env
-Authorization: sent exactly from settings.json/env
-ClientIdent  : disabled; use -LoopDiagnosticHeaders only when receiver-side tracing needs it
-CompatBody   : False
-WireMode     : Qwen Code OpenAI SDK-like headers/body
-Stream       : True
-Retry        : max 3, backoff 1-10 sec
-TokenUse     : light < 1000, rich >= 4000 output tokens
-HeaderLog    : unmasked
-QuestionSrc  : question_bank.txt
-AnswerPreview: 4 lines / 1000 chars
-AutoCleanup  : folder <= 100 MB, transcript <= 25 MB, error <= 5 MB, keep 30 turns, stale check > 14 days
-Cleanup     : ok, current 182.3 KB
-IntervalMode : random
-IntervalRange: 8 min (480 sec) - 15 min (900 sec)
-Countdown    : live every 1 sec
-TimeoutSec   : 120
-WorkDir      : ...\qwen-loop-data\check\user
-Stop         : Ctrl+C
-==============================================
-DryRun mode: API 호출 없이 settings.json 활용 내역만 확인했습니다.
-Created:
-- ...\qwen-loop-data\check\user\settings_effective_summary.json
-- ...\qwen-loop-data\check\user\dry_run_request_headers.json
-- ...\qwen-loop-data\check\user\dry_run_request_body.json
-Endpoint:
-- http://10.32.64.116:8002/chat/completions
-```
-
-`run-qwen-loop.bat`에서 2번을 고르면 프로젝트 경로를 입력받고, 별도 WorkDir을 만든 뒤 스캔 결과를 Runtime Summary에 표시합니다.
+You will see:
 
 ```text
 Qwen Loop Scheduler
 ------------------------------------------------------------
 1. Random question loop
-   - 기존 qwen-loop-data 상태를 이어서 사용합니다.
+   - Resumes the existing qwen-loop-data session.
 
 2. Project directory loop
-   - 입력한 프로젝트 디렉터리를 스캔합니다.
-   - 프로젝트 기반 첫 질문을 만들고 새 세션으로 시작합니다.
+   - Scans a directory and starts a fresh project-based session.
 
-Select mode [1/2]: 2
-
-[MODE] Project directory loop
-ProjectRoot 예시: D:\workspace\my-project
-
-ProjectRoot: D:\workspace\my-project
-
-ProjectRoot : D:\workspace\my-project
-WorkDir     : ...\qwen-loop-data\project\my-project-20260707-104500
-
-QuestionSrc  : project-scan
-ProjectRoot  : D:\workspace\my-project
-ProjectScan  : 128 files scanned, 24 key files selected
-WorkDir      : ...\qwen-loop-data\project\my-project-20260707-104500
+Select mode [1/2]:
 ```
 
-실제 루프에서는 질문 전송, HTTP 상태, 답변 preview, token 사용량, 다음 질문, 저장 경로가 한 사이클 안에서 이어서 보입니다.
+Choose:
+
+- `1` to resume or start the general random question loop.
+- `2` to enter a project directory path and start a fresh project-based loop.
+
+Press `Ctrl+C` in the console to stop the loop.
+
+## Project Directory Mode
+
+Project mode scans the directory locally before the first request.
+
+It excludes large/generated/sensitive locations such as:
 
 ```text
-[2026-07-06 13:50:15] RUN #1 QUESTION:
-현재 Spring Boot 백엔드의 핵심 도메인 서비스 레이어에서 트랜잭션 경계가 Repository 호출 시점에 명확히 구분되어 있는지 분석해 줘.
-
-[2026-07-06 13:50:15] POST http://10.32.64.116:8002/chat/completions (attempt 1/4, retry-count=0)
-[2026-07-06 13:50:42] HTTP 200 OK (27091 ms, 18432 bytes, retry-count=0)
-ResponseText : 6280 chars extracted
-TokenUse     : input=2,418, output=1,946, total=4,364 | balanced (reasonable depth and cost)
-
-ANSWER PREVIEW:
-트랜잭션 경계를 검토할 때는 먼저 Service public method 단위에서 업무 유스케이스가 닫히는지 확인해야 합니다.
-그 다음 Repository 호출이 같은 트랜잭션 안에서 필요한 지연 로딩, 변경 감지, 예외 롤백 규칙을 공유하는지 봅니다.
-...
-
-NEXT QUESTION:
-현재 Service 계층에서 읽기 전용 조회와 쓰기 유스케이스가 같은 @Transactional 설정을 공유하면서 불필요한 flush나 lock 경합을 만들 가능성이 있는지 분석해 줘.
-
-Saved:
-- ...\qwen-loop-data\next_question.txt
-- ...\qwen-loop-data\last_turn.txt
-- ...\qwen-loop-data\transcript.md
-- ...\qwen-loop-data\transcript.jsonl
-- ...\qwen-loop-data\last_request_headers.json
-- ...\qwen-loop-data\last_request_body.json
-- ...\qwen-loop-data\last_response_status.json
-
-RUN #1 complete. Full answer saved to transcript.md.
-RunHistory  : ...\qwen-loop-data\run_history.md
-Wait 11:50 (710s) | next 14:02:32 | random | Ctrl+C
+.git
+node_modules
+build
+target
+dist
+qwen-loop-data
+.env*
+.npmrc
 ```
 
-통신이 불안정하면 retry 대상 오류만 다시 시도합니다. `404`나 인증 오류처럼 같은 요청을 반복해도 해결되지 않는 오류는 retry 없이 실패 로그를 남깁니다.
+It scores useful files by path, filename, extension, and code signals such as:
 
 ```text
-[2026-07-06 14:10:04] POST http://10.32.64.116:8002/chat/completions (attempt 1/4, retry-count=0)
-Endpoint failed: http://10.32.64.116:8002/chat/completions (attempt 1/4, retryable=True)
-HTTP 호출 실패 after 120013 ms: The operation has timed out.
-Retry 1/3 in 1.4 sec...
-
-[2026-07-06 14:10:06] POST http://10.32.64.116:8002/chat/completions (attempt 2/4, retry-count=1)
-[2026-07-06 14:10:29] HTTP 200 OK (22841 ms, 15320 bytes, retry-count=1)
+Service, Controller, Repository, Mapper, pom.xml, package.json,
+useEffect, @Transactional, Invoke-RestMethod
 ```
 
-## 로그 파일
+Selected file excerpts are added to the first prompt within size limits. The full project is not blindly sent.
 
-실행 후 `qwen-loop-data` 폴더에 생성됩니다. 이 폴더는 `.gitignore` 대상인 런타임 상태/검증 출력이며 설정 원천이 아닙니다. 다른 PC에서 실행하면 그 PC의 `%USERPROFILE%`, settings 경로, 질문 상태에 맞춰 새로 생성됩니다.
+Project mode writes to a fresh folder:
 
-기본 실행에서는 Qwen Code CLI 전송 모양을 해치지 않도록 PC명, 사용자명, 도메인, TCP local IP, target host 같은 `X-Qwen-Loop-*` 진단값을 조회하거나 보내지 않습니다. 수신자 추적이 필요할 때만 `-LoopDiagnosticHeaders`를 켜며, 이때 생성되는 `clientNetworkIdentity` 값은 해당 실행 환경에서 동적으로 계산된 진단 로그입니다.
+```text
+qwen-loop-data\project\<project-name>-<yyyyMMdd-HHmmss>\
+```
 
-자동정리는 시작 시 한 번, 각 루프 저장 후 한 번 실행됩니다. 크기 임계치를 넘으면 `transcript.md`는 최근 turn 중심으로 compact하고, `transcript.jsonl`은 최근 record와 짧은 답변 preview만 남깁니다. `error.log`는 최근 tail만 남기며, 오래된 check/DryRun 파일은 날짜 기준으로 제거합니다.
+Key outputs:
+
+```text
+project_scan_summary.md
+project_scan_summary.json
+next_question.txt
+transcript.md
+transcript.jsonl
+run_history.md
+run_history.jsonl
+```
+
+Unlike random mode, project mode does not resume the previous project answer. It starts fresh each time, while still using recent global questions only as duplicate-avoidance hints.
+
+## How It Works
+
+```text
++-----------------------------+
+| 1. Pick current question     |
+| next_question.txt or seed    |
++--------------+--------------+
+               |
+               v
++-----------------------------+
+| 2. Build Qwen-style request  |
+| settings-based headers/body  |
++--------------+--------------+
+               |
+               v
++-----------------------------+
+| 3. POST /chat/completions    |
+| streaming response expected  |
++--------------+--------------+
+               |
+               v
++-----------------------------+
+| 4. Extract NEXT_QUESTION     |
+| from the answer              |
++--------------+--------------+
+               |
+               v
++-----------------------------+
+| 5. Save logs and transcript  |
+| next_question, history, json |
++--------------+--------------+
+               |
+               v
++-----------------------------+
+| 6. Wait random interval      |
+| default: 8-15 minutes        |
++--------------+--------------+
+               |
+               v
+        Repeat until stopped
+```
+
+The model is instructed to start every response with:
+
+```text
+NEXT_QUESTION: <one concrete follow-up question>
+```
+
+The script parses that line and stores it in:
+
+```text
+qwen-loop-data\next_question.txt
+```
+
+## Qwen Code-like Request Shape
+
+The default request path is:
+
+```text
+<baseUrl>/chat/completions
+```
+
+Default wire behavior:
+
+- `stream: true`
+- `stream_options.include_usage: true`
+- `User-Agent: QwenCode/<version> (win32; x64)`
+- `X-Stainless-*` SDK-style headers
+- `X-Stainless-Retry-Count` updated per retry attempt
+- `generationConfig.customHeaders` merged into HTTP headers
+- `generationConfig.samplingParams` merged into request body
+- `generationConfig.extra_body` merged last
+
+The script does **not** send `X-Qwen-Loop-*` diagnostic headers by default. Use `-LoopDiagnosticHeaders` only if receiver-side tracing needs client identity information.
+
+## Output Files
+
+Runtime data is written under:
+
+```text
+qwen-loop-data\
+```
+
+Common files:
 
 ```text
 settings_effective_summary.json
 last_request_headers.json
 last_request_body.json
 last_response_status.json
-dry_run_request_headers.json
-dry_run_request_body.json
-project_scan_summary.md
-project_scan_summary.json
 next_question.txt
 last_turn.txt
 transcript.md
@@ -281,115 +291,108 @@ run_history.jsonl
 error.log
 ```
 
-## run_history 예시
+`qwen-loop-data` is ignored by git and can be deleted when you do not need the local run state anymore.
 
-`run_history.md`는 콘솔을 계속 보고 있지 않아도 호출 흐름을 확인할 수 있는 실행 일지입니다. `Seq`는 `run_history.jsonl`을 기준으로 계속 증가하는 누적 번호이고, `Session`은 현재 프로그램 실행 창 안의 `RUN #1`, `RUN #2` 번호입니다.
+## Console Output Example
 
-```text
-# Qwen Loop Run History
-
-| Seq | Session | Status | Started | Request | Response | Elapsed | HTTP | Next Wait | Next Run | Question | Next Question | Note |
-|---:|---:|---|---|---|---|---:|---|---|---|---|---|---|
-| 1 | 1 | ok | 2026-07-06 15:36:32 | 2026-07-06 15:36:32 | 2026-07-06 15:36:32 | 334 ms | 200 OK | 0 min 1 sec (1 sec) | 2026-07-06 15:36:33 | 업무용 React 화면에서 키보드 접근성... | history-follow-up-1 | answer=53 chars, outputTokens=201 |
-| 2 | 2 | ok | 2026-07-06 15:36:34 | 2026-07-06 15:36:34 | 2026-07-06 15:36:34 | 130 ms | 200 OK | 11 min 50 sec (710 sec) | 2026-07-06 15:48:24 | history-follow-up-1 | history-follow-up-2 | answer=53 chars, outputTokens=202 |
-| 3 | 3 | error | 2026-07-06 15:48:24 | 2026-07-06 15:48:24 | 2026-07-06 15:50:24 | 2 min (120 sec) |  | 8 min 4 sec (484 sec) | 2026-07-06 15:58:28 | history-follow-up-2 |  | 모든 endpoint 호출 실패... |
-```
-
-이 예시에서 볼 수 있는 것:
-
-- `Seq 1`, `Seq 2`가 모두 `ok`이고 HTTP가 `200 OK`이면 실제 요청/응답이 정상 완료된 것입니다.
-- `Seq 2`의 `Question`이 `Seq 1`의 `Next Question`과 같으면 다음 질문 이어달리기가 정상입니다.
-- 마지막 실행이 `-Once`나 `-MaxRuns`로 끝나는 경우에는 `Next Wait`/`Next Run`이 비어 있을 수 있습니다.
-- `Status`가 `error`이면 `HTTP`가 비어 있거나 실패 코드가 들어가고, `Note`에 오류 요약이 남습니다.
-
-`run_history.jsonl`은 같은 내용을 한 줄 JSON으로 저장합니다. 사람이 볼 때는 `run_history.md`, 나중에 필터링하거나 집계할 때는 `run_history.jsonl`을 보면 됩니다.
-
-## 문서/산출물 정리 기준
-
-현재 유지하는 기준 문서는 `README.md`, `AGENTS.md`, `CHANGELOG.md`입니다. 과거 대화 요약, 일회성 인수인계 문서, 이전 배포 zip/diff 같은 reference artifact는 현재 실행 기준과 충돌하거나 중복되면 보관하지 않습니다.
-
-`qwen-loop-data`는 예외입니다. 이 폴더는 실행할 때마다 생기는 상태/검증 출력이므로 git에 올리지 않지만, 루프 재시작과 API 검증에는 실제로 사용됩니다. 특히 `run_history.md`는 호출 성공/실패와 다음 실행 예정 시각을 빠르게 보는 운영 일지 역할을 합니다.
-
-## 프로젝트 디렉터리 모드
-
-`run-qwen-loop.bat`에서 2번을 선택하면 사용자가 입력한 디렉터리를 로컬에서 먼저 스캔합니다. 코드 전체를 무제한으로 보내는 방식이 아니라, `node_modules`, `.git`, `build`, `target`, `qwen-loop-data` 같은 큰 산출물 폴더와 `.env*`, `.npmrc` 같은 로컬 secret 파일은 제외하고 Java/Spring, React/TypeScript, SQL/MyBatis, PowerShell/BAT 스크립트 등 분석에 의미 있는 텍스트 파일만 후보로 봅니다.
-
-스캐너는 파일명, 경로, 확장자, 코드 키워드를 기준으로 점수를 매깁니다. 예를 들어 `Service`, `Controller`, `Repository`, `Mapper`, `package.json`, `pom.xml`, `useEffect`, `@Transactional`, `Invoke-RestMethod` 같은 신호가 있으면 핵심 후보로 올라갑니다. 선택된 파일의 앞부분 excerpt만 `ProjectScanMaxFileChars`와 `ProjectScanMaxTotalChars` 한도 안에서 request prompt에 넣습니다.
-
-2번 모드 산출물은 새 WorkDir 아래에 저장됩니다.
+Shortened example:
 
 ```text
-qwen-loop-data\project\<project-name>-<yyyyMMdd-HHmmss>\
-  project_scan_summary.md          사람이 보는 스캔 요약
-  project_scan_summary.json        스캔 결과 JSON
-  next_question.txt                프로젝트 기반 첫 질문 또는 이후 NEXT_QUESTION
-  transcript.md / transcript.jsonl 답변 전문
-  run_history.md / run_history.jsonl 호출 생명주기
+=== Runtime Summary: SETTINGS-FIRST ===
+ProviderType : openai
+ProviderName : qwen-agent
+BaseUrl      : http://localhost:8000
+Model        : qwen-agent
+WireMode     : Qwen Code OpenAI SDK-like headers/body
+Stream       : True
+Retry        : max 3, backoff 1-10 sec
+IntervalMode : random
+IntervalRange: 8 min (480 sec) - 15 min (900 sec)
+
+[2026-07-07 10:00:00] RUN #1 QUESTION:
+Analyze the transaction boundary of the current Service layer.
+
+[2026-07-07 10:00:00] POST http://localhost:8000/chat/completions (attempt 1/4, retry-count=0)
+[2026-07-07 10:00:28] HTTP 200 OK (28142 ms, 24576 bytes, retry-count=0)
+TokenUse     : input=1,204, output=2,842, total=4,046 | balanced
+
+ANSWER PREVIEW:
+The first thing to verify is whether each Service method owns one complete use case...
+
+NEXT QUESTION:
+Analyze whether read-only queries and write use cases share the same @Transactional settings.
+
+RUN #1 complete. Full answer saved to transcript.md.
+Wait 11:50 (710s) | next 10:12:18 | random | Ctrl+C
 ```
 
-이 모드는 프로그램을 껐다 켜도 이전 프로젝트 답변을 이어받지 않는 fresh session으로 시작합니다. 다만 기존 `qwen-loop-data`의 최근 질문은 중복 방지용으로만 참고하므로, 같은 질문을 반복해서 던질 가능성은 낮춥니다.
+## Useful Options
 
-## 질문 루프
+You can call `qwen-loop.ps1` directly for advanced usage:
 
-전체 흐름은 아래처럼 반복됩니다.
+```powershell
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\qwen-loop.ps1 `
+  -SettingsPath "$env:USERPROFILE\.qwen\settings.json" `
+  -MinIntervalMinutes 8 `
+  -MaxIntervalMinutes 15 `
+  -WorkDir ".\qwen-loop-data"
+```
+
+Common options:
 
 ```text
-+-----------------------------+
-| 1. 다음 질문 선택           |
-| next_question.txt 우선 사용 |
-+--------------+--------------+
-               |
-               v
-+-----------------------------+
-| 2. API 요청 생성/전송       |
-| settings.json 기반 header   |
-| body + 현재 질문            |
-+--------------+--------------+
-               |
-               v
-+-----------------------------+
-| 3. 응답 수신/상태 표시      |
-| HTTP status, retry, preview |
-+--------------+--------------+
-               |
-               v
-+-----------------------------+
-| 4. NEXT_QUESTION 추출       |
-| 답변 첫 줄에서 다음 질문    |
-| 파싱                        |
-+--------------+--------------+
-               |
-               v
-+-----------------------------+
-| 5. 상태/로그 저장           |
-| next_question.txt           |
-| transcript.md / jsonl       |
-| last_turn.txt               |
-+--------------+--------------+
-               |
-               v
-+-----------------------------+
-| 6. 랜덤 대기                |
-| 8-15분 countdown 표시       |
-+--------------+--------------+
-               |
-               v
-        다음 루프로 반복
+-DryRun                         Build request logs without calling the API
+-Once                           Run one request and exit
+-ProjectRoot <path>             Scan a project directory and start from it
+-QuestionTrack <name>           Pick seeds from a specific question_bank track
+-MinIntervalMinutes <n>         Random wait minimum
+-MaxIntervalMinutes <n>         Random wait maximum
+-MaxRetries <n>                 Retry count for retryable failures
+-CompatBody                     Use a stricter standard OpenAI body
+-EndpointFallbacks              Try endpoint fallback candidates
+-MaskSensitiveLogs              Mask sensitive values in saved header logs
+-LoopDiagnosticHeaders          Send X-Qwen-Loop-* diagnostic headers
+-NoBanner                       Hide startup ASCII banner
+-NoCountdown                    Disable live countdown line
+-NoAutoCleanup                  Disable qwen-loop-data cleanup
 ```
 
-핵심은 프로그램이 직접 다음 질문 문장을 조립하지 않는다는 점입니다. 모델에게 답변 첫 줄을 `NEXT_QUESTION:`으로 쓰라고 지시하고, 프로그램은 그 줄을 파싱해서 `next_question.txt`에 저장합니다. 다음 루프에서는 저장된 이 질문을 다시 현재 질문으로 사용합니다.
+## Safety Notes
 
-질문은 아래 순서로 결정됩니다.
+- Request/response logs are saved locally for debugging. By default, header/body logs are not masked because this tool is meant for internal API inspection. Use `-MaskSensitiveLogs` if you need safer saved logs.
+- Project scan mode excludes common secret files, but you should still review `project_scan_summary.md` before sharing logs.
+- `settings.json` should not contain real public credentials.
+- This tool automates repeated API calls. Keep the default 8-15 minute randomized interval, or choose a responsible interval for your server.
 
-1. `qwen-loop-data\next_question.txt`가 있으면 그대로 이어서 사용
-2. 없거나 비어 있으면 `transcript.jsonl`의 마지막 `nextQuestion` 복구
-3. 그래도 없으면 `transcript.md`의 마지막 `## Next Question` 복구
-4. 그래도 없으면 `last_turn.txt`를 바탕으로 복구 질문 생성
-5. 완전히 처음이면 `question_bank.txt`에서 랜덤 seed 선택
-6. `question_bank.txt`가 없거나 비어 있으면 `seed_prompt.txt` 사용
+## Troubleshooting
 
-`question_bank.txt`는 `[java-spring]`, `[react-typescript]`처럼 트랙을 붙인 질문 목록입니다. 특정 트랙만 시작하고 싶으면 `qwen-loop.ps1`에 `-QuestionTrack java-spring`처럼 넘깁니다. 기본 프롬프트는 Java/Spring 질문과 React 질문을 억지로 묶지 않고, 현재 질문의 주 트랙 안에서 더 좁고 검증 가능한 후속 질문을 만들도록 지시합니다.
+### DryRun works, real call fails
 
-## 주의
+Check:
 
-이 루프는 모델 가중치를 실제로 학습시키는 파인튜닝이 아닙니다. 대신 개발 분석 질문/답변 로그를 계속 축적하여 나중에 문서화, RAG, Continue/Qwen 컨텍스트로 재활용하기 위한 도구입니다.
+- `last_response_status.json`
+- `error.log`
+- endpoint path: `<baseUrl>/chat/completions`
+- API key source in `settings_effective_summary.json`
+
+### Server rejects extra body fields
+
+Try:
+
+```bat
+04_RUN_LOOP_10MIN_COMPAT_BODY_IF_SERVER_REJECTS.bat
+```
+
+or pass:
+
+```powershell
+-CompatBody
+```
+
+### Text is garbled
+
+The scripts force UTF-8 console/file handling with `chcp 65001` and UTF-8 PowerShell output. If your terminal still displays broken text, try Windows Terminal or a UTF-8 compatible console font.
+
+## License
+
+No license file is included yet. Add a `LICENSE` file before publishing if you want others to use, modify, or redistribute this project under a specific license.
