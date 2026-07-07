@@ -264,6 +264,7 @@ Default wire behavior:
 - `generationConfig.customHeaders` merged into HTTP headers
 - `generationConfig.samplingParams` merged into request body
 - `generationConfig.extra_body` merged last
+- streaming responses are returned as soon as SSE `data: [DONE]` is received
 
 The script does **not** send `X-Qwen-Loop-*` diagnostic headers by default. Use `-LoopDiagnosticHeaders` only if receiver-side tracing needs client identity information.
 

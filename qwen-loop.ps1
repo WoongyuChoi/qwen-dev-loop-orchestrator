@@ -1992,7 +1992,38 @@ function Format-TokenUsageForMarkdown($usage, $profile) {
     return "input=$(Format-TokenNumber $usage.inputTokens), output=$(Format-TokenNumber $usage.outputTokens), total=$(Format-TokenNumber $usage.totalTokens), level=$($profile.level), note=$($profile.note)"
 }
 
-function Invoke-JsonPostUtf8([string]$Uri, $Headers, [byte[]]$BodyBytes, [int]$TimeoutSeconds) {
+function Read-ResponseStreamUtf8($Stream, [bool]$StopOnSseDone) {
+    if ($null -eq $Stream) { return "" }
+
+    if (-not $StopOnSseDone) {
+        $ms = New-Object System.IO.MemoryStream
+        $Stream.CopyTo($ms)
+        return [System.Text.Encoding]::UTF8.GetString($ms.ToArray())
+    }
+
+    $reader = New-Object System.IO.StreamReader($Stream, $Utf8NoBom, $true)
+    $sb = New-Object System.Text.StringBuilder
+    try {
+        while ($true) {
+            $line = $reader.ReadLine()
+            if ($null -eq $line) { break }
+
+            [void]$sb.Append($line).Append("`r`n")
+
+            $trimmed = $line.Trim()
+            if ($trimmed.StartsWith("data:")) {
+                $data = $trimmed.Substring(5).Trim()
+                if ($data -eq "[DONE]") { break }
+            }
+        }
+    } finally {
+        $reader.Dispose()
+    }
+
+    return $sb.ToString()
+}
+
+function Invoke-JsonPostUtf8([string]$Uri, $Headers, [byte[]]$BodyBytes, [int]$TimeoutSeconds, [bool]$StopOnSseDone = $false) {
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $req = [System.Net.HttpWebRequest]::Create($Uri)
     $req.Method = "POST"
@@ -2019,16 +2050,14 @@ function Invoke-JsonPostUtf8([string]$Uri, $Headers, [byte[]]$BodyBytes, [int]$T
         $resp = $req.GetResponse()
         try {
             $respStream = $resp.GetResponseStream()
-            $ms = New-Object System.IO.MemoryStream
-            $respStream.CopyTo($ms)
-            $bytes = $ms.ToArray()
+            $body = Read-ResponseStreamUtf8 $respStream $StopOnSseDone
             $sw.Stop()
             return [PSCustomObject]@{
-                Body = [System.Text.Encoding]::UTF8.GetString($bytes)
+                Body = $body
                 StatusCode = [int]$resp.StatusCode
                 StatusDescription = [string]$resp.StatusDescription
                 ContentType = [string]$resp.ContentType
-                ReceivedBytes = [int64]$bytes.Length
+                ReceivedBytes = [int64][System.Text.Encoding]::UTF8.GetByteCount($body)
                 DurationMs = [int64]$sw.ElapsedMilliseconds
             }
         } finally {
@@ -2125,7 +2154,7 @@ function Invoke-QwenChat($providerInfo, $settings, $networkIdentity, [string]$sy
             try {
                 $attemptText = "$($attempt + 1)/$($MaxRetries + 1)"
                 Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] POST $endpoint (attempt $attemptText, retry-count=$attempt)" -ForegroundColor Cyan
-                $response = Invoke-JsonPostUtf8 -Uri $endpoint -Headers $headers -BodyBytes $bodyBytes -TimeoutSeconds $EffectiveTimeoutSec
+                $response = Invoke-JsonPostUtf8 -Uri $endpoint -Headers $headers -BodyBytes $bodyBytes -TimeoutSeconds $EffectiveTimeoutSec -StopOnSseDone:(-not [bool]$NonStreaming)
                 Write-Host ("[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] HTTP {0} {1} ({2} ms, {3} bytes, retry-count={4})" -f $response.StatusCode, $response.StatusDescription, $response.DurationMs, $response.ReceivedBytes, $attempt) -ForegroundColor Green
                 $answerText = Convert-OpenAIResponseToText $response.Body (-not [bool]$NonStreaming)
                 $tokenUsage = Get-OpenAIUsageFromRaw $response.Body (-not [bool]$NonStreaming)

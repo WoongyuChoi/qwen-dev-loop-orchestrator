@@ -7,15 +7,15 @@ set "SETTINGS_PATH=%USERPROFILE%\.qwen\settings.json"
 
 pushd "%SCRIPT_DIR%" >nul
 if errorlevel 1 (
-  echo [ERROR] cannot enter script directory: "%SCRIPT_DIR%"
+  echo [ERROR] Cannot enter script directory: "%SCRIPT_DIR%"
   pause
   exit /b 1
 )
 
 if not exist "%SETTINGS_PATH%" (
-  echo [ERROR] settings.json not found: %SETTINGS_PATH%
-  pause
+  echo [ERROR] settings.json not found: "%SETTINGS_PATH%"
   popd >nul
+  pause
   exit /b 1
 )
 
