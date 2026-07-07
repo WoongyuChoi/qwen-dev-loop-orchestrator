@@ -76,9 +76,21 @@ question_bank.txt                 트랙별 초기 질문 seed 모음
 
 ```text
 check-qwen-loop.bat               실제 호출 없이 사용자/프로젝트 settings를 순차 DryRun
-run-qwen-loop.bat                 실제 사용자 settings 기준 메인 루프 실행
+run-qwen-loop.bat                 실제 사용자 settings 기준 메인 루프 실행, 1/2 모드 선택
 05_OPEN_LOG_FOLDER.bat            로그 폴더 열기
 ```
+
+`run-qwen-loop.bat`을 실행하면 먼저 모드를 고릅니다.
+
+```text
+1. Random question loop
+   기존처럼 qwen-loop-data\next_question.txt와 transcript를 이어서 사용합니다.
+
+2. Project directory loop
+   사용자가 입력한 프로젝트 디렉터리를 스캔하고, 새 WorkDir에서 프로젝트 기반 첫 질문을 만듭니다.
+```
+
+2번 모드는 이전 답변을 이어받지 않는 새 세션입니다. 대신 기존 `qwen-loop-data`의 최근 질문은 중복 회피용 히스토리로만 프롬프트에 넣습니다.
 
 세부 검증용 파일:
 
@@ -106,7 +118,7 @@ run-qwen-loop.bat                 실제 사용자 settings 기준 메인 루프
 1. `check-qwen-loop.bat` 더블클릭
 2. 사용자/프로젝트 settings DryRun 결과 확인
 3. `qwen-loop-data\check\...\dry_run_request_headers.json`과 `dry_run_request_body.json` 확인
-4. 정상이라면 `run-qwen-loop.bat` 실행
+4. 정상이라면 `run-qwen-loop.bat` 실행 후 1번 또는 2번 모드 선택
 
 프로젝트 내부 settings로 테스트하려면 01/02/03 대신 06/07/08을 사용합니다.
 
@@ -170,6 +182,34 @@ Endpoint:
 - http://10.32.64.116:8002/chat/completions
 ```
 
+`run-qwen-loop.bat`에서 2번을 고르면 프로젝트 경로를 입력받고, 별도 WorkDir을 만든 뒤 스캔 결과를 Runtime Summary에 표시합니다.
+
+```text
+Qwen Loop Scheduler
+------------------------------------------------------------
+1. Random question loop
+   - 기존 qwen-loop-data 상태를 이어서 사용합니다.
+
+2. Project directory loop
+   - 입력한 프로젝트 디렉터리를 스캔합니다.
+   - 프로젝트 기반 첫 질문을 만들고 새 세션으로 시작합니다.
+
+Select mode [1/2]: 2
+
+[MODE] Project directory loop
+ProjectRoot 예시: D:\workspace\my-project
+
+ProjectRoot: D:\workspace\my-project
+
+ProjectRoot : D:\workspace\my-project
+WorkDir     : ...\qwen-loop-data\project\my-project-20260707-104500
+
+QuestionSrc  : project-scan
+ProjectRoot  : D:\workspace\my-project
+ProjectScan  : 128 files scanned, 24 key files selected
+WorkDir      : ...\qwen-loop-data\project\my-project-20260707-104500
+```
+
 실제 루프에서는 질문 전송, HTTP 상태, 답변 preview, token 사용량, 다음 질문, 저장 경로가 한 사이클 안에서 이어서 보입니다.
 
 ```text
@@ -230,6 +270,8 @@ last_request_body.json
 last_response_status.json
 dry_run_request_headers.json
 dry_run_request_body.json
+project_scan_summary.md
+project_scan_summary.json
 next_question.txt
 last_turn.txt
 transcript.md
@@ -267,6 +309,25 @@ error.log
 현재 유지하는 기준 문서는 `README.md`, `AGENTS.md`, `CHANGELOG.md`입니다. 과거 대화 요약, 일회성 인수인계 문서, 이전 배포 zip/diff 같은 reference artifact는 현재 실행 기준과 충돌하거나 중복되면 보관하지 않습니다.
 
 `qwen-loop-data`는 예외입니다. 이 폴더는 실행할 때마다 생기는 상태/검증 출력이므로 git에 올리지 않지만, 루프 재시작과 API 검증에는 실제로 사용됩니다. 특히 `run_history.md`는 호출 성공/실패와 다음 실행 예정 시각을 빠르게 보는 운영 일지 역할을 합니다.
+
+## 프로젝트 디렉터리 모드
+
+`run-qwen-loop.bat`에서 2번을 선택하면 사용자가 입력한 디렉터리를 로컬에서 먼저 스캔합니다. 코드 전체를 무제한으로 보내는 방식이 아니라, `node_modules`, `.git`, `build`, `target`, `qwen-loop-data` 같은 큰 산출물 폴더와 `.env*`, `.npmrc` 같은 로컬 secret 파일은 제외하고 Java/Spring, React/TypeScript, SQL/MyBatis, PowerShell/BAT 스크립트 등 분석에 의미 있는 텍스트 파일만 후보로 봅니다.
+
+스캐너는 파일명, 경로, 확장자, 코드 키워드를 기준으로 점수를 매깁니다. 예를 들어 `Service`, `Controller`, `Repository`, `Mapper`, `package.json`, `pom.xml`, `useEffect`, `@Transactional`, `Invoke-RestMethod` 같은 신호가 있으면 핵심 후보로 올라갑니다. 선택된 파일의 앞부분 excerpt만 `ProjectScanMaxFileChars`와 `ProjectScanMaxTotalChars` 한도 안에서 request prompt에 넣습니다.
+
+2번 모드 산출물은 새 WorkDir 아래에 저장됩니다.
+
+```text
+qwen-loop-data\project\<project-name>-<yyyyMMdd-HHmmss>\
+  project_scan_summary.md          사람이 보는 스캔 요약
+  project_scan_summary.json        스캔 결과 JSON
+  next_question.txt                프로젝트 기반 첫 질문 또는 이후 NEXT_QUESTION
+  transcript.md / transcript.jsonl 답변 전문
+  run_history.md / run_history.jsonl 호출 생명주기
+```
+
+이 모드는 프로그램을 껐다 켜도 이전 프로젝트 답변을 이어받지 않는 fresh session으로 시작합니다. 다만 기존 `qwen-loop-data`의 최근 질문은 중복 방지용으로만 참고하므로, 같은 질문을 반복해서 던질 가능성은 낮춥니다.
 
 ## 질문 루프
 

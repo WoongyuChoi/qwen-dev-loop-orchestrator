@@ -8,6 +8,8 @@
 - `.qwen/settings.json` 미러 추가.
 - Codex용 `AGENTS.md` 추가.
 - README에 실행 방법, CMD 출력 예시, 질문 루프 흐름을 통합.
+- `run-qwen-loop.bat`에 1번 랜덤 질문 루프 / 2번 프로젝트 디렉터리 루프 선택 메뉴를 추가.
+- 프로젝트 디렉터리 루프는 입력한 디렉터리를 로컬 스캔해 `project_scan_summary.md/json`을 만들고, 별도 WorkDir에서 프로젝트 기반 질문으로 시작.
 - 과거 대화 요약/인수인계 문서와 이전 배포 reference artifact는 현재 기준 문서로 흡수 후 제거.
 - 프로젝트 내부 settings를 직접 쓰는 더블클릭 BAT 3개 추가.
 - `context_files.txt` 예시 경로의 백슬래시 오류 보정.
@@ -25,6 +27,7 @@
 - 대기 중 CMD 같은 줄 countdown으로 남은 시간과 다음 호출 예정 시각을 표시.
 - 실제 응답 수신 후 CMD에 답변 본문 preview와 다음 질문, 저장 경로, 사이클 완료 상태를 표시.
 - `run_history.md`/`run_history.jsonl`에 호출 seq, 시작/응답/다음 실행 예정 시각, HTTP 상태를 누적 기록.
+- 프로젝트 모드는 기존 답변을 이어받지 않는 fresh session으로 시작하되, 기존 `qwen-loop-data` 최근 질문은 중복 회피용으로만 참고.
 - 서버가 usage를 반환하면 입력/출력/전체 token 수와 light/balanced/rich 색상 등급을 표시.
 - `qwen-loop-data` 자동정리를 추가해 큰 transcript/error 로그와 오래된 check 산출물을 임계치 기준으로 정리.
 - last_request_headers/body 로그 생성.

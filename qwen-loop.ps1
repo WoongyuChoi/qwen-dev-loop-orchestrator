@@ -6,6 +6,7 @@
     [string]$QuestionBankFile = "$PSScriptRoot\question_bank.txt",
     [string]$QuestionTrack = "",
     [string]$ContextListFile = "$PSScriptRoot\context_files.txt",
+    [string]$ProjectRoot = "",
     [string]$WorkDir = "$PSScriptRoot\qwen-loop-data",
     [int]$IntervalSeconds = 600,
     [int]$MinIntervalMinutes = 8,
@@ -14,6 +15,9 @@
     [double]$Temperature = 0.35,
     [int]$TimeoutSec = 120,
     [int]$MaxContextChars = 30000,
+    [int]$ProjectScanMaxFiles = 60,
+    [int]$ProjectScanMaxFileChars = 2500,
+    [int]$ProjectScanMaxTotalChars = 30000,
     [int]$LastTurnChars = 12000,
     [int]$CountdownRefreshSeconds = 1,
     [int]$AnswerPreviewLines = 4,
@@ -133,6 +137,8 @@ function Test-ProtectedWorkFile([string]$Root, [string]$FileFullName) {
         "transcript.jsonl",
         "run_history.md",
         "run_history.jsonl",
+        "project_scan_summary.md",
+        "project_scan_summary.json",
         "error.log",
         "settings_effective_summary.json",
         "last_request_headers.json",
@@ -1005,6 +1011,328 @@ function Read-ContextBundle([string]$listFile, [int]$maxChars) {
     return ($bundleParts -join "`n")
 }
 
+function Assert-ProjectScanConfig() {
+    if ($ProjectScanMaxFiles -lt 1) { throw "ProjectScanMaxFiles는 1 이상이어야 합니다." }
+    if ($ProjectScanMaxFileChars -lt 200) { throw "ProjectScanMaxFileChars는 200 이상이어야 합니다." }
+    if ($ProjectScanMaxTotalChars -lt 1000) { throw "ProjectScanMaxTotalChars는 1000 이상이어야 합니다." }
+}
+
+function Resolve-ProjectRoot([string]$PathText) {
+    $p = Expand-PathInput $PathText
+    if ([string]::IsNullOrWhiteSpace($p)) { return "" }
+    if (-not [System.IO.Path]::IsPathRooted($p)) { $p = Join-Path $PSScriptRoot $p }
+    if (!(Test-Path -LiteralPath $p -PathType Container)) { throw "ProjectRoot 디렉터리를 찾지 못했습니다: $PathText" }
+    return [System.IO.Path]::GetFullPath($p).TrimEnd([char[]]@('\', '/'))
+}
+
+function Test-ProjectExcludedDirectoryName([string]$Name) {
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
+    $excluded = @(
+        ".git", ".svn", ".hg", ".idea", ".vscode", ".gradle",
+        "node_modules", "dist", "build", "target", "out", "coverage",
+        ".next", ".nuxt", ".cache", ".turbo", "logs", "log",
+        "qwen-loop-data", "bin", "obj", "vendor"
+    )
+    return ($excluded -contains $Name.ToLowerInvariant())
+}
+
+function Test-ProjectIncludedFile([System.IO.FileInfo]$File) {
+    $ext = $File.Extension.ToLowerInvariant()
+    $allowed = @(
+        ".java", ".kt", ".kts", ".xml", ".properties", ".yml", ".yaml",
+        ".gradle", ".json", ".ts", ".tsx", ".js", ".jsx",
+        ".vue", ".sql", ".md", ".graphql", ".gql",
+        ".ps1", ".psm1", ".bat", ".cmd", ".sh"
+    )
+    if ($allowed -notcontains $ext) { return $false }
+    if ($File.Length -gt 1MB) { return $false }
+    if ($File.Name -match '(?i)^\.env($|\.)|^\.npmrc$|^\.pypirc$') { return $false }
+    if ($File.Name -match '(?i)(package-lock|yarn\.lock|pnpm-lock|gradle\.lockfile)$') { return $false }
+    if ($File.Name -match '(?i)(\.min\.js|\.map)$') { return $false }
+    return $true
+}
+
+function Get-ProjectRelativePath([string]$Root, [string]$Path) {
+    $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd([char[]]@('\', '/'))
+    $pathFull = [System.IO.Path]::GetFullPath($Path)
+    if ($pathFull.StartsWith($rootFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $pathFull.Substring($rootFull.Length).TrimStart([char[]]@('\', '/'))
+    }
+    return $Path
+}
+
+function Read-ProjectFilePrefix([string]$Path, [int]$MaxChars) {
+    try {
+        $raw = Read-Utf8File $Path
+        return Get-TextPrefix $raw $MaxChars
+    } catch {
+        try {
+            $raw = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::Default)
+            return Get-TextPrefix $raw $MaxChars
+        } catch {
+            return ""
+        }
+    }
+}
+
+function Add-ProjectScoreReason($Reasons, [string]$Reason) {
+    if (-not [string]::IsNullOrWhiteSpace($Reason) -and -not $Reasons.Contains($Reason)) { $Reasons.Add($Reason) | Out-Null }
+}
+
+function Get-ProjectFileScore([System.IO.FileInfo]$File, [string]$Root, [string]$Content) {
+    $relative = Get-ProjectRelativePath $Root $File.FullName
+    $relLower = $relative.ToLowerInvariant()
+    $nameLower = $File.Name.ToLowerInvariant()
+    $score = 0
+    $reasons = New-Object System.Collections.Generic.List[string]
+
+    if ($nameLower -in @("pom.xml", "build.gradle", "settings.gradle", "package.json", "vite.config.ts", "next.config.js", "tsconfig.json")) {
+        $score += 35; Add-ProjectScoreReason $reasons "project/build entry"
+    }
+    if ($nameLower -match '(run|start|loop|main|check).*\.(ps1|bat|cmd|sh)$') {
+        $score += 35; Add-ProjectScoreReason $reasons "script entry"
+    }
+    if ($nameLower -match 'application\.(yml|yaml|properties)$') {
+        $score += 35; Add-ProjectScoreReason $reasons "runtime config"
+    }
+    if ($nameLower -match '(application|main)\.(java|kt|tsx|ts|jsx|js|ps1)$') {
+        $score += 25; Add-ProjectScoreReason $reasons "entry point"
+    }
+    if ($nameLower -match '(controller|resource)\.(java|kt)$') {
+        $score += 35; Add-ProjectScoreReason $reasons "api boundary"
+    }
+    if ($nameLower -match 'service\.(java|kt)$') {
+        $score += 45; Add-ProjectScoreReason $reasons "service/domain logic"
+    }
+    if ($nameLower -match '(repository|mapper|dao)\.(java|kt|xml)$') {
+        $score += 35; Add-ProjectScoreReason $reasons "db boundary"
+    }
+    if ($nameLower -match '(config|security|filter|interceptor)\.(java|kt|ts|tsx)$') {
+        $score += 25; Add-ProjectScoreReason $reasons "cross-cutting config"
+    }
+    if ($relLower -match '(^|[\\/])(pages|routes|router|app)[\\/]') {
+        $score += 25; Add-ProjectScoreReason $reasons "frontend route/page"
+    }
+    if ($relLower -match '(^|[\\/])(api|services|store|stores|hooks|features)[\\/]') {
+        $score += 22; Add-ProjectScoreReason $reasons "frontend data/state boundary"
+    }
+
+    $contentLower = if ($Content) { $Content.ToLowerInvariant() } else { "" }
+    $keywordRules = @(
+        @("@transactional", 25, "transaction boundary"),
+        @("@requestmapping", 18, "spring route mapping"),
+        @("@getmapping", 18, "spring route mapping"),
+        @("@postmapping", 18, "spring route mapping"),
+        @("useeffect", 12, "react side effect"),
+        @("usestate", 8, "react state"),
+        @("usequery", 15, "frontend server-state query"),
+        @("axios", 12, "http client"),
+        @("fetch(", 12, "http client"),
+        @("createstore", 12, "state store"),
+        @("createslice", 12, "state store"),
+        @("zustand", 12, "state store"),
+        @("try {", 6, "error handling"),
+        @("catch", 6, "error handling"),
+        @("param(", 10, "script parameters"),
+        @("invoke-restmethod", 18, "http client"),
+        @("invoke-webrequest", 18, "http client"),
+        @("powershell.exe", 12, "script launcher")
+    )
+    foreach ($rule in $keywordRules) {
+        if ($contentLower.Contains([string]$rule[0])) {
+            $score += [int]$rule[1]
+            Add-ProjectScoreReason $reasons ([string]$rule[2])
+        }
+    }
+
+    if ($File.Extension.ToLowerInvariant() -in @(".sql", ".xml") -or $relLower -match 'mapper|mybatis') {
+        $sqlRules = @(
+            @("select ", 12, "sql read"),
+            @("insert ", 12, "sql write"),
+            @("update ", 12, "sql write"),
+            @("delete ", 12, "sql delete")
+        )
+        foreach ($rule in $sqlRules) {
+            if ($contentLower.Contains([string]$rule[0])) {
+                $score += [int]$rule[1]
+                Add-ProjectScoreReason $reasons ([string]$rule[2])
+            }
+        }
+    }
+
+    $methodMatches = ([regex]::Matches($Content, '(?m)\b(public|private|protected|async|function|const)\b')).Count
+    if ($methodMatches -ge 8) {
+        $score += 10
+        Add-ProjectScoreReason $reasons "many executable blocks"
+    }
+
+    return [PSCustomObject]@{
+        path = $relative
+        fullName = $File.FullName
+        extension = $File.Extension
+        sizeBytes = [int64]$File.Length
+        score = $score
+        reasons = @($reasons)
+        excerpt = $Content
+    }
+}
+
+function Get-ProjectCandidateFiles([string]$Root) {
+    $result = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+    $queue = New-Object System.Collections.Generic.Queue[System.IO.DirectoryInfo]
+    $queue.Enqueue((Get-Item -LiteralPath $Root))
+    $visitedDirs = 0
+
+    while ($queue.Count -gt 0 -and $visitedDirs -lt 3000 -and $result.Count -lt 2000) {
+        $dir = $queue.Dequeue()
+        $visitedDirs++
+
+        try {
+            foreach ($childDir in @(Get-ChildItem -LiteralPath $dir.FullName -Directory -Force -ErrorAction SilentlyContinue)) {
+                if (-not (Test-ProjectExcludedDirectoryName $childDir.Name)) { $queue.Enqueue($childDir) }
+            }
+            foreach ($file in @(Get-ChildItem -LiteralPath $dir.FullName -File -Force -ErrorAction SilentlyContinue)) {
+                if (Test-ProjectIncludedFile $file) { $result.Add($file) | Out-Null }
+            }
+        } catch { }
+    }
+
+    return @($result)
+}
+
+function Get-DetectedProjectStack($Files) {
+    $paths = (($Files | ForEach-Object { $_.FullName.ToLowerInvariant() }) -join "`n")
+    $stack = New-Object System.Collections.Generic.List[string]
+
+    if ($paths -match 'pom\.xml|build\.gradle|\.java|\.kt') { $stack.Add("Java/Spring") | Out-Null }
+    if ($paths -match 'package\.json|\.tsx|\.jsx|vite\.config|next\.config') { $stack.Add("React/TypeScript") | Out-Null }
+    if ($paths -match 'mapper|mybatis|\.sql') { $stack.Add("DB/MyBatis/SQL") | Out-Null }
+    if ($paths -match 'security|auth|jwt|oauth') { $stack.Add("Security/Auth") | Out-Null }
+    if ($paths -match '\.ps1|\.bat|\.cmd|\.sh') { $stack.Add("Script/Automation") | Out-Null }
+    if ($stack.Count -eq 0) { $stack.Add("generic codebase") | Out-Null }
+    return @($stack)
+}
+
+function New-ProjectScanContext([string]$Root) {
+    if ([string]::IsNullOrWhiteSpace($Root)) { return $null }
+
+    Assert-ProjectScanConfig
+    $resolvedRoot = Resolve-ProjectRoot $Root
+    $files = @(Get-ProjectCandidateFiles $resolvedRoot)
+    $scored = New-Object System.Collections.Generic.List[object]
+
+    foreach ($file in $files) {
+        $content = Read-ProjectFilePrefix $file.FullName ([Math]::Max($ProjectScanMaxFileChars, 4000))
+        $scoreItem = Get-ProjectFileScore $file $resolvedRoot $content
+        if ($scoreItem.score -gt 0) { $scored.Add($scoreItem) | Out-Null }
+    }
+
+    $selected = @($scored | Sort-Object @{ Expression = "score"; Descending = $true }, @{ Expression = "sizeBytes"; Descending = $true } | Select-Object -First $ProjectScanMaxFiles)
+    $stack = @(Get-DetectedProjectStack $files)
+
+    $contextParts = New-Object System.Collections.Generic.List[string]
+    $contextParts.Add("Project root: $resolvedRoot") | Out-Null
+    $contextParts.Add("Detected stack: $($stack -join ', ')") | Out-Null
+    $contextParts.Add("Scanned text files: $($files.Count); selected key files: $($selected.Count)") | Out-Null
+    $contextParts.Add("") | Out-Null
+    $contextParts.Add("Top key files:") | Out-Null
+
+    foreach ($item in @($selected | Select-Object -First 25)) {
+        $reasonText = if ($item.reasons.Count -gt 0) { $item.reasons -join ", " } else { "signal score" }
+        $contextParts.Add("- [$($item.score)] $($item.path) :: $reasonText") | Out-Null
+    }
+
+    $contextParts.Add("") | Out-Null
+    $contextParts.Add("Selected excerpts:") | Out-Null
+    $usedChars = ($contextParts -join "`n").Length
+    foreach ($item in $selected) {
+        $excerpt = Get-TextPrefix ([string]$item.excerpt) $ProjectScanMaxFileChars
+        if ([string]::IsNullOrWhiteSpace($excerpt)) { continue }
+        $block = @"
+
+### $($item.path)
+score=$($item.score); reasons=$($item.reasons -join ", ")
+~~~text
+$excerpt
+~~~
+"@
+        if (($usedChars + $block.Length) -gt $ProjectScanMaxTotalChars) { break }
+        $contextParts.Add($block) | Out-Null
+        $usedChars += $block.Length
+    }
+
+    $promptContext = Get-TextPrefix (($contextParts -join "`n") + "`n") $ProjectScanMaxTotalChars
+
+    $seedQuestion = "아래 프로젝트 스캔 결과의 핵심 파일과 코드 조각을 바탕으로, 실제 업무 흐름에 영향을 주는 로직 하나를 골라 구조, 동작 방식, 실패 가능성, 다음에 확인해야 할 파일을 구체적으로 분석해줘."
+    if ($selected.Count -gt 0) {
+        $topNames = (($selected | Select-Object -First 5 | ForEach-Object { $_.path }) -join ", ")
+        $seedQuestion = "프로젝트 핵심 후보 파일($topNames)을 바탕으로, 실제 업무 흐름에 영향을 주는 로직 하나를 골라 구조, 동작 방식, 실패 가능성, 다음에 확인해야 할 파일을 구체적으로 분석해줘."
+    }
+
+    return [PSCustomObject]@{
+        root = $resolvedRoot
+        generatedAt = (Get-Date).ToString("o")
+        scannedFileCount = $files.Count
+        selectedFileCount = $selected.Count
+        detectedStack = $stack
+        selectedFiles = @($selected | ForEach-Object {
+            [ordered]@{
+                path = $_.path
+                extension = $_.extension
+                sizeBytes = $_.sizeBytes
+                score = $_.score
+                reasons = $_.reasons
+                excerptChars = ([string]$_.excerpt).Length
+            }
+        })
+        promptContext = $promptContext
+        seedQuestion = $seedQuestion
+    }
+}
+
+function Write-ProjectScanFiles($Scan, [string]$WorkDirPath) {
+    if ($null -eq $Scan) { return }
+
+    $mdPath = Join-Path $WorkDirPath "project_scan_summary.md"
+    $jsonPath = Join-Path $WorkDirPath "project_scan_summary.json"
+
+    $fileRows = @()
+    foreach ($file in @($Scan.selectedFiles | Select-Object -First 40)) {
+        $reasonText = if ($file.reasons) { ($file.reasons -join ", ") } else { "" }
+        $fileRows += "| $($file.score) | $($file.path) | $reasonText | $(Format-ByteSize ([int64]$file.sizeBytes)) |"
+    }
+    if ($fileRows.Count -eq 0) { $fileRows = @("|  | no key files selected |  |  |") }
+
+    $md = @"
+# Project Scan Summary
+
+- Root: $($Scan.root)
+- Generated: $($Scan.generatedAt)
+- Detected stack: $($Scan.detectedStack -join ", ")
+- Scanned files: $($Scan.scannedFileCount)
+- Selected key files: $($Scan.selectedFileCount)
+
+## Key File Candidates
+
+| Score | Path | Reasons | Size |
+|---:|---|---|---:|
+$($fileRows -join "`n")
+
+## Initial Project Question
+
+$($Scan.seedQuestion)
+
+## Prompt Context Preview
+
+~~~text
+$(Get-TextPrefix $Scan.promptContext 12000)
+~~~
+"@
+
+    Write-Utf8File $mdPath $md
+    Write-Utf8File $jsonPath ($Scan | ConvertTo-Json -Depth 50)
+}
+
 function Extract-NextQuestion([string]$content) {
     $lines = $content -split "`r?`n" | ForEach-Object { Remove-BomAndTrim $_ } | Where-Object { $_ -ne "" }
     foreach ($line in $lines) {
@@ -1173,6 +1501,61 @@ function Get-RecentQuestionHistory([string]$jsonlPath, [int]$maxItems) {
                     $items.Add($candidate.Trim())
                     if ($items.Count -ge $maxItems) { break }
                 }
+            }
+        } catch { }
+    }
+
+    if ($items.Count -eq 0) { return "" }
+    return (($items | ForEach-Object { "- $_" }) -join "`n")
+}
+
+function Get-LoopDataHistoryRoot([string]$workDirPath) {
+    $scriptLoopData = Join-Path $PSScriptRoot "qwen-loop-data"
+    if (Test-Path -LiteralPath $scriptLoopData -PathType Container) {
+        return (Resolve-Path -LiteralPath $scriptLoopData | Select-Object -First 1).Path
+    }
+    if (Test-Path -LiteralPath $workDirPath -PathType Container) {
+        return (Resolve-Path -LiteralPath $workDirPath | Select-Object -First 1).Path
+    }
+    return ""
+}
+
+function Get-RecentQuestionHistoryFromTree([string]$rootDir, [string]$excludeJsonlPath, [int]$maxItems) {
+    if ([string]::IsNullOrWhiteSpace($rootDir) -or !(Test-Path -LiteralPath $rootDir -PathType Container)) { return "" }
+
+    $excludeFull = ""
+    try {
+        if (Test-Path -LiteralPath $excludeJsonlPath -PathType Leaf) {
+            $excludeFull = (Resolve-Path -LiteralPath $excludeJsonlPath | Select-Object -First 1).Path
+        }
+    } catch { }
+
+    $seen = @{}
+    $items = New-Object System.Collections.Generic.List[string]
+    $files = @(Get-ChildItem -LiteralPath $rootDir -Recurse -File -Filter "transcript.jsonl" -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 40)
+
+    foreach ($file in $files) {
+        if ($items.Count -ge $maxItems) { break }
+        if (-not [string]::IsNullOrWhiteSpace($excludeFull) -and $file.FullName.Equals($excludeFull, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+
+        try {
+            $lines = @(Get-Content -LiteralPath $file.FullName -Encoding UTF8 | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            for ($i = $lines.Count - 1; $i -ge 0 -and $items.Count -lt $maxItems; $i--) {
+                try {
+                    $record = $lines[$i] | ConvertFrom-Json
+                    foreach ($name in @("nextQuestion", "question")) {
+                        $candidate = [string](Get-JsonProperty $record $name)
+                        if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+                        $key = $candidate.Trim().ToLowerInvariant()
+                        if (-not $seen.ContainsKey($key)) {
+                            $seen[$key] = $true
+                            $items.Add($candidate.Trim())
+                            if ($items.Count -ge $maxItems) { break }
+                        }
+                    }
+                } catch { }
             }
         } catch { }
     }
@@ -1842,7 +2225,21 @@ $runHistoryPath = Join-Path $WorkDir "run_history.md"
 $runHistoryJsonlPath = Join-Path $WorkDir "run_history.jsonl"
 $errorLogPath = Join-Path $WorkDir "error.log"
 
-$initialQuestion = Initialize-NextQuestion $nextQuestionPath $jsonlPath $transcriptPath $lastTurnPath $SeedFile $QuestionBankFile $QuestionTrack
+$projectScan = $null
+$projectContext = ""
+if (-not [string]::IsNullOrWhiteSpace($ProjectRoot)) {
+    $projectScan = New-ProjectScanContext $ProjectRoot
+    Write-ProjectScanFiles $projectScan $WorkDir
+    Write-Utf8File $nextQuestionPath $projectScan.seedQuestion
+    $projectContext = $projectScan.promptContext
+    $initialQuestion = [PSCustomObject]@{
+        Question = $projectScan.seedQuestion
+        Source = "project-scan"
+        SeedSource = (Join-Path $WorkDir "project_scan_summary.md")
+    }
+} else {
+    $initialQuestion = Initialize-NextQuestion $nextQuestionPath $jsonlPath $transcriptPath $lastTurnPath $SeedFile $QuestionBankFile $QuestionTrack
+}
 $seedQuestion = $initialQuestion.Question
 $startupCleanup = Invoke-WorkDirCleanup $WorkDir $transcriptPath $jsonlPath $errorLogPath
 
@@ -1876,6 +2273,10 @@ Write-Host "Retry        : max $MaxRetries, backoff $RetryInitialDelaySeconds-$R
 Write-Host "TokenUse     : light < $TokenLowThreshold, rich >= $TokenRichThreshold output tokens"
 Write-Host "HeaderLog    : $(if ($MaskSensitiveLogs -and -not $LogSensitive) { 'masked' } else { 'unmasked' })"
 Write-Host "QuestionSrc  : $($initialQuestion.Source)"
+if ($projectScan) {
+    Write-Host "ProjectRoot  : $($projectScan.root)"
+    Write-Host "ProjectScan  : $($projectScan.scannedFileCount) files scanned, $($projectScan.selectedFileCount) key files selected"
+}
 $answerPreviewText = if ($NoAnswerPreview) { "disabled" } else { "$AnswerPreviewLines lines / $AnswerPreviewChars chars" }
 Write-Host "AnswerPreview: $answerPreviewText"
 Write-Host "AutoCleanup  : $(Get-CleanupPolicyText)"
@@ -1959,6 +2360,20 @@ $settingsSummary = [ordered]@{
     initialQuestionSource = $initialQuestion.Source
     initialQuestionSeedSource = $initialQuestion.SeedSource
     questionTrack = $QuestionTrack
+    projectScan = if ($projectScan) {
+        [ordered]@{
+            root = $projectScan.root
+            generatedAt = $projectScan.generatedAt
+            scannedFileCount = $projectScan.scannedFileCount
+            selectedFileCount = $projectScan.selectedFileCount
+            detectedStack = $projectScan.detectedStack
+            maxFiles = $ProjectScanMaxFiles
+            maxFileChars = $ProjectScanMaxFileChars
+            maxTotalChars = $ProjectScanMaxTotalChars
+            summaryMarkdown = (Join-Path $WorkDir "project_scan_summary.md")
+            summaryJson = (Join-Path $WorkDir "project_scan_summary.json")
+        }
+    } else { $null }
     loopDiagnosticHeaders = [bool]$LoopDiagnosticHeaders
     endpointFallbacks = [bool]$EndpointFallbacks
     endpoints = @(Get-EndpointCandidates $providerInfo.BaseUrl)
@@ -1978,13 +2393,16 @@ $settingsSummary = [ordered]@{
 Write-Utf8File (Join-Path $WorkDir "settings_effective_summary.json") ($settingsSummary | ConvertTo-Json -Depth 50)
 
 if ($DryRun) {
-    $dryRunPrompt = @"
-현재 루프 질문:
-$seedQuestion
-
-요청:
-DryRun preview. 이 파일은 API 호출 없이 실제 전송 예정 header/body 형태를 확인하기 위한 샘플입니다.
-"@
+    $dryRunPromptParts = New-Object System.Collections.Generic.List[string]
+    $dryRunPromptParts.Add("현재 루프 질문:`n$seedQuestion") | Out-Null
+    if ($projectScan) {
+        $dryRunQuestionHistory = Get-RecentQuestionHistoryFromTree (Get-LoopDataHistoryRoot $WorkDir) $jsonlPath 12
+        if ([string]::IsNullOrWhiteSpace($dryRunQuestionHistory)) { $dryRunQuestionHistory = "(none)" }
+        $dryRunPromptParts.Add("기존 qwen-loop-data 최근 질문(중복 회피용):`n$dryRunQuestionHistory") | Out-Null
+        $dryRunPromptParts.Add("프로젝트 스캔 컨텍스트:`n$projectContext") | Out-Null
+    }
+    $dryRunPromptParts.Add("요청:`nDryRun preview. 이 파일은 API 호출 없이 실제 전송 예정 header/body 형태를 확인하기 위한 샘플입니다.") | Out-Null
+    $dryRunPrompt = ($dryRunPromptParts -join "`n`n")
     $dryRunHeaders = Build-ClientHeaders $providerInfo $settings $networkIdentity
     $dryRunBody = Build-RequestBody $settings $providerInfo $systemPrompt $dryRunPrompt $networkIdentity
     Write-Utf8File (Join-Path $WorkDir "dry_run_request_headers.json") ((Get-LoggedHeaders $dryRunHeaders) | ConvertTo-Json -Depth 30)
@@ -2026,6 +2444,17 @@ while ($true) {
         $lastTurn = ""
         if (Test-Path -LiteralPath $lastTurnPath) { $lastTurn = Get-TextPrefix ((Read-Utf8File $lastTurnPath).Trim()) $LastTurnChars }
         $questionHistory = Get-RecentQuestionHistory $jsonlPath 8
+        if ($projectScan) {
+            $globalQuestionHistory = Get-RecentQuestionHistoryFromTree (Get-LoopDataHistoryRoot $WorkDir) $jsonlPath 12
+            if (-not [string]::IsNullOrWhiteSpace($globalQuestionHistory)) {
+                if (-not [string]::IsNullOrWhiteSpace($questionHistory)) { $questionHistory += "`n" }
+                $questionHistory += "기존 qwen-loop-data 최근 질문(중복 회피용):`n$globalQuestionHistory"
+            }
+        }
+        $projectPromptSection = ""
+        if ($projectScan) {
+            $projectPromptSection = "프로젝트 스캔 컨텍스트:`n$projectContext`n"
+        }
 
         $userPrompt = @"
 현재 루프 질문:
@@ -2039,6 +2468,8 @@ $questionHistory
 
 공통 컨텍스트:
 $contextBundle
+
+$projectPromptSection
 
 요청:
 위 질문에 답변해줘.

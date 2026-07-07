@@ -17,7 +17,7 @@
 
 - `qwen-loop.ps1`: 메인 루프 실행 로직
 - `check-qwen-loop.bat`: 실제 호출 없이 사용자/프로젝트 settings를 순차 DryRun하는 권장 체크 진입점
-- `run-qwen-loop.bat`: 실제 사용자 설정 기준 메인 루프 실행 진입점
+- `run-qwen-loop.bat`: 실제 사용자 설정 기준 메인 루프 실행 진입점. 1번은 기존 랜덤 질문 루프, 2번은 프로젝트 디렉터리 스캔 기반 새 세션
 - `settings.json`: 스크린샷 기반으로 재구성한 Qwen Code 설정 파일
 - `.qwen/settings.json`: 실제 사용자 경로 구조를 프로젝트 내부에 미러링한 파일
 - `seed_prompt.txt`: question bank가 비었을 때 사용하는 단일 fallback 질문
@@ -32,6 +32,9 @@
 ## 테스트 체크리스트
 
 - `check-qwen-loop.bat` 더블클릭 시 사용자/프로젝트 settings DryRun이 순차적으로 정상 실행되는지 확인한다.
+- `run-qwen-loop.bat` 더블클릭 시 1번/2번 모드 선택 메뉴가 표시되고, 2번에서 입력한 ProjectRoot가 별도 `qwen-loop-data/project/<name>-<timestamp>` WorkDir로 실행되는지 확인한다.
+- 프로젝트 디렉터리 모드에서 `project_scan_summary.md`와 `project_scan_summary.json`이 생성되고, `settings_effective_summary.json.projectScan`에 root/scanned/selected/stack 정보가 들어가는지 확인한다.
+- 프로젝트 디렉터리 모드는 이전 답변을 이어받지 않는 fresh session이지만, 기존 `qwen-loop-data` 최근 질문은 중복 회피용 히스토리로 prompt에 포함되는지 확인한다.
 - `02_RUN_ONCE_TEST_DOUBLECLICK.bat` 또는 `07_RUN_ONCE_PROJECT_SETTINGS_DOUBLECLICK.bat` 더블클릭 시 `NEXT_QUESTION` 한글이 깨지지 않는지 확인한다.
 - `qwen-loop-data/last_request_headers.json`과 `last_request_body.json`에 settings 기반 정보가 반영되는지 확인한다.
 - `qwen-loop-data/run_history.md`에서 호출 seq, started/request/response, HTTP, next run 시각이 누적되는지 확인한다.
