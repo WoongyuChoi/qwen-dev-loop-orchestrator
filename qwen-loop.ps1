@@ -1451,6 +1451,13 @@ function Get-RecoveryQuestionFromLastTurn([string]$path) {
     return "아래 직전 루프 요약을 바탕으로, 이미 다룬 내용을 반복하지 말고 같은 기술 트랙 안에서 아직 검증되지 않은 핵심 가정 하나를 더 좁고 깊게 분석해줘.`n`n$lastTurn"
 }
 
+function Test-SameQuestionText([string]$Left, [string]$Right) {
+    $l = ([string]$Left).Trim() -replace '\s+', ' '
+    $r = ([string]$Right).Trim() -replace '\s+', ' '
+    if ([string]::IsNullOrWhiteSpace($l) -or [string]::IsNullOrWhiteSpace($r)) { return $false }
+    return $l.Equals($r, [System.StringComparison]::Ordinal)
+}
+
 function Initialize-NextQuestion([string]$nextPath, [string]$jsonlPath, [string]$transcriptPath, [string]$lastTurnPath, [string]$seedFile, [string]$questionBankFile, [string]$trackFilter) {
     if (Test-Path -LiteralPath $nextPath -PathType Leaf) {
         $existing = (Read-Utf8File $nextPath).Trim()
@@ -2263,12 +2270,52 @@ $projectContext = ""
 if (-not [string]::IsNullOrWhiteSpace($ProjectRoot)) {
     $projectScan = New-ProjectScanContext $ProjectRoot
     Write-ProjectScanFiles $projectScan $WorkDir
-    Write-Utf8File $nextQuestionPath $projectScan.seedQuestion
     $projectContext = $projectScan.promptContext
-    $initialQuestion = [PSCustomObject]@{
-        Question = $projectScan.seedQuestion
-        Source = "project-scan"
-        SeedSource = (Join-Path $WorkDir "project_scan_summary.md")
+
+    $existingProjectQuestion = ""
+    if (Test-Path -LiteralPath $nextQuestionPath -PathType Leaf) {
+        $existingProjectQuestion = (Read-Utf8File $nextQuestionPath).Trim()
+    }
+
+    $hasUsableProjectQuestion = (-not [string]::IsNullOrWhiteSpace($existingProjectQuestion)) -and (-not (Test-SameQuestionText $existingProjectQuestion $projectScan.seedQuestion))
+
+    if ($hasUsableProjectQuestion) {
+        $initialQuestion = [PSCustomObject]@{
+            Question = $existingProjectQuestion
+            Source = "project-next_question.txt"
+            SeedSource = $nextQuestionPath
+        }
+    } else {
+        $candidate = Get-LastJsonlNextQuestion $jsonlPath
+        if (-not [string]::IsNullOrWhiteSpace($candidate) -and -not (Test-SameQuestionText $candidate $projectScan.seedQuestion)) {
+            Write-Utf8File $nextQuestionPath $candidate
+            $initialQuestion = [PSCustomObject]@{ Question = $candidate; Source = "project-transcript.jsonl"; SeedSource = $jsonlPath }
+        }
+    }
+
+    if ($null -eq $initialQuestion) {
+        $candidate = Get-LastTranscriptNextQuestion $transcriptPath
+        if (-not [string]::IsNullOrWhiteSpace($candidate) -and -not (Test-SameQuestionText $candidate $projectScan.seedQuestion)) {
+            Write-Utf8File $nextQuestionPath $candidate
+            $initialQuestion = [PSCustomObject]@{ Question = $candidate; Source = "project-transcript.md"; SeedSource = $transcriptPath }
+        }
+    }
+
+    if ($null -eq $initialQuestion) {
+        $candidate = Get-RecoveryQuestionFromLastTurn $lastTurnPath
+        if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+            Write-Utf8File $nextQuestionPath $candidate
+            $initialQuestion = [PSCustomObject]@{ Question = $candidate; Source = "project-last_turn.txt"; SeedSource = $lastTurnPath }
+        }
+    }
+
+    if ($null -eq $initialQuestion) {
+        Write-Utf8File $nextQuestionPath $projectScan.seedQuestion
+        $initialQuestion = [PSCustomObject]@{
+            Question = $projectScan.seedQuestion
+            Source = "project-scan"
+            SeedSource = (Join-Path $WorkDir "project_scan_summary.md")
+        }
     }
 } else {
     $initialQuestion = Initialize-NextQuestion $nextQuestionPath $jsonlPath $transcriptPath $lastTurnPath $SeedFile $QuestionBankFile $QuestionTrack
