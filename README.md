@@ -191,7 +191,9 @@ run_history.md
 run_history.jsonl
 ```
 
-Project mode reuses the same project work folder so logs do not create git changes in the scanned target project. The double-click launcher passes `-FreshProjectQuestion`, so each new option-2 startup ignores the saved `next_question.txt` for the first request, builds diversity groups from the scanned project's real directory structure and file roles, samples a primary group first, then chooses a representative file inside that group. Support candidates are also drawn across groups where possible, so large high-score folders such as `src/api` cannot monopolize every first question. Markdown docs, root-level build/config files such as `package.json`, `tsconfig.json`, and `vite.config.ts`, public assets, launcher scripts, and test files can remain in the scan context or support candidates, but they are skipped as primary question targets when domain/code candidates exist. The first project question is domain-flow oriented: it asks for the business/user scenario, normal data/state flow, connected files to inspect next, and only then exception/performance/security risk checks. The prompt context puts the primary target and support excerpts first, writes a new first question that must stay centered on the primary target, and omits the previous `last_turn.txt` from that first prompt to avoid drifting back into yesterday's topic. After that first request, the running loop still follows the model's saved `NEXT_QUESTION` normally.
+Project mode reuses the same project work folder so logs do not create git changes in the scanned target project. The double-click launcher passes `-FreshProjectQuestion`, so each new option-2 startup ignores the saved `next_question.txt` for the first request, builds diversity groups from the scanned project's real directory structure and file roles, samples a primary group first, then chooses a representative file inside that group. Support candidates are also drawn across groups where possible, so large high-score folders such as `src/api` cannot monopolize every first question. Markdown docs can remain in the scan context but are skipped as question targets, while root-level build/config files such as `package.json`, `tsconfig.json`, and `vite.config.ts`, public assets, launcher scripts, and test files can remain in the scan context or support candidates but are skipped as primary question targets when domain/code candidates exist. The first project question is domain-flow oriented: it asks for the business/user scenario, normal data/state flow, connected files to inspect next, and only then exception/performance/security risk checks. The prompt context puts the primary target and support excerpts first, writes a new first question that must stay centered on the primary target, and omits the previous `last_turn.txt` from that first prompt to avoid drifting back into yesterday's topic. After that first request, the running loop still follows the model's saved `NEXT_QUESTION` normally.
+
+`run-qwen-loop.bat` asks for the wait interval before starting the selected loop. Choose random to keep the default 8-15 minute wait after each response, or choose fixed minutes to wait a specific number of minutes after each response. A fixed value of `0` means the next request starts immediately after the previous response has been handled.
 
 For every project-mode turn, the script also builds a best-effort dynamic context from the current question. It extracts file/class/method/config/SQL-like terms, searches the scanned project for matching files, and prepends found excerpts before the base scan context. Matched files are excerpted around relevant line windows instead of always sending only the file prefix. The script also reads the directly matched files to derive linked expansion terms from imports, XML `id`/`refid`, class references, and method calls, then includes matching connected files such as services, mappers, SQL/XML, utilities, DTOs, or stores when they exist. Missing files are skipped rather than treated as errors, and the last lookup summary is saved to `last_dynamic_project_context.json`.
 
@@ -357,6 +359,7 @@ Common options:
 -QuestionTrack <name>           Pick seeds from a specific question_bank track
 -MinIntervalMinutes <n>         Random wait minimum
 -MaxIntervalMinutes <n>         Random wait maximum
+-IntervalSeconds <n>            Fixed wait in seconds; 0 runs again immediately after each response
 -MaxRetries <n>                 Retry count for retryable failures
 -CompatBody                     Use a stricter standard OpenAI body
 -EndpointFallbacks              Try endpoint fallback candidates
@@ -372,7 +375,7 @@ Common options:
 - Request/response logs are saved locally for debugging. By default, header/body logs are not masked because this tool is meant for internal API inspection. Use `-MaskSensitiveLogs` if you need safer saved logs.
 - Project scan mode excludes common secret files, but you should still review `project_scan_summary.md` before sharing logs.
 - `settings.json` should not contain real public credentials.
-- This tool automates repeated API calls. Keep the default 8-15 minute randomized interval, or choose a responsible interval for your server.
+- This tool automates repeated API calls. Keep the default 8-15 minute randomized interval, or choose a responsible fixed interval for your server. A 0-minute fixed interval is supported for local stress/continuation checks, but it will immediately send the next request after each response completes.
 
 ## Troubleshooting
 

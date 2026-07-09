@@ -754,13 +754,13 @@ function Get-IntervalPlan() {
     $randomIntervalWasExplicit = $ScriptBoundParameterNames.ContainsKey("MinIntervalMinutes") -or $ScriptBoundParameterNames.ContainsKey("MaxIntervalMinutes")
 
     if ($fixedIntervalWasExplicit -and -not $randomIntervalWasExplicit) {
-        if ($IntervalSeconds -le 0) { throw "IntervalSeconds는 1 이상이어야 합니다." }
+        if ($IntervalSeconds -lt 0) { throw "IntervalSeconds는 0 이상이어야 합니다." }
         return [PSCustomObject]@{
             Mode = "fixed"
             FixedSeconds = [int]$IntervalSeconds
             MinSeconds = [int]$IntervalSeconds
             MaxSeconds = [int]$IntervalSeconds
-            Note = "Legacy fixed interval mode because -IntervalSeconds was explicitly provided without random min/max."
+            Note = "Fixed interval mode because -IntervalSeconds was explicitly provided without random min/max. 0 means run again immediately after the previous response is handled."
         }
     }
 
