@@ -1245,6 +1245,25 @@ function Test-ProjectQuestionSeedCandidate($Item) {
     return ($role -ne "docs")
 }
 
+function Test-ProjectPrimaryQuestionSeedCandidate($Item) {
+    if (-not (Test-ProjectQuestionSeedCandidate $Item)) { return $false }
+
+    $role = [string]$Item.questionGroupRole
+    if ([string]::IsNullOrWhiteSpace($role)) {
+        $group = Get-ProjectQuestionGroup $Item
+        $role = [string]$group.role
+    }
+
+    $anchorPath = [string]$Item.questionGroupAnchorPath
+    if ([string]::IsNullOrWhiteSpace($anchorPath)) {
+        $group = Get-ProjectQuestionGroup $Item
+        $anchorPath = [string]$group.anchorPath
+    }
+
+    if ($anchorPath -eq "public") { return $false }
+    return ($role -notin @("entry-build", "config-security", "config-data", "docs", "script-launcher", "test"))
+}
+
 function Get-ProjectQuestionGroup($Item) {
     $path = [string]$Item.path
     $normalized = (($path -replace '\\', '/') -replace '/+', '/').Trim("/")
@@ -1963,20 +1982,29 @@ $excerpt
     }
 }
 
-function Select-ProjectQuestionCandidates($Files, [int]$Count, [int]$PoolSize) {
-    $rawItems = @($Files | Where-Object { $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.path) })
-    $items = @($rawItems | Where-Object { Test-ProjectQuestionSeedCandidate $_ })
-    if ($items.Count -eq 0) { $items = $rawItems }
+function Select-ProjectQuestionCandidateSet($Items, [int]$Count, [int]$PoolSize, $ExistingPaths) {
+    $items = @($Items | Where-Object { $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.path) })
     if ($items.Count -eq 0 -or $Count -lt 1) { return @() }
+    if ($null -eq $ExistingPaths) { $ExistingPaths = @{} }
 
     $ranked = @($items | Sort-Object @{ Expression = "score"; Descending = $true }, @{ Expression = "sizeBytes"; Descending = $true }, @{ Expression = "path"; Descending = $false })
     $groups = @(Get-ProjectQuestionGroups $ranked)
-    if ($groups.Count -eq 0) { return @($ranked | Select-Object -First $Count) }
+    if ($groups.Count -eq 0) {
+        $fallback = New-Object System.Collections.Generic.List[object]
+        foreach ($file in $ranked) {
+            if ($fallback.Count -ge $Count) { break }
+            $path = [string]$file.path
+            if (-not $ExistingPaths.ContainsKey($path)) {
+                $fallback.Add($file) | Out-Null
+                $ExistingPaths[$path] = $true
+            }
+        }
+        return @($fallback.ToArray())
+    }
 
     $remainingGroups = New-Object System.Collections.Generic.List[object]
     foreach ($group in $groups) { $remainingGroups.Add($group) | Out-Null }
     $selected = New-Object System.Collections.Generic.List[object]
-    $selectedPaths = @{}
 
     while ($selected.Count -lt $Count -and $remainingGroups.Count -gt 0) {
         $totalWeight = 0
@@ -1989,11 +2017,11 @@ function Select-ProjectQuestionCandidates($Files, [int]$Count, [int]$PoolSize) {
             $cursor += [Math]::Max(1, [int]$group.groupWeight)
             if ($roll -le $cursor) {
                 $filePoolSize = [Math]::Max(3, [Math]::Min([Math]::Max($PoolSize, $Count), 12))
-                $filePool = @($group.files | Where-Object { -not $selectedPaths.ContainsKey([string]$_.path) } | Select-Object -First $filePoolSize)
+                $filePool = @($group.files | Where-Object { -not $ExistingPaths.ContainsKey([string]$_.path) } | Select-Object -First $filePoolSize)
                 $file = Select-WeightedProjectFile $filePool
                 if ($file) {
                     $selected.Add($file) | Out-Null
-                    $selectedPaths[[string]$file.path] = $true
+                    $ExistingPaths[[string]$file.path] = $true
                 }
                 $remainingGroups.RemoveAt($i)
                 break
@@ -2003,10 +2031,34 @@ function Select-ProjectQuestionCandidates($Files, [int]$Count, [int]$PoolSize) {
 
     foreach ($file in $ranked) {
         if ($selected.Count -ge $Count) { break }
-        if (-not $selectedPaths.ContainsKey([string]$file.path)) {
+        if (-not $ExistingPaths.ContainsKey([string]$file.path)) {
             $selected.Add($file) | Out-Null
-            $selectedPaths[[string]$file.path] = $true
+            $ExistingPaths[[string]$file.path] = $true
         }
+    }
+
+    return @($selected.ToArray())
+}
+
+function Select-ProjectQuestionCandidates($Files, [int]$Count, [int]$PoolSize) {
+    $rawItems = @($Files | Where-Object { $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.path) })
+    $items = @($rawItems | Where-Object { Test-ProjectQuestionSeedCandidate $_ })
+    if ($items.Count -eq 0) { $items = $rawItems }
+    if ($items.Count -eq 0 -or $Count -lt 1) { return @() }
+
+    $selectedPaths = @{}
+    $selected = New-Object System.Collections.Generic.List[object]
+
+    $primaryItems = @($items | Where-Object { Test-ProjectPrimaryQuestionSeedCandidate $_ })
+    if ($primaryItems.Count -eq 0) { $primaryItems = $items }
+
+    $primary = @(Select-ProjectQuestionCandidateSet $primaryItems 1 $PoolSize $selectedPaths)
+    foreach ($file in $primary) { $selected.Add($file) | Out-Null }
+
+    $remainingCount = $Count - $selected.Count
+    if ($remainingCount -gt 0) {
+        $support = @(Select-ProjectQuestionCandidateSet $items $remainingCount $PoolSize $selectedPaths)
+        foreach ($file in $support) { $selected.Add($file) | Out-Null }
     }
 
     return @($selected.ToArray())
@@ -2163,6 +2215,8 @@ $excerpt
                 reasons = $_.reasons
                 questionGroupKey = $_.questionGroupKey
                 questionGroupLabel = $_.questionGroupLabel
+                questionGroupRole = $_.questionGroupRole
+                questionGroupAnchorPath = $_.questionGroupAnchorPath
                 excerptChars = ([string]$_.excerpt).Length
             }
         })
@@ -2174,6 +2228,8 @@ $excerpt
                 reasons = $_.reasons
                 questionGroupKey = $_.questionGroupKey
                 questionGroupLabel = $_.questionGroupLabel
+                questionGroupRole = $_.questionGroupRole
+                questionGroupAnchorPath = $_.questionGroupAnchorPath
             }
         })
         promptContext = $promptContext
