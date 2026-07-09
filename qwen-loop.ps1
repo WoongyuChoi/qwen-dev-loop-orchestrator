@@ -19,6 +19,9 @@
     [int]$ProjectScanMaxFiles = 60,
     [int]$ProjectScanMaxFileChars = 2500,
     [int]$ProjectScanMaxTotalChars = 30000,
+    [int]$DynamicProjectContextMaxFiles = 8,
+    [int]$DynamicProjectContextMaxFileChars = 2500,
+    [int]$DynamicProjectContextMaxTotalChars = 18000,
     [int]$LastTurnChars = 12000,
     [int]$CountdownRefreshSeconds = 1,
     [int]$AnswerPreviewLines = 4,
@@ -1017,6 +1020,9 @@ function Assert-ProjectScanConfig() {
     if ($ProjectScanMaxFiles -lt 1) { throw "ProjectScanMaxFiles는 1 이상이어야 합니다." }
     if ($ProjectScanMaxFileChars -lt 200) { throw "ProjectScanMaxFileChars는 200 이상이어야 합니다." }
     if ($ProjectScanMaxTotalChars -lt 1000) { throw "ProjectScanMaxTotalChars는 1000 이상이어야 합니다." }
+    if ($DynamicProjectContextMaxFiles -lt 0) { throw "DynamicProjectContextMaxFiles는 0 이상이어야 합니다." }
+    if ($DynamicProjectContextMaxFileChars -lt 200) { throw "DynamicProjectContextMaxFileChars는 200 이상이어야 합니다." }
+    if ($DynamicProjectContextMaxTotalChars -lt 1000) { throw "DynamicProjectContextMaxTotalChars는 1000 이상이어야 합니다." }
 }
 
 function Resolve-ProjectRoot([string]$PathText) {
@@ -1213,6 +1219,240 @@ function Get-DetectedProjectStack($Files) {
     if ($paths -match '\.ps1|\.bat|\.cmd|\.sh') { $stack.Add("Script/Automation") | Out-Null }
     if ($stack.Count -eq 0) { $stack.Add("generic codebase") | Out-Null }
     return @($stack)
+}
+
+function Test-DynamicProjectNoiseTerm([string]$Value) {
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $true }
+    $v = $Value.Trim()
+    if ($v.Length -lt 3 -or $v.Length -gt 100) { return $true }
+    if ($v -match '(?i)^(http|https|www|com|org|net)$') { return $true }
+
+    $noise = @(
+        "SQL", "DB", "HTTP", "HTTPS", "JSON", "XML", "API", "URI", "URL",
+        "GET", "POST", "PUT", "PATCH", "DELETE", "TRUE", "FALSE", "NULL",
+        "SELECT", "INSERT", "UPDATE", "WHERE", "FROM", "JOIN", "AND", "OR"
+    )
+    return ($noise -contains $v.ToUpperInvariant())
+}
+
+function Add-DynamicProjectSearchTerm($Terms, [string]$Value, [string]$Kind, [int]$Weight) {
+    if (Test-DynamicProjectNoiseTerm $Value) { return }
+
+    $clean = [regex]::Replace([string]$Value, '^[`"''“”‘’\(\)\[\]<>,.;:]+|[`"''“”‘’\(\)\[\]<>,.;:]+$', '')
+    if (Test-DynamicProjectNoiseTerm $clean) { return }
+
+    $key = $clean.ToLowerInvariant()
+    if ((-not $Terms.ContainsKey($key)) -or ([int]$Terms[$key].weight -lt $Weight)) {
+        $Terms[$key] = [PSCustomObject]@{
+            value = $clean
+            kind = $Kind
+            weight = $Weight
+        }
+    }
+}
+
+function Get-DynamicProjectSearchTerms([string]$Question, [string]$LastTurn) {
+    $terms = @{}
+    $sources = @(
+        [PSCustomObject]@{ Text = [string]$Question; Weight = 100 },
+        [PSCustomObject]@{ Text = (Get-TextPrefix ([string]$LastTurn) 6000); Weight = 45 }
+    )
+
+    foreach ($source in $sources) {
+        $text = [string]$source.Text
+        if ([string]::IsNullOrWhiteSpace($text)) { continue }
+
+        foreach ($match in [regex]::Matches($text, '(?i)\b[A-Za-z0-9_$@.-]+\.(java|kt|kts|xml|ts|tsx|js|jsx|vue|sql|properties|ya?ml|json|md|graphql|gql|gradle|ps1|bat|cmd|sh)\b')) {
+            Add-DynamicProjectSearchTerm $terms $match.Value "file" ([int]$source.Weight + 40)
+        }
+
+        foreach ($match in [regex]::Matches($text, '[$#]\{([^}]{1,80})\}')) {
+            Add-DynamicProjectSearchTerm $terms $match.Value "placeholder" ([int]$source.Weight + 20)
+            Add-DynamicProjectSearchTerm $terms $match.Groups[1].Value "symbol" ([int]$source.Weight)
+        }
+
+        foreach ($match in [regex]::Matches($text, '\b[A-Z][A-Za-z0-9_]{2,80}\b')) {
+            Add-DynamicProjectSearchTerm $terms $match.Value "symbol" ([int]$source.Weight)
+        }
+
+        foreach ($match in [regex]::Matches($text, '\b[a-z][A-Za-z0-9_]*[A-Z][A-Za-z0-9_]{2,80}\b')) {
+            Add-DynamicProjectSearchTerm $terms $match.Value "symbol" ([int]($source.Weight * 0.8))
+        }
+    }
+
+    return @($terms.Values | Sort-Object @{ Expression = "weight"; Descending = $true }, @{ Expression = "value"; Descending = $false } | Select-Object -First 40)
+}
+
+function Add-DynamicProjectReason($Reasons, [string]$Reason) {
+    if (-not [string]::IsNullOrWhiteSpace($Reason) -and -not $Reasons.Contains($Reason)) { $Reasons.Add($Reason) | Out-Null }
+}
+
+function Get-DynamicProjectCandidateScore($File, [string]$Root, $Terms, [string]$QuestionLower) {
+    $relative = Get-ProjectRelativePath $Root $File.FullName
+    $relLower = $relative.ToLowerInvariant()
+    $nameLower = $File.Name.ToLowerInvariant()
+    $baseLower = [System.IO.Path]::GetFileNameWithoutExtension($File.Name).ToLowerInvariant()
+    $score = 0
+    $reasons = New-Object System.Collections.Generic.List[string]
+    $matchedTerms = New-Object System.Collections.Generic.List[string]
+    $content = $null
+    $contentLower = $null
+
+    foreach ($term in $Terms) {
+        $termValue = [string]$term.value
+        $termLower = $termValue.ToLowerInvariant()
+        $termBaseLower = [System.IO.Path]::GetFileNameWithoutExtension($termValue).ToLowerInvariant()
+        $termWeight = [Math]::Max(1, [int]$term.weight)
+        $matched = $false
+
+        if ($nameLower -eq $termLower -or $baseLower -eq $termLower -or $baseLower -eq $termBaseLower) {
+            $score += [int]($termWeight * 2.4)
+            Add-DynamicProjectReason $reasons "name:$termValue"
+            $matched = $true
+        } elseif ($relLower.Contains($termLower) -or $relLower.Contains($termBaseLower)) {
+            $score += [int]($termWeight * 1.6)
+            Add-DynamicProjectReason $reasons "path:$termValue"
+            $matched = $true
+        }
+
+        if (-not $matched) {
+            if ($null -eq $contentLower) {
+                $content = Read-ProjectFilePrefix $File.FullName ([Math]::Max($DynamicProjectContextMaxFileChars, 6000))
+                $contentLower = ([string]$content).ToLowerInvariant()
+            }
+            if ($contentLower.Contains($termLower)) {
+                $score += [int]($termWeight * 0.8)
+                Add-DynamicProjectReason $reasons "content:$termValue"
+                $matched = $true
+            }
+        }
+
+        if ($matched -and -not $matchedTerms.Contains($termValue)) { $matchedTerms.Add($termValue) | Out-Null }
+    }
+
+    if ($QuestionLower -match 'mapper|mybatis|sql' -and ($relLower -match 'mapper|mybatis|sql' -or $File.Extension.ToLowerInvariant() -eq ".xml")) {
+        $score += 25
+        Add-DynamicProjectReason $reasons "stack:mapper/sql"
+    }
+    if ($QuestionLower -match '\bvo\b|dto|request|response|validation|@valid|validated' -and ($relLower -match '(vo|dto|request|response)' -or $nameLower -match '(vo|dto|request|response)')) {
+        $score += 25
+        Add-DynamicProjectReason $reasons "stack:vo/dto/validation"
+    }
+    if ($QuestionLower -match 'controller|endpoint|route' -and $relLower -match 'controller|routes|pages|app') {
+        $score += 20
+        Add-DynamicProjectReason $reasons "stack:controller/route"
+    }
+    if ($QuestionLower -match 'service|transaction|rollback' -and $relLower -match 'service') {
+        $score += 20
+        Add-DynamicProjectReason $reasons "stack:service"
+    }
+
+    return [PSCustomObject]@{
+        path = $relative
+        fullName = $File.FullName
+        extension = $File.Extension
+        sizeBytes = [int64]$File.Length
+        score = $score
+        reasons = @($reasons)
+        matchedTerms = @($matchedTerms)
+    }
+}
+
+function Build-DynamicProjectContext([string]$Root, [string]$Question, [string]$LastTurn) {
+    $empty = [PSCustomObject]@{
+        text = ""
+        terms = @()
+        files = @()
+        missingTerms = @()
+        error = ""
+    }
+    if ([string]::IsNullOrWhiteSpace($Root) -or $DynamicProjectContextMaxFiles -eq 0) { return $empty }
+
+    try {
+        $terms = @(Get-DynamicProjectSearchTerms $Question $LastTurn)
+        if ($terms.Count -eq 0) { return $empty }
+
+        $files = @(Get-ProjectCandidateFiles $Root)
+        $scored = New-Object System.Collections.Generic.List[object]
+        $matchedTermSet = @{}
+        $questionLower = ([string]$Question).ToLowerInvariant()
+
+        foreach ($file in $files) {
+            try {
+                $candidate = Get-DynamicProjectCandidateScore $file $Root $terms $questionLower
+                if ($candidate.score -gt 0) {
+                    foreach ($term in $candidate.matchedTerms) { $matchedTermSet[[string]$term] = $true }
+                    $scored.Add($candidate) | Out-Null
+                }
+            } catch { }
+        }
+
+        $selected = @($scored | Sort-Object @{ Expression = "score"; Descending = $true }, @{ Expression = "sizeBytes"; Descending = $false } | Select-Object -First $DynamicProjectContextMaxFiles)
+        $missing = @($terms | Where-Object { -not $matchedTermSet.ContainsKey([string]$_.value) } | Select-Object -First 16 | ForEach-Object { $_.value })
+        $termText = (($terms | Select-Object -First 24 | ForEach-Object { "$($_.value)[$($_.kind)]" }) -join ", ")
+        if ([string]::IsNullOrWhiteSpace($termText)) { $termText = "(none)" }
+
+        $parts = New-Object System.Collections.Generic.List[string]
+        $parts.Add("동적 프로젝트 컨텍스트(현재 질문 기준 best-effort 관련 파일 검색)") | Out-Null
+        $parts.Add("- 추출 검색어: $termText") | Out-Null
+        if ($missing.Count -gt 0) {
+            $parts.Add("- 프로젝트에서 찾지 못한 검색어: $($missing -join ', ')") | Out-Null
+        }
+        if ($selected.Count -eq 0) {
+            $parts.Add("- 관련 파일을 찾지 못했습니다. 없는 파일은 전송하지 않고 기존 스캔 컨텍스트만 사용합니다.") | Out-Null
+        } else {
+            $parts.Add("- 관련 파일 후보:") | Out-Null
+            foreach ($item in $selected) {
+                $reasonText = if ($item.reasons.Count -gt 0) { $item.reasons -join ", " } else { "term match" }
+                $parts.Add("  - [$($item.score)] $($item.path) :: $reasonText") | Out-Null
+            }
+        }
+        $parts.Add("") | Out-Null
+
+        $usedChars = ($parts -join "`n").Length
+        foreach ($item in $selected) {
+            try {
+                $excerpt = Get-TextPrefix (Read-ProjectFilePrefix $item.fullName $DynamicProjectContextMaxFileChars) $DynamicProjectContextMaxFileChars
+                if ([string]::IsNullOrWhiteSpace($excerpt)) { continue }
+                $block = @"
+### $($item.path)
+score=$($item.score); reasons=$($item.reasons -join ", "); matchedTerms=$($item.matchedTerms -join ", ")
+~~~text
+$excerpt
+~~~
+
+"@
+                if (($usedChars + $block.Length) -gt $DynamicProjectContextMaxTotalChars) { break }
+                $parts.Add($block) | Out-Null
+                $usedChars += $block.Length
+            } catch {
+                $parts.Add("### $($item.path)`n파일 내용을 읽지 못했습니다: $($_.Exception.Message)`n") | Out-Null
+            }
+        }
+
+        return [PSCustomObject]@{
+            text = (($parts -join "`n") + "`n")
+            terms = @($terms | ForEach-Object { [ordered]@{ value = $_.value; kind = $_.kind; weight = $_.weight } })
+            files = @($selected | ForEach-Object {
+                [ordered]@{
+                    path = $_.path
+                    score = $_.score
+                    reasons = $_.reasons
+                    matchedTerms = $_.matchedTerms
+                }
+            })
+            missingTerms = $missing
+            error = ""
+        }
+    } catch {
+        return [PSCustomObject]@{
+            text = "동적 프로젝트 컨텍스트 생성 중 오류가 있었지만 루프는 계속 진행합니다: $($_.Exception.Message)`n"
+            terms = @()
+            files = @()
+            missingTerms = @()
+            error = [string]$_.Exception.Message
+        }
+    }
 }
 
 function Select-ProjectQuestionCandidates($Files, [int]$Count, [int]$PoolSize) {
@@ -1867,7 +2107,8 @@ NEXT_QUESTION: 여기에 다음 루프에서 물어볼 구체적인 후속 질�
 7. NEXT_QUESTION은 최근 질문과 중복되지 않아야 하며, 단순한 "분석 순서"가 아니라 하나의 검증 가능한 기술 가정, 설계 trade-off, 실패 모드, 성능/동시성/보안/테스트 쟁점으로 좁힌다.
 8. 코드베이스 내용이 제공되지 않은 경우에는 추측을 확정처럼 말하지 말고, 확인해야 할 파일과 명령을 제시한다.
 9. 다음 질문은 현재 답변에서 가장 중요한 미해결 지점이나 더 깊게 파고들 가치가 있는 지점으로 만든다.
-10. 너무 짧게 답하지 말고, 가능한 한 깊이 있는 분석, 체크리스트, 예시, 반례, 검증 방법을 포함한다.
+10. NEXT_QUESTION에는 가능하면 다음 루프에서 확인해야 할 구체적인 파일명, 클래스명, 메서드명, Mapper id, SQL/설정 키를 포함한다.
+11. 너무 짧게 답하지 말고, 가능한 한 깊이 있는 분석, 체크리스트, 예시, 반례, 검증 방법을 포함한다.
 "@
 }
 
@@ -2367,6 +2608,7 @@ $runHistoryPath = Join-Path $WorkDir "run_history.md"
 $runHistoryJsonlPath = Join-Path $WorkDir "run_history.jsonl"
 $errorLogPath = Join-Path $WorkDir "error.log"
 $pendingQuestionPath = Join-Path $WorkDir "pending_question.txt"
+$dynamicProjectContextPath = Join-Path $WorkDir "last_dynamic_project_context.json"
 
 $projectScan = $null
 $projectContext = ""
@@ -2557,6 +2799,14 @@ $settingsSummary = [ordered]@{
         startup = ConvertTo-PlainObject $startupCleanup
         note = "Preserves active state files such as next_question.txt and last_turn.txt; compacts large transcripts/error.log and removes stale dry-run/check artifacts."
     }
+    dynamicProjectContext = [ordered]@{
+        enabled = ($null -ne $projectScan)
+        maxFiles = $DynamicProjectContextMaxFiles
+        maxFileChars = $DynamicProjectContextMaxFileChars
+        maxTotalChars = $DynamicProjectContextMaxTotalChars
+        lastSummaryJson = $dynamicProjectContextPath
+        note = "For project mode, each turn extracts file/class/method symbols from the current question and best-effort attaches matching project file excerpts. Missing files are skipped without failing the loop."
+    }
     interval = [ordered]@{
         mode = $intervalPlan.Mode
         minSeconds = $intervalPlan.MinSeconds
@@ -2613,7 +2863,12 @@ if ($DryRun) {
         $dryRunQuestionHistory = Get-RecentQuestionHistoryFromTree (Get-LoopDataHistoryRoot $WorkDir) $jsonlPath 12
         if ([string]::IsNullOrWhiteSpace($dryRunQuestionHistory)) { $dryRunQuestionHistory = "(none)" }
         $dryRunPromptParts.Add("기존 qwen-loop-data 최근 질문(중복 회피용):`n$dryRunQuestionHistory") | Out-Null
-        $dryRunPromptParts.Add("프로젝트 스캔 컨텍스트:`n$projectContext") | Out-Null
+        $dryRunDynamicProjectContext = Build-DynamicProjectContext $projectScan.root $seedQuestion ""
+        Write-Utf8File $dynamicProjectContextPath ($dryRunDynamicProjectContext | ConvertTo-Json -Depth 50)
+        if (-not [string]::IsNullOrWhiteSpace([string]$dryRunDynamicProjectContext.text)) {
+            $dryRunPromptParts.Add("현재 질문 관련 동적 프로젝트 컨텍스트:`n$($dryRunDynamicProjectContext.text)") | Out-Null
+        }
+        $dryRunPromptParts.Add("기본 프로젝트 스캔 컨텍스트:`n$projectContext") | Out-Null
     }
     $dryRunPromptParts.Add("요청:`nDryRun preview. 이 파일은 API 호출 없이 실제 전송 예정 header/body 형태를 확인하기 위한 샘플입니다.") | Out-Null
     $dryRunPrompt = ($dryRunPromptParts -join "`n`n")
@@ -2628,6 +2883,7 @@ if ($DryRun) {
     Write-Host "- $(Join-Path $WorkDir 'settings_effective_summary.json')"
     Write-Host "- $(Join-Path $WorkDir 'dry_run_request_headers.json')"
     Write-Host "- $(Join-Path $WorkDir 'dry_run_request_body.json')"
+    if ($projectScan) { Write-Host "- $dynamicProjectContextPath" }
     Write-Host "Endpoint$(if ($EndpointFallbacks) { ' candidates' } else { '' }):" -ForegroundColor Yellow
     Get-EndpointCandidates $providerInfo.BaseUrl | ForEach-Object { Write-Host "- $_" }
     exit 0
@@ -2659,6 +2915,7 @@ while ($true) {
         $lastTurn = ""
         $skipStoredProjectTurn = $projectScan -and $FreshProjectQuestion -and $runCount -eq 1
         if ((-not $skipStoredProjectTurn) -and (Test-Path -LiteralPath $lastTurnPath)) { $lastTurn = Get-TextPrefix ((Read-Utf8File $lastTurnPath).Trim()) $LastTurnChars }
+        $dynamicProjectContext = $null
         $questionHistory = Get-RecentQuestionHistory $jsonlPath 8
         if ($projectScan) {
             $globalQuestionHistory = Get-RecentQuestionHistoryFromTree (Get-LoopDataHistoryRoot $WorkDir) $jsonlPath 12
@@ -2666,10 +2923,16 @@ while ($true) {
                 if (-not [string]::IsNullOrWhiteSpace($questionHistory)) { $questionHistory += "`n" }
                 $questionHistory += "기존 qwen-loop-data 최근 질문(중복 회피용):`n$globalQuestionHistory"
             }
+            $dynamicProjectContext = Build-DynamicProjectContext $projectScan.root $question $lastTurn
+            Write-Utf8File $dynamicProjectContextPath ($dynamicProjectContext | ConvertTo-Json -Depth 50)
         }
         $projectPromptSection = ""
         if ($projectScan) {
-            $projectPromptSection = "프로젝트 스캔 컨텍스트:`n$projectContext`n"
+            $dynamicContextText = ""
+            if ($dynamicProjectContext -and -not [string]::IsNullOrWhiteSpace([string]$dynamicProjectContext.text)) {
+                $dynamicContextText = "현재 질문 관련 동적 프로젝트 컨텍스트:`n$($dynamicProjectContext.text)`n"
+            }
+            $projectPromptSection = "$dynamicContextText`n기본 프로젝트 스캔 컨텍스트:`n$projectContext`n"
         }
 
         $userPrompt = @"
@@ -2781,6 +3044,7 @@ $answer
         Write-Host "- $(Join-Path $WorkDir 'last_request_headers.json')"
         Write-Host "- $(Join-Path $WorkDir 'last_request_body.json')"
         Write-Host "- $(Join-Path $WorkDir 'last_response_status.json')"
+        if ($projectScan) { Write-Host "- $dynamicProjectContextPath" }
         Write-Host "`nRUN #$runCount complete. Full answer saved to transcript.md." -ForegroundColor Green
     } catch {
         $completedAt = Get-Date

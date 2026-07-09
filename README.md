@@ -184,6 +184,7 @@ Key outputs:
 project_scan_summary.md
 project_scan_summary.json
 next_question.txt
+last_dynamic_project_context.json
 transcript.md
 transcript.jsonl
 run_history.md
@@ -191,6 +192,8 @@ run_history.jsonl
 ```
 
 Project mode reuses the same project work folder so logs do not create git changes in the scanned target project. The double-click launcher passes `-FreshProjectQuestion`, so each new option-2 startup ignores the saved `next_question.txt` for the first request, samples important files from a wider top-candidate pool with score weighting, chooses one sampled file as the primary question target, puts that target and support file excerpts first in the prompt context, writes a new first question that must stay centered on the primary target, and omits the previous `last_turn.txt` from that first prompt to avoid drifting back into yesterday's topic. After that first request, the running loop still follows the model's saved `NEXT_QUESTION` normally.
+
+For every project-mode turn, the script also builds a best-effort dynamic context from the current question. It extracts file/class/method/config/SQL-like terms, searches the scanned project for matching files, and prepends found excerpts before the base scan context. Missing files are skipped rather than treated as errors, and the last lookup summary is saved to `last_dynamic_project_context.json`.
 
 Advanced direct calls without `-FreshProjectQuestion` keep the older continuation behavior: if `next_question.txt` already contains a real follow-up for that project, the loop continues from it; otherwise it recovers from `transcript.jsonl`, `transcript.md`, `last_turn.txt`, or interrupted `pending_question.txt` before falling back to a fresh scan seed. Automatic cleanup compacts large transcripts/error logs and enforces the configured work-folder size cap.
 
@@ -348,6 +351,9 @@ Common options:
 -Once                           Run one request and exit
 -ProjectRoot <path>             Scan a project directory and start from it
 -FreshProjectQuestion           For ProjectRoot, start with a newly sampled project question instead of saved next_question.txt
+-DynamicProjectContextMaxFiles <n>      Max related files attached per project-mode turn
+-DynamicProjectContextMaxFileChars <n>  Max excerpt chars per dynamic related file
+-DynamicProjectContextMaxTotalChars <n> Max total chars for dynamic project context
 -QuestionTrack <name>           Pick seeds from a specific question_bank track
 -MinIntervalMinutes <n>         Random wait minimum
 -MaxIntervalMinutes <n>         Random wait maximum
