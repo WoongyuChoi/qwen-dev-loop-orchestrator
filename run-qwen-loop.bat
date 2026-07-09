@@ -29,7 +29,7 @@ echo    - 기존 qwen-loop-data 상태를 이어서 사용합니다.
 echo.
 echo 2. Project directory loop
 echo    - 입력한 프로젝트 디렉터리를 스캔합니다.
-echo    - 프로젝트 기반 첫 질문을 만들고 새 세션으로 시작합니다.
+echo    - 매 실행마다 중요 후보 파일을 다시 샘플링해 새 첫 질문으로 시작합니다.
 echo ============================================================
 echo.
 choice /C 12 /N /M "Select mode [1/2]: "
@@ -83,6 +83,7 @@ echo.
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%qwen-loop.ps1" ^
   -SettingsPath "%SETTINGS_PATH%" ^
   -ProjectRoot "%PROJECT_ROOT%" ^
+  -FreshProjectQuestion ^
   -MinIntervalMinutes 8 ^
   -MaxIntervalMinutes 15 ^
   -LastTurnChars 12000 ^

@@ -7,6 +7,7 @@
     [string]$QuestionTrack = "",
     [string]$ContextListFile = "$PSScriptRoot\context_files.txt",
     [string]$ProjectRoot = "",
+    [switch]$FreshProjectQuestion,
     [string]$WorkDir = "$PSScriptRoot\qwen-loop-data",
     [int]$IntervalSeconds = 600,
     [int]$MinIntervalMinutes = 8,
@@ -1222,7 +1223,29 @@ function Select-ProjectQuestionCandidates($Files, [int]$Count, [int]$PoolSize) {
     $pool = @($items | Select-Object -First $effectivePoolSize)
     if ($pool.Count -le $Count) { return @($pool) }
 
-    return @($pool | Get-Random -Count $Count)
+    $remaining = New-Object System.Collections.Generic.List[object]
+    foreach ($item in $pool) { $remaining.Add($item) | Out-Null }
+    $selected = New-Object System.Collections.Generic.List[object]
+
+    while ($selected.Count -lt $Count -and $remaining.Count -gt 0) {
+        $totalWeight = 0
+        foreach ($item in $remaining) {
+            $totalWeight += [Math]::Max(1, [int]$item.score)
+        }
+
+        $roll = Get-Random -Minimum 1 -Maximum ($totalWeight + 1)
+        $cursor = 0
+        for ($i = 0; $i -lt $remaining.Count; $i++) {
+            $cursor += [Math]::Max(1, [int]$remaining[$i].score)
+            if ($roll -le $cursor) {
+                $selected.Add($remaining[$i]) | Out-Null
+                $remaining.RemoveAt($i)
+                break
+            }
+        }
+    }
+
+    return @($selected.ToArray())
 }
 
 function Test-ProjectScanBootstrapQuestion([string]$Question) {
@@ -1230,6 +1253,7 @@ function Test-ProjectScanBootstrapQuestion([string]$Question) {
     if ([string]::IsNullOrWhiteSpace($q)) { return $false }
 
     if ($q -match '^프로젝트 핵심 후보 파일\(.+\)을 바탕으로,') { return $true }
+    if ($q -match '^이번 실행의 주 대상 파일은 .+입니다\. 반드시 이 파일을 중심으로') { return $true }
     if ($q -match '^아래 프로젝트 스캔 결과의 핵심 파일과 코드 조각을 바탕으로,') { return $true }
     if ($q -match '^이전 실행에서 프로젝트 전체 핵심 후보를 고르는 초기 질문이 이미 전송됐지만 완료 기록이 없습니다\.') { return $true }
     if ($q -match '^이전 실행에서 프로젝트 스캔 기반 초기 질문이 이미 전송됐지만 완료 기록이 없습니다\.') { return $true }
@@ -1253,11 +1277,31 @@ function New-ProjectScanContext([string]$Root) {
 
     $selected = @($scored | Sort-Object @{ Expression = "score"; Descending = $true }, @{ Expression = "sizeBytes"; Descending = $true } | Select-Object -First $ProjectScanMaxFiles)
     $stack = @(Get-DetectedProjectStack $files)
+    $questionCandidates = @(Select-ProjectQuestionCandidates $selected 5 40)
+    $primaryQuestionCandidate = if ($questionCandidates.Count -gt 0) { $questionCandidates[0] } else { $null }
 
     $contextParts = New-Object System.Collections.Generic.List[string]
     $contextParts.Add("Project root: $resolvedRoot") | Out-Null
     $contextParts.Add("Detected stack: $($stack -join ', ')") | Out-Null
     $contextParts.Add("Scanned text files: $($files.Count); selected key files: $($selected.Count)") | Out-Null
+    $contextParts.Add("") | Out-Null
+    $contextParts.Add("Primary question target for this startup:") | Out-Null
+    if ($primaryQuestionCandidate) {
+        $reasonText = if ($primaryQuestionCandidate.reasons.Count -gt 0) { $primaryQuestionCandidate.reasons -join ", " } else { "signal score" }
+        $contextParts.Add("- [$($primaryQuestionCandidate.score)] $($primaryQuestionCandidate.path) :: $reasonText") | Out-Null
+    } else {
+        $contextParts.Add("- no primary target selected") | Out-Null
+    }
+    $contextParts.Add("") | Out-Null
+    $contextParts.Add("Question candidate sample for this startup:") | Out-Null
+    if ($questionCandidates.Count -gt 0) {
+        foreach ($item in $questionCandidates) {
+            $reasonText = if ($item.reasons.Count -gt 0) { $item.reasons -join ", " } else { "signal score" }
+            $contextParts.Add("- [$($item.score)] $($item.path) :: $reasonText") | Out-Null
+        }
+    } else {
+        $contextParts.Add("- no question candidates selected") | Out-Null
+    }
     $contextParts.Add("") | Out-Null
     $contextParts.Add("Top key files:") | Out-Null
 
@@ -1267,9 +1311,16 @@ function New-ProjectScanContext([string]$Root) {
     }
 
     $contextParts.Add("") | Out-Null
-    $contextParts.Add("Selected excerpts:") | Out-Null
-    $usedChars = ($contextParts -join "`n").Length
+    $contextParts.Add("Selected excerpts, with this startup's question candidates first:") | Out-Null
+    $candidatePathSet = @{}
+    foreach ($item in $questionCandidates) { $candidatePathSet[[string]$item.path] = $true }
+    $excerptItems = New-Object System.Collections.Generic.List[object]
+    foreach ($item in $questionCandidates) { $excerptItems.Add($item) | Out-Null }
     foreach ($item in $selected) {
+        if (-not $candidatePathSet.ContainsKey([string]$item.path)) { $excerptItems.Add($item) | Out-Null }
+    }
+    $usedChars = ($contextParts -join "`n").Length
+    foreach ($item in $excerptItems) {
         $excerpt = Get-TextPrefix ([string]$item.excerpt) $ProjectScanMaxFileChars
         if ([string]::IsNullOrWhiteSpace($excerpt)) { continue }
         $block = @"
@@ -1287,10 +1338,12 @@ $excerpt
 
     $promptContext = Get-TextPrefix (($contextParts -join "`n") + "`n") $ProjectScanMaxTotalChars
 
-    $questionCandidates = @(Select-ProjectQuestionCandidates $selected 5 20)
-
     $seedQuestion = "아래 프로젝트 스캔 결과의 핵심 파일과 코드 조각을 바탕으로, 이번 실행에서 실제 업무 흐름에 영향을 주는 로직 하나를 새롭게 골라 구조, 동작 방식, 실패 가능성, 다음에 확인해야 할 파일을 구체적으로 분석해줘."
-    if ($selected.Count -gt 0) {
+    if ($primaryQuestionCandidate -and -not [string]::IsNullOrWhiteSpace([string]$primaryQuestionCandidate.path)) {
+        $supportNames = (($questionCandidates | Select-Object -Skip 1 | ForEach-Object { $_.path }) -join ", ")
+        if ([string]::IsNullOrWhiteSpace($supportNames)) { $supportNames = "없음" }
+        $seedQuestion = "이번 실행의 주 대상 파일은 $($primaryQuestionCandidate.path)입니다. 반드시 이 파일을 중심으로 실제 업무 흐름 하나를 새롭게 골라 구조, 동작 방식, 실패 가능성, 다음에 확인해야 할 연결 파일을 구체적으로 분석해줘. 보조 후보 파일은 $supportNames 입니다. 다른 상위 파일은 연결 확인용으로만 참고하고 주제를 임의로 바꾸지 마."
+    } elseif ($selected.Count -gt 0) {
         $candidateNames = (($questionCandidates | ForEach-Object { $_.path }) -join ", ")
         $seedQuestion = "프로젝트 핵심 후보 파일($candidateNames)을 바탕으로, 이번 실행에서는 후보 중 하나를 새롭게 골라 실제 업무 흐름에 영향을 주는 로직 하나의 구조, 동작 방식, 실패 가능성, 다음에 확인해야 할 파일을 구체적으로 분석해줘."
     }
@@ -1301,6 +1354,7 @@ $excerpt
         scannedFileCount = $files.Count
         selectedFileCount = $selected.Count
         detectedStack = $stack
+        primaryQuestionCandidateFile = if ($primaryQuestionCandidate) { $primaryQuestionCandidate.path } else { "" }
         selectedFiles = @($selected | ForEach-Object {
             [ordered]@{
                 path = $_.path
@@ -1341,6 +1395,7 @@ function Write-ProjectScanFiles($Scan, [string]$WorkDirPath) {
 - Detected stack: $($Scan.detectedStack -join ", ")
 - Scanned files: $($Scan.scannedFileCount)
 - Selected key files: $($Scan.selectedFileCount)
+- Primary question target: $($Scan.primaryQuestionCandidateFile)
 
 ## Key File Candidates
 
@@ -2326,11 +2381,20 @@ if (-not [string]::IsNullOrWhiteSpace($ProjectRoot)) {
         $existingProjectQuestion = (Read-Utf8File $nextQuestionPath).Trim()
     }
 
+    if ($FreshProjectQuestion) {
+        Write-Utf8File $nextQuestionPath $projectScan.seedQuestion
+        $initialQuestion = [PSCustomObject]@{
+            Question = $projectScan.seedQuestion
+            Source = "project-fresh-scan"
+            SeedSource = (Join-Path $WorkDir "project_scan_summary.md")
+        }
+    }
+
     $hasUsableProjectQuestion = (-not [string]::IsNullOrWhiteSpace($existingProjectQuestion)) -and `
         (-not (Test-SameQuestionText $existingProjectQuestion $projectScan.seedQuestion)) -and `
         (-not (Test-ProjectScanBootstrapQuestion $existingProjectQuestion))
 
-    if ($hasUsableProjectQuestion) {
+    if ($null -eq $initialQuestion -and $hasUsableProjectQuestion) {
         $initialQuestion = [PSCustomObject]@{
             Question = $existingProjectQuestion
             Source = "project-next_question.txt"
@@ -2423,6 +2487,7 @@ Write-Host "QuestionSrc  : $($initialQuestion.Source)"
 if ($projectScan) {
     Write-Host "ProjectRoot  : $($projectScan.root)"
     Write-Host "ProjectScan  : $($projectScan.scannedFileCount) files scanned, $($projectScan.selectedFileCount) key files selected"
+    Write-Host "ProjectStart : $(if ($FreshProjectQuestion) { 'fresh random scan question; saved next_question is ignored on startup' } else { 'continue saved next_question when available' })"
 }
 $answerPreviewText = if ($NoAnswerPreview) { "disabled" } else { "$AnswerPreviewLines lines / $AnswerPreviewChars chars" }
 Write-Host "AnswerPreview: $answerPreviewText"
@@ -2507,12 +2572,14 @@ $settingsSummary = [ordered]@{
     initialQuestionSource = $initialQuestion.Source
     initialQuestionSeedSource = $initialQuestion.SeedSource
     questionTrack = $QuestionTrack
+    freshProjectQuestion = [bool]$FreshProjectQuestion
     projectScan = if ($projectScan) {
         [ordered]@{
             root = $projectScan.root
             generatedAt = $projectScan.generatedAt
             scannedFileCount = $projectScan.scannedFileCount
             selectedFileCount = $projectScan.selectedFileCount
+            primaryQuestionCandidateFile = $projectScan.primaryQuestionCandidateFile
             detectedStack = $projectScan.detectedStack
             maxFiles = $ProjectScanMaxFiles
             maxFileChars = $ProjectScanMaxFileChars
@@ -2590,7 +2657,8 @@ while ($true) {
 
         $contextBundle = Read-ContextBundle $ContextListFile $MaxContextChars
         $lastTurn = ""
-        if (Test-Path -LiteralPath $lastTurnPath) { $lastTurn = Get-TextPrefix ((Read-Utf8File $lastTurnPath).Trim()) $LastTurnChars }
+        $skipStoredProjectTurn = $projectScan -and $FreshProjectQuestion -and $runCount -eq 1
+        if ((-not $skipStoredProjectTurn) -and (Test-Path -LiteralPath $lastTurnPath)) { $lastTurn = Get-TextPrefix ((Read-Utf8File $lastTurnPath).Trim()) $LastTurnChars }
         $questionHistory = Get-RecentQuestionHistory $jsonlPath 8
         if ($projectScan) {
             $globalQuestionHistory = Get-RecentQuestionHistoryFromTree (Get-LoopDataHistoryRoot $WorkDir) $jsonlPath 12

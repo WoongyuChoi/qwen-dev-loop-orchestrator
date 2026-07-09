@@ -134,7 +134,7 @@ Qwen Loop Scheduler
    - Resumes the existing qwen-loop-data session.
 
 2. Project directory loop
-   - Scans a directory and starts a fresh project-based session.
+   - Scans a directory and starts with a fresh sampled project question.
 
 Select mode [1/2]:
 ```
@@ -142,7 +142,7 @@ Select mode [1/2]:
 Choose:
 
 - `1` to resume or start the general random question loop.
-- `2` to enter a project directory path and start a fresh project-based loop.
+- `2` to enter a project directory path and start from a newly sampled project question.
 
 Press `Ctrl+C` in the console to stop the loop.
 
@@ -190,7 +190,9 @@ run_history.md
 run_history.jsonl
 ```
 
-Project mode reuses the same project work folder so logs do not create git changes in the scanned target project. If `next_question.txt` already contains a real follow-up for that project, the loop continues from it. If the file is missing or still contains a scan bootstrap question, the script first tries to recover the latest follow-up from `transcript.jsonl`, `transcript.md`, or `last_turn.txt`. If the previous scan bootstrap was already sent but no completed answer was saved, `pending_question.txt` makes the next launch ask a narrower interrupted-run recovery question instead of repeating the same broad bootstrap. Fresh scan seeds and interrupted-run recovery questions sample from the top project candidates instead of always using the same first files. Only then does it fall back to the fresh scan-based seed question. Automatic cleanup compacts large transcripts/error logs and enforces the configured work-folder size cap.
+Project mode reuses the same project work folder so logs do not create git changes in the scanned target project. The double-click launcher passes `-FreshProjectQuestion`, so each new option-2 startup ignores the saved `next_question.txt` for the first request, samples important files from a wider top-candidate pool with score weighting, chooses one sampled file as the primary question target, puts that target and support file excerpts first in the prompt context, writes a new first question that must stay centered on the primary target, and omits the previous `last_turn.txt` from that first prompt to avoid drifting back into yesterday's topic. After that first request, the running loop still follows the model's saved `NEXT_QUESTION` normally.
+
+Advanced direct calls without `-FreshProjectQuestion` keep the older continuation behavior: if `next_question.txt` already contains a real follow-up for that project, the loop continues from it; otherwise it recovers from `transcript.jsonl`, `transcript.md`, `last_turn.txt`, or interrupted `pending_question.txt` before falling back to a fresh scan seed. Automatic cleanup compacts large transcripts/error logs and enforces the configured work-folder size cap.
 
 ## How It Works
 
@@ -345,6 +347,7 @@ Common options:
 -DryRun                         Build request logs without calling the API
 -Once                           Run one request and exit
 -ProjectRoot <path>             Scan a project directory and start from it
+-FreshProjectQuestion           For ProjectRoot, start with a newly sampled project question instead of saved next_question.txt
 -QuestionTrack <name>           Pick seeds from a specific question_bank track
 -MinIntervalMinutes <n>         Random wait minimum
 -MaxIntervalMinutes <n>         Random wait maximum

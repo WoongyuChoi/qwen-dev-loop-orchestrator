@@ -32,9 +32,9 @@
 ## 테스트 체크리스트
 
 - `check-qwen-loop.bat` 더블클릭 시 사용자/프로젝트 settings DryRun이 순차적으로 정상 실행되는지 확인한다.
-- `run-qwen-loop.bat` 더블클릭 시 1번/2번 모드 선택 메뉴가 표시되고, 2번에서 입력한 ProjectRoot가 이 오케스트레이터의 고정 `qwen-loop-data/project/<name>` WorkDir로 실행되는지 확인한다.
+- `run-qwen-loop.bat` 더블클릭 시 1번/2번 모드 선택 메뉴가 표시되고, 2번에서 입력한 ProjectRoot가 이 오케스트레이터의 고정 `qwen-loop-data/project/<name>` WorkDir로 실행되며 `-FreshProjectQuestion`으로 저장된 `next_question.txt` 대신 새 중요 후보 파일 샘플 기반 첫 질문을 보내는지 확인한다.
 - 프로젝트 디렉터리 모드에서 `project_scan_summary.md`와 `project_scan_summary.json`이 생성되고, `settings_effective_summary.json.projectScan`에 root/scanned/selected/stack 정보가 들어가는지 확인한다.
-- 프로젝트 디렉터리 모드는 고정 project WorkDir의 `next_question.txt`가 실제 후속 질문이면 이어가고, scan bootstrap 계열이거나 없으면 transcript/last_turn 복구 후 `pending_question.txt`로 중단된 scan seed 재전송을 피한 뒤 fresh scan seed로 fallback하며, fresh/interrupted seed 질문은 상위 핵심 후보군에서 랜덤 샘플을 사용하고, 기존 `qwen-loop-data` 최근 질문은 중복 회피용 히스토리로 prompt에 포함되는지 확인한다.
+- 프로젝트 디렉터리 모드는 더블클릭 2번 진입 시 첫 요청에서 `next_question.txt`와 이전 `last_turn.txt`를 우선하지 않고 fresh scan seed를 사용하며, 상위 후보 풀에서 score 가중 랜덤으로 primary question target을 뽑고 해당 파일과 보조 후보 excerpt가 prompt context 앞쪽에 실리는지 확인한다. 기존 `qwen-loop-data` 최근 질문은 중복 회피용 히스토리로 prompt에 포함된다. 직접 `qwen-loop.ps1 -ProjectRoot`를 `-FreshProjectQuestion` 없이 호출하는 고급 경로에서는 기존 continuation 동작을 유지한다.
 - `02_RUN_ONCE_TEST_DOUBLECLICK.bat` 또는 `07_RUN_ONCE_PROJECT_SETTINGS_DOUBLECLICK.bat` 더블클릭 시 `NEXT_QUESTION` 한글이 깨지지 않는지 확인한다.
 - `qwen-loop-data/last_request_headers.json`과 `last_request_body.json`에 settings 기반 정보가 반영되는지 확인한다.
 - `qwen-loop-data/run_history.md`에서 호출 seq, started/request/response, HTTP, next run 시각이 누적되는지 확인한다.
