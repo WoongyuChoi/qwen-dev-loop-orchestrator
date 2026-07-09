@@ -18,7 +18,7 @@ It is an independent helper script, not an official Qwen project.
 It can run in two modes:
 
 - **Random question loop**: starts from `question_bank.txt` or resumes `qwen-loop-data\next_question.txt`.
-- **Project directory loop**: scans a local Java/Spring, React/TypeScript, SQL/MyBatis, or script-based project and starts a fresh project-specific analysis loop.
+- **Project directory loop**: scans a local project, builds dynamic structure groups from its actual directories and file roles, and starts a fresh project-specific analysis loop.
 
 Core behavior:
 
@@ -191,7 +191,7 @@ run_history.md
 run_history.jsonl
 ```
 
-Project mode reuses the same project work folder so logs do not create git changes in the scanned target project. The double-click launcher passes `-FreshProjectQuestion`, so each new option-2 startup ignores the saved `next_question.txt` for the first request, samples important files from a wider top-candidate pool with score weighting, chooses one sampled file as the primary question target, puts that target and support file excerpts first in the prompt context, writes a new first question that must stay centered on the primary target, and omits the previous `last_turn.txt` from that first prompt to avoid drifting back into yesterday's topic. After that first request, the running loop still follows the model's saved `NEXT_QUESTION` normally.
+Project mode reuses the same project work folder so logs do not create git changes in the scanned target project. The double-click launcher passes `-FreshProjectQuestion`, so each new option-2 startup ignores the saved `next_question.txt` for the first request, builds diversity groups from the scanned project's real directory structure and file roles, samples a primary group first, then chooses a representative file inside that group. Support candidates are also drawn across groups where possible, so large high-score folders such as `src/api` cannot monopolize every first question. Markdown docs can remain in the scan context, but they are skipped as primary question targets when code candidates exist. The first project question is domain-flow oriented: it asks for the business/user scenario, normal data/state flow, connected files to inspect next, and only then exception/performance/security risk checks. The prompt context puts the primary target and support excerpts first, writes a new first question that must stay centered on the primary target, and omits the previous `last_turn.txt` from that first prompt to avoid drifting back into yesterday's topic. After that first request, the running loop still follows the model's saved `NEXT_QUESTION` normally.
 
 For every project-mode turn, the script also builds a best-effort dynamic context from the current question. It extracts file/class/method/config/SQL-like terms, searches the scanned project for matching files, and prepends found excerpts before the base scan context. Missing files are skipped rather than treated as errors, and the last lookup summary is saved to `last_dynamic_project_context.json`.
 
