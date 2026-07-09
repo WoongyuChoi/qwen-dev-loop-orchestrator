@@ -1083,6 +1083,18 @@ function Read-ProjectFilePrefix([string]$Path, [int]$MaxChars) {
     }
 }
 
+function Read-ProjectFileText([string]$Path) {
+    try {
+        return (Read-Utf8File $Path)
+    } catch {
+        try {
+            return [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::Default)
+        } catch {
+            return ""
+        }
+    }
+}
+
 function Add-ProjectScoreReason($Reasons, [string]$Reason) {
     if (-not [string]::IsNullOrWhiteSpace($Reason) -and -not $Reasons.Contains($Reason)) { $Reasons.Add($Reason) | Out-Null }
 }
@@ -1462,8 +1474,12 @@ function Get-DynamicProjectSearchTerms([string]$Question, [string]$LastTurn) {
         $text = [string]$source.Text
         if ([string]::IsNullOrWhiteSpace($text)) { continue }
 
-        foreach ($match in [regex]::Matches($text, '(?i)\b[A-Za-z0-9_$@.-]+\.(java|kt|kts|xml|ts|tsx|js|jsx|vue|sql|properties|ya?ml|json|md|graphql|gql|gradle|ps1|bat|cmd|sh)\b')) {
-            Add-DynamicProjectSearchTerm $terms $match.Value "file" ([int]$source.Weight + 40)
+        foreach ($match in [regex]::Matches($text, '(?i)(?<![A-Za-z0-9_$@.-])([A-Za-z0-9_$@.-]+\.(?:java|kt|kts|xml|ts|tsx|js|jsx|vue|sql|properties|ya?ml|json|md|graphql|gql|gradle|ps1|bat|cmd|sh))(?=$|[^A-Za-z0-9_$@.-])')) {
+            Add-DynamicProjectSearchTerm $terms $match.Groups[1].Value "file" ([int]$source.Weight + 40)
+        }
+
+        foreach ($match in [regex]::Matches($text, '(?<![A-Za-z0-9_-])([A-Za-z][A-Za-z0-9_]*-[A-Za-z][A-Za-z0-9_-]{2,100})(?=$|[^A-Za-z0-9_-])')) {
+            Add-DynamicProjectSearchTerm $terms $match.Groups[1].Value "symbol" ([int]$source.Weight + 10)
         }
 
         foreach ($match in [regex]::Matches($text, '[$#]\{([^}]{1,80})\}')) {
@@ -1481,6 +1497,205 @@ function Get-DynamicProjectSearchTerms([string]$Question, [string]$LastTurn) {
     }
 
     return @($terms.Values | Sort-Object @{ Expression = "weight"; Descending = $true }, @{ Expression = "value"; Descending = $false } | Select-Object -First 40)
+}
+
+function Get-DynamicProjectFocusTerms($Candidate, $Terms) {
+    $seen = @{}
+    $items = New-Object System.Collections.Generic.List[object]
+    $order = 0
+
+    foreach ($value in @($Candidate.matchedTerms)) {
+        $text = [string]$value
+        $key = $text.ToLowerInvariant()
+        if (-not [string]::IsNullOrWhiteSpace($text) -and -not $seen.ContainsKey($key)) {
+            $items.Add([PSCustomObject]@{ Value = $text; Priority = (Get-DynamicProjectFocusTermPriority $text); Order = $order }) | Out-Null
+            $seen[$key] = $true
+            $order++
+        }
+    }
+    foreach ($term in @($Terms)) {
+        $value = [string]$term.value
+        $key = $value.ToLowerInvariant()
+        if (-not [string]::IsNullOrWhiteSpace($value) -and -not $seen.ContainsKey($key)) {
+            $items.Add([PSCustomObject]@{ Value = $value; Priority = (Get-DynamicProjectFocusTermPriority $value); Order = $order }) | Out-Null
+            $seen[$key] = $true
+            $order++
+        }
+    }
+    return @($items |
+        Sort-Object @{ Expression = "Priority"; Descending = $false }, @{ Expression = "Order"; Descending = $false } |
+        Select-Object -First 28 |
+        ForEach-Object { $_.Value })
+}
+
+function Get-DynamicProjectFocusTermPriority([string]$Value) {
+    $v = [string]$Value
+    if ($v -match '[$#]\{') { return 0 }
+    if ($v -match '\.') { return 5 }
+    if ($v -cmatch '^[A-Z][A-Za-z0-9_]*-[A-Z][A-Za-z0-9_]*') { return 0 }
+    if ($v -cmatch '^[a-z][A-Za-z0-9_]*[A-Z][A-Za-z0-9_]*$') { return 1 }
+    if ($v -cmatch '^[a-z][A-Za-z0-9_]{2,}$') { return 2 }
+    if ($v -cmatch '^[a-z][a-z0-9]+(?:-[a-z0-9]+)+$') { return 4 }
+    if ($v -match '(?i)(Service|ServiceImpl|Controller|Mapper|Repository|Dao|DTO|VO|Request|Response|Util|Utils)$') { return 4 }
+    return 3
+}
+
+function Add-LineRange($Ranges, [int]$Start, [int]$End, [int]$Priority) {
+    if ($End -lt $Start) { return }
+    $Ranges.Add([PSCustomObject]@{ Start = $Start; End = $End; Priority = $Priority }) | Out-Null
+}
+
+function Merge-LineRanges($Ranges) {
+    $merged = New-Object System.Collections.Generic.List[object]
+    $sorted = @($Ranges | Sort-Object @{ Expression = "Start"; Descending = $false }, @{ Expression = "End"; Descending = $false })
+    foreach ($range in $sorted) {
+        if ($merged.Count -eq 0) {
+            $merged.Add([PSCustomObject]@{ Start = [int]$range.Start; End = [int]$range.End; Priority = [int]$range.Priority }) | Out-Null
+            continue
+        }
+
+        $last = $merged[$merged.Count - 1]
+        if ([int]$range.Start -le ([int]$last.End + 2)) {
+            if ([int]$range.End -gt [int]$last.End) { $last.End = [int]$range.End }
+            if ([int]$range.Priority -lt [int]$last.Priority) { $last.Priority = [int]$range.Priority }
+        } else {
+            $merged.Add([PSCustomObject]@{ Start = [int]$range.Start; End = [int]$range.End; Priority = [int]$range.Priority }) | Out-Null
+        }
+    }
+    return @($merged.ToArray())
+}
+
+function Get-FocusedProjectSnippet([string]$Path, $Candidate, $Terms, [int]$MaxChars) {
+    $raw = Read-ProjectFileText $Path
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        return [PSCustomObject]@{ Text = ""; Mode = "empty"; FocusTerms = @() }
+    }
+
+    $focusTerms = @(Get-DynamicProjectFocusTerms $Candidate $Terms |
+        Where-Object { -not (Test-DynamicProjectNoiseTerm $_) } |
+        Select-Object -First 24)
+    if ($focusTerms.Count -eq 0) {
+        return [PSCustomObject]@{ Text = (Get-TextPrefix $raw $MaxChars); Mode = "prefix"; FocusTerms = @() }
+    }
+
+    $lines = @($raw -split "`r?`n", 0, "RegexMatch")
+    if ($lines.Count -eq 0) {
+        return [PSCustomObject]@{ Text = (Get-TextPrefix $raw $MaxChars); Mode = "prefix"; FocusTerms = $focusTerms }
+    }
+
+    $ranges = New-Object System.Collections.Generic.List[object]
+    $hits = 0
+    $termInfos = @($focusTerms | ForEach-Object {
+        $termText = [string]$_
+        [PSCustomObject]@{
+            Lower = $termText.ToLowerInvariant()
+            Priority = Get-DynamicProjectFocusTermPriority $termText
+        }
+    } | Where-Object { -not [string]::IsNullOrWhiteSpace($_.Lower) })
+    for ($i = 0; $i -lt $lines.Count -and $hits -lt 18; $i++) {
+        $lineLower = ([string]$lines[$i]).ToLowerInvariant()
+        foreach ($termInfo in $termInfos) {
+            if ($lineLower.Contains([string]$termInfo.Lower)) {
+                Add-LineRange $ranges ([Math]::Max(0, $i - 10)) ([Math]::Min($lines.Count - 1, $i + 18)) ([int]$termInfo.Priority)
+                $hits++
+                break
+            }
+        }
+    }
+
+    if ($ranges.Count -eq 0) {
+        return [PSCustomObject]@{ Text = (Get-TextPrefix $raw $MaxChars); Mode = "prefix-no-term-hit"; FocusTerms = $focusTerms }
+    }
+
+    $parts = New-Object System.Collections.Generic.List[string]
+    $used = 0
+    $orderedRanges = @(Merge-LineRanges $ranges | Sort-Object @{ Expression = "Priority"; Descending = $false }, @{ Expression = "Start"; Descending = $false })
+    foreach ($range in $orderedRanges) {
+        $header = "... lines $([int]$range.Start + 1)-$([int]$range.End + 1) ...`n"
+        $snippetLines = New-Object System.Collections.Generic.List[string]
+        for ($lineNo = [int]$range.Start; $lineNo -le [int]$range.End; $lineNo++) {
+            $snippetLines.Add(("{0,5}: {1}" -f ($lineNo + 1), $lines[$lineNo])) | Out-Null
+        }
+        $block = $header + ($snippetLines -join "`n") + "`n"
+        if (($used + $block.Length) -gt $MaxChars) {
+            $remaining = $MaxChars - $used
+            if ($remaining -gt 120) {
+                $parts.Add((Get-TextPrefix $block $remaining)) | Out-Null
+            }
+            break
+        }
+        $parts.Add($block) | Out-Null
+        $used += $block.Length
+    }
+
+    return [PSCustomObject]@{
+        Text = (($parts -join "`n").TrimEnd())
+        Mode = "focused-line-window"
+        FocusTerms = $focusTerms
+    }
+}
+
+function Add-DynamicExpansionTerm($Terms, [string]$Value, [string]$Kind, [int]$Weight) {
+    if ([string]$Value -match '^(Controller|Service|ServiceImpl|Mapper|Repository|Dao|DAO|Request|Response|Provider|Store|Util|Utils|GetResponse|HttpWebRequest)$') { return }
+    Add-DynamicProjectSearchTerm $Terms $Value $Kind $Weight
+}
+
+function Get-DynamicProjectExpansionTerms($Selected, [string]$Root, $ExistingTerms) {
+    $terms = @{}
+    $existing = @{}
+    foreach ($term in @($ExistingTerms)) {
+        $existingKey = ([string]$term.value).ToLowerInvariant()
+        if (-not [string]::IsNullOrWhiteSpace($existingKey)) {
+            $existing[$existingKey] = $true
+        }
+    }
+
+    foreach ($item in @($Selected | Select-Object -First 5)) {
+        if ([string]$item.extension -eq ".md") { continue }
+
+        $raw = Read-ProjectFileText $item.fullName
+        if ([string]::IsNullOrWhiteSpace($raw)) { continue }
+
+        foreach ($match in [regex]::Matches($raw, '(?m)^\s*import\s+(?:static\s+)?([A-Za-z_][A-Za-z0-9_.]*)(?:\.[A-Za-z_][A-Za-z0-9_]*)?\s*;')) {
+            $full = $match.Groups[1].Value
+            $simple = ($full -split '\.')[-1]
+            Add-DynamicExpansionTerm $terms $simple "import" 72
+            Add-DynamicExpansionTerm $terms "$simple.java" "import-file" 78
+        }
+
+        foreach ($match in [regex]::Matches($raw, '(?m)\b(?:from|require)\s*\(?\s*[''"]([^''"]+)[''"]')) {
+            $importPath = $match.Groups[1].Value
+            $leaf = (($importPath -replace '\\', '/') -split '/')[-1]
+            if (-not [string]::IsNullOrWhiteSpace($leaf) -and -not $leaf.StartsWith(".")) {
+                Add-DynamicExpansionTerm $terms $leaf "import" 65
+            }
+        }
+
+        foreach ($match in [regex]::Matches($raw, '(?i)\b(?:id|refid)\s*=\s*["'']([^"'']{2,100})["'']')) {
+            Add-DynamicExpansionTerm $terms $match.Groups[1].Value "xml-id" 82
+        }
+
+        foreach ($match in [regex]::Matches($raw, '\b[A-Z][A-Za-z0-9_]{3,90}\b')) {
+            $value = $match.Value
+            if ($value -match '(Service|ServiceImpl|Mapper|Repository|Dao|DAO|Controller|Util|Utils|Vo|VO|Dto|DTO|Request|Response|Provider|Store)$') {
+                Add-DynamicExpansionTerm $terms $value "symbol-ref" 58
+            }
+        }
+
+        foreach ($match in [regex]::Matches($raw, '\b([a-z][A-Za-z0-9_]{2,80})\s*\(')) {
+            $value = $match.Groups[1].Value
+            if ($value -match '^(get|set|is|toString|equals|hashCode|size|add|put|trim|substring|if|for|while|switch|catch|return|throw|this|super)$') { continue }
+            Add-DynamicExpansionTerm $terms $value "call-ref" 38
+        }
+    }
+
+    return @($terms.Values |
+        Where-Object {
+            $candidateKey = ([string]$_.value).ToLowerInvariant()
+            -not [string]::IsNullOrWhiteSpace($candidateKey) -and -not $existing.ContainsKey($candidateKey)
+        } |
+        Sort-Object @{ Expression = "weight"; Descending = $true }, @{ Expression = "value"; Descending = $false } |
+        Select-Object -First 36)
 }
 
 function Add-DynamicProjectReason($Reasons, [string]$Reason) {
@@ -1530,19 +1745,20 @@ function Get-DynamicProjectCandidateScore($File, [string]$Root, $Terms, [string]
         if ($matched -and -not $matchedTerms.Contains($termValue)) { $matchedTerms.Add($termValue) | Out-Null }
     }
 
-    if ($QuestionLower -match 'mapper|mybatis|sql' -and ($relLower -match 'mapper|mybatis|sql' -or $File.Extension.ToLowerInvariant() -eq ".xml")) {
+    $hasTermMatch = $score -gt 0
+    if ($hasTermMatch -and $QuestionLower -match 'mapper|mybatis|sql' -and ($relLower -match 'mapper|mybatis|sql' -or $File.Extension.ToLowerInvariant() -eq ".xml")) {
         $score += 25
         Add-DynamicProjectReason $reasons "stack:mapper/sql"
     }
-    if ($QuestionLower -match '\bvo\b|dto|request|response|validation|@valid|validated' -and ($relLower -match '(vo|dto|request|response)' -or $nameLower -match '(vo|dto|request|response)')) {
+    if ($hasTermMatch -and $QuestionLower -match '\bvo\b|dto|request|response|validation|@valid|validated' -and ($relLower -match '(vo|dto|request|response)' -or $nameLower -match '(vo|dto|request|response)')) {
         $score += 25
         Add-DynamicProjectReason $reasons "stack:vo/dto/validation"
     }
-    if ($QuestionLower -match 'controller|endpoint|route' -and $relLower -match 'controller|routes|pages|app') {
+    if ($hasTermMatch -and $QuestionLower -match 'controller|endpoint|route' -and $relLower -match 'controller|routes|pages|app') {
         $score += 20
         Add-DynamicProjectReason $reasons "stack:controller/route"
     }
-    if ($QuestionLower -match 'service|transaction|rollback' -and $relLower -match 'service') {
+    if ($hasTermMatch -and $QuestionLower -match 'service|transaction|rollback' -and $relLower -match 'service') {
         $score += 20
         Add-DynamicProjectReason $reasons "stack:service"
     }
@@ -1555,6 +1771,39 @@ function Get-DynamicProjectCandidateScore($File, [string]$Root, $Terms, [string]
         score = $score
         reasons = @($reasons)
         matchedTerms = @($matchedTerms)
+    }
+}
+
+function Add-DynamicProjectSelectedTermHits($Selected, $Terms, $MatchedTermSet) {
+    foreach ($item in @($Selected)) {
+        $pathLower = ([string]$item.path).ToLowerInvariant()
+        $nameLower = ([System.IO.Path]::GetFileName([string]$item.path)).ToLowerInvariant()
+        $baseLower = [System.IO.Path]::GetFileNameWithoutExtension($nameLower).ToLowerInvariant()
+        $contentLower = $null
+
+        foreach ($term in @($Terms)) {
+            $termValue = [string]$term.value
+            if ([string]::IsNullOrWhiteSpace($termValue)) { continue }
+
+            $termLower = $termValue.ToLowerInvariant()
+            $termBaseLower = [System.IO.Path]::GetFileNameWithoutExtension($termValue).ToLowerInvariant()
+            $matched = (
+                $nameLower -eq $termLower -or
+                $baseLower -eq $termLower -or
+                $baseLower -eq $termBaseLower -or
+                $pathLower.Contains($termLower) -or
+                $pathLower.Contains($termBaseLower)
+            )
+
+            if (-not $matched) {
+                if ($null -eq $contentLower) {
+                    $contentLower = (Read-ProjectFileText $item.fullName).ToLowerInvariant()
+                }
+                $matched = $contentLower.Contains($termLower)
+            }
+
+            if ($matched) { $MatchedTermSet[$termValue] = $true }
+        }
     }
 }
 
@@ -1587,14 +1836,53 @@ function Build-DynamicProjectContext([string]$Root, [string]$Question, [string]$
             } catch { }
         }
 
-        $selected = @($scored | Sort-Object @{ Expression = "score"; Descending = $true }, @{ Expression = "sizeBytes"; Descending = $false } | Select-Object -First $DynamicProjectContextMaxFiles)
+        $initialLimit = [Math]::Max(1, [Math]::Min($DynamicProjectContextMaxFiles, [int][Math]::Ceiling($DynamicProjectContextMaxFiles * 0.65)))
+        $selected = @($scored | Sort-Object @{ Expression = "score"; Descending = $true }, @{ Expression = "sizeBytes"; Descending = $false } | Select-Object -First $initialLimit)
+        $selectedPathSet = @{}
+        foreach ($item in $selected) {
+            $selectedPathSet[[string]$item.path] = $true
+            $item | Add-Member -NotePropertyName contextSource -NotePropertyValue "direct-question-match" -Force
+        }
+
+        $expansionTerms = @(Get-DynamicProjectExpansionTerms $selected $Root $terms)
+        $expanded = @()
+        if ($expansionTerms.Count -gt 0 -and $selected.Count -lt $DynamicProjectContextMaxFiles) {
+            $expandedScored = New-Object System.Collections.Generic.List[object]
+            foreach ($file in $files) {
+                try {
+                    $candidate = Get-DynamicProjectCandidateScore $file $Root $expansionTerms $questionLower
+                    if ($candidate.score -gt 0 -and -not $selectedPathSet.ContainsKey([string]$candidate.path)) {
+                        $candidate | Add-Member -NotePropertyName contextSource -NotePropertyValue "linked-reference-expansion" -Force
+                        $expandedScored.Add($candidate) | Out-Null
+                    }
+                } catch { }
+            }
+
+            $remainingSlots = $DynamicProjectContextMaxFiles - $selected.Count
+            $expanded = @($expandedScored | Sort-Object @{ Expression = "score"; Descending = $true }, @{ Expression = "sizeBytes"; Descending = $false } | Select-Object -First $remainingSlots)
+            if ($expanded.Count -gt 0) {
+                $combined = New-Object System.Collections.Generic.List[object]
+                foreach ($item in $selected) { $combined.Add($item) | Out-Null }
+                foreach ($item in $expanded) {
+                    $combined.Add($item) | Out-Null
+                    $selectedPathSet[[string]$item.path] = $true
+                }
+                $selected = @($combined.ToArray())
+            }
+        }
+
+        Add-DynamicProjectSelectedTermHits $selected $terms $matchedTermSet
+
         $missing = @($terms | Where-Object { -not $matchedTermSet.ContainsKey([string]$_.value) } | Select-Object -First 16 | ForEach-Object { $_.value })
         $termText = (($terms | Select-Object -First 24 | ForEach-Object { "$($_.value)[$($_.kind)]" }) -join ", ")
         if ([string]::IsNullOrWhiteSpace($termText)) { $termText = "(none)" }
+        $expansionTermText = (($expansionTerms | Select-Object -First 16 | ForEach-Object { "$($_.value)[$($_.kind)]" }) -join ", ")
+        if ([string]::IsNullOrWhiteSpace($expansionTermText)) { $expansionTermText = "(none)" }
 
         $parts = New-Object System.Collections.Generic.List[string]
-        $parts.Add("동적 프로젝트 컨텍스트(현재 질문 기준 best-effort 관련 파일 검색)") | Out-Null
+        $parts.Add("동적 프로젝트 컨텍스트(현재 질문 기준 best-effort 관련 파일 검색 + 연결 파일 확장)") | Out-Null
         $parts.Add("- 추출 검색어: $termText") | Out-Null
+        $parts.Add("- 연결 확장 검색어(import/XML id/클래스 참조 기반): $expansionTermText") | Out-Null
         if ($missing.Count -gt 0) {
             $parts.Add("- 프로젝트에서 찾지 못한 검색어: $($missing -join ', ')") | Out-Null
         }
@@ -1604,7 +1892,24 @@ function Build-DynamicProjectContext([string]$Root, [string]$Question, [string]$
             $parts.Add("- 관련 파일 후보:") | Out-Null
             foreach ($item in $selected) {
                 $reasonText = if ($item.reasons.Count -gt 0) { $item.reasons -join ", " } else { "term match" }
-                $parts.Add("  - [$($item.score)] $($item.path) :: $reasonText") | Out-Null
+                $sourceText = if (-not [string]::IsNullOrWhiteSpace([string]$item.contextSource)) { "source=$($item.contextSource); " } else { "" }
+                $parts.Add("  - [$($item.score)] $($item.path) :: $sourceText$reasonText") | Out-Null
+            }
+            $pivotCandidates = @($selected |
+                Where-Object { [string]$_.contextSource -eq "linked-reference-expansion" } |
+                Select-Object -First 5 |
+                ForEach-Object { $_.path })
+            if ($pivotCandidates.Count -gt 0) {
+                $parts.Add("- 다음 질문 확장 힌트: 현재 파일/메서드만 반복하지 말고, 가능하면 연결 확장 파일($($pivotCandidates -join ', ')) 중 하나를 주 대상으로 삼아 책임/데이터 계약/호출 흐름을 검증합니다.") | Out-Null
+            } elseif ($selected.Count -gt 1) {
+                $primaryPath = [string]$selected[0].path
+                $relatedCandidates = @($selected |
+                    Where-Object { [string]$_.path -ne $primaryPath } |
+                    Select-Object -First 5 |
+                    ForEach-Object { $_.path })
+                if ($relatedCandidates.Count -gt 0) {
+                    $parts.Add("- 다음 질문 확장 힌트: 현재 주 대상($primaryPath)만 반복하지 말고, 가능하면 함께 발견된 연결/보조 파일($($relatedCandidates -join ', ')) 중 하나를 주 대상으로 삼아 책임/데이터 계약/호출 흐름을 검증합니다.") | Out-Null
+                }
             }
         }
         $parts.Add("") | Out-Null
@@ -1612,11 +1917,12 @@ function Build-DynamicProjectContext([string]$Root, [string]$Question, [string]$
         $usedChars = ($parts -join "`n").Length
         foreach ($item in $selected) {
             try {
-                $excerpt = Get-TextPrefix (Read-ProjectFilePrefix $item.fullName $DynamicProjectContextMaxFileChars) $DynamicProjectContextMaxFileChars
+                $snippet = Get-FocusedProjectSnippet $item.fullName $item $terms $DynamicProjectContextMaxFileChars
+                $excerpt = Get-TextPrefix ([string]$snippet.Text) $DynamicProjectContextMaxFileChars
                 if ([string]::IsNullOrWhiteSpace($excerpt)) { continue }
                 $block = @"
 ### $($item.path)
-score=$($item.score); reasons=$($item.reasons -join ", "); matchedTerms=$($item.matchedTerms -join ", ")
+score=$($item.score); source=$($item.contextSource); excerptMode=$($snippet.Mode); reasons=$($item.reasons -join ", "); matchedTerms=$($item.matchedTerms -join ", "); focusTerms=$($snippet.FocusTerms -join ", ")
 ~~~text
 $excerpt
 ~~~
@@ -1633,10 +1939,12 @@ $excerpt
         return [PSCustomObject]@{
             text = (($parts -join "`n") + "`n")
             terms = @($terms | ForEach-Object { [ordered]@{ value = $_.value; kind = $_.kind; weight = $_.weight } })
+            expansionTerms = @($expansionTerms | ForEach-Object { [ordered]@{ value = $_.value; kind = $_.kind; weight = $_.weight } })
             files = @($selected | ForEach-Object {
                 [ordered]@{
                     path = $_.path
                     score = $_.score
+                    source = $_.contextSource
                     reasons = $_.reasons
                     matchedTerms = $_.matchedTerms
                 }
@@ -2394,7 +2702,8 @@ NEXT_QUESTION: 여기에 다음 루프에서 물어볼 구체적인 후속 질�
 9. 코드베이스 내용이 제공되지 않은 경우에는 추측을 확정처럼 말하지 말고, 확인해야 할 파일과 명령을 제시한다.
 10. 다음 질문은 현재 답변에서 가장 중요한 미해결 지점이나 더 깊게 파고들 가치가 있는 지점으로 만든다.
 11. NEXT_QUESTION에는 가능하면 다음 루프에서 확인해야 할 구체적인 파일명, 클래스명, 메서드명, Mapper id, SQL/설정 키를 포함한다.
-12. 너무 짧게 답하지 말고, 가능한 한 깊이 있는 분석, 체크리스트, 예시, 반례, 검증 방법을 포함한다.
+12. 동적 프로젝트 컨텍스트에 "다음 질문 확장 힌트" 또는 linked-reference-expansion 파일이 있으면, NEXT_QUESTION은 현재 파일/메서드만 반복하지 말고 그 연결 파일 중 하나를 주 대상으로 삼아 책임, 데이터 계약, 호출 흐름을 검증하도록 만든다.
+13. 너무 짧게 답하지 말고, 가능한 한 깊이 있는 분석, 체크리스트, 예시, 반례, 검증 방법을 포함한다.
 "@
 }
 
@@ -3091,7 +3400,7 @@ $settingsSummary = [ordered]@{
         maxFileChars = $DynamicProjectContextMaxFileChars
         maxTotalChars = $DynamicProjectContextMaxTotalChars
         lastSummaryJson = $dynamicProjectContextPath
-        note = "For project mode, each turn extracts file/class/method symbols from the current question and best-effort attaches matching project file excerpts. Missing files are skipped without failing the loop."
+        note = "For project mode, each turn extracts file/class/method symbols from the current question, attaches focused matching excerpts, expands connected files from imports/XML ids/class refs/calls, and skips missing files without failing the loop."
     }
     interval = [ordered]@{
         mode = $intervalPlan.Mode
@@ -3241,7 +3550,7 @@ $projectPromptSection
 요청:
 위 질문에 답변해줘.
 반드시 첫 번째 줄에는 NEXT_QUESTION: 으로 시작하는 다음 후속 질문을 한 줄로 작성하고, 그 뒤에 현재 질문에 대한 상세 답변을 작성해줘.
-다음 질문은 최근 질문 히스토리를 반복하지 말고, 현재 질문의 주 기술 트랙과 업무 도메인 흐름을 유지하면서 더 좁고 검증 가능한 연결 파일, 데이터 계약, 상태 흐름, 설계 쟁점으로 이어가줘. 예외/장애 가능성은 필요할 때만 다루고 그것만 반복하지 마.
+다음 질문은 최근 질문 히스토리를 반복하지 말고, 현재 질문의 주 기술 트랙과 업무 도메인 흐름을 유지하면서 더 좁고 검증 가능한 연결 파일, 데이터 계약, 상태 흐름, 설계 쟁점으로 이어가줘. 동적 컨텍스트에 연결 확장 파일이나 다음 질문 확장 힌트가 있으면 같은 파일/메서드를 반복하지 말고 그 연결 파일 중 하나로 파생해줘. 예외/장애 가능성은 필요할 때만 다루고 그것만 반복하지 마.
 "@
 
         Write-Host "`n[$($started.ToString('yyyy-MM-dd HH:mm:ss'))] RUN #$runCount QUESTION:" -ForegroundColor Green
