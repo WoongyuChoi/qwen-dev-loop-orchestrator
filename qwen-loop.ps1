@@ -1982,6 +1982,154 @@ $excerpt
     }
 }
 
+function Get-PromptContextExcerptPaths([string]$Text, [int]$Limit) {
+    $paths = New-Object System.Collections.Generic.List[string]
+    if ([string]::IsNullOrWhiteSpace($Text) -or $Limit -eq 0) { return @() }
+
+    $seen = @{}
+    foreach ($match in [regex]::Matches($Text, '(?m)^###\s+(.+?)\s*$')) {
+        $path = ([string]$match.Groups[1].Value).Trim()
+        if ([string]::IsNullOrWhiteSpace($path)) { continue }
+        if ($seen.ContainsKey($path)) { continue }
+        $seen[$path] = $true
+        $paths.Add($path) | Out-Null
+        if ($Limit -gt 0 -and $paths.Count -ge $Limit) { break }
+    }
+
+    return @($paths.ToArray())
+}
+
+function Write-PromptPathList([string]$Label, $Items, [int]$Limit) {
+    $list = @($Items | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    if ($list.Count -eq 0) { return }
+
+    Write-Host "$Label ($($list.Count)):" -ForegroundColor DarkCyan
+    $shown = 0
+    foreach ($item in $list) {
+        if ($Limit -gt 0 -and $shown -ge $Limit) { break }
+        Write-Host "  - $item"
+        $shown++
+    }
+    if ($Limit -gt 0 -and $list.Count -gt $shown) {
+        Write-Host "  - ... +$($list.Count - $shown) more" -ForegroundColor DarkGray
+    }
+}
+
+function Add-PromptSnippetSource($Rows, $Index, [string]$Path, [string]$Source) {
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+    if ([string]::IsNullOrWhiteSpace($Source)) { $Source = "snippet" }
+
+    if (-not $Index.ContainsKey($Path)) {
+        $sources = New-Object System.Collections.Generic.List[string]
+        $sources.Add($Source) | Out-Null
+        $row = [PSCustomObject]@{
+            path = $Path
+            sources = $sources
+        }
+        $Rows.Add($row) | Out-Null
+        $Index[$Path] = $row
+        return
+    }
+
+    $existing = $Index[$Path]
+    if (-not $existing.sources.Contains($Source)) {
+        $existing.sources.Add($Source) | Out-Null
+    }
+}
+
+function Get-DynamicPromptFileSourceMap($DynamicProjectContext) {
+    $map = @{}
+    if ($null -eq $DynamicProjectContext -or -not $DynamicProjectContext.files) { return $map }
+
+    foreach ($file in @($DynamicProjectContext.files)) {
+        $path = [string]$file.path
+        if ([string]::IsNullOrWhiteSpace($path) -or $map.ContainsKey($path)) { continue }
+
+        $source = [string]$file.source
+        if ($source -eq "linked-reference-expansion") {
+            $map[$path] = "dynamic linked"
+        } elseif ($source -eq "direct-question-match") {
+            $map[$path] = "dynamic direct"
+        } elseif (-not [string]::IsNullOrWhiteSpace($source)) {
+            $map[$path] = "dynamic $source"
+        } else {
+            $map[$path] = "dynamic"
+        }
+    }
+
+    return $map
+}
+
+function Write-ProjectPromptFileSummary($ProjectScan, $DynamicProjectContext) {
+    if ($null -eq $ProjectScan) { return }
+
+    $snippetRows = New-Object System.Collections.Generic.List[object]
+    $snippetIndex = @{}
+    $dynamicSourceMap = Get-DynamicPromptFileSourceMap $DynamicProjectContext
+
+    $dynamicExcerptPaths = @()
+    if ($DynamicProjectContext -and -not [string]::IsNullOrWhiteSpace([string]$DynamicProjectContext.text)) {
+        $dynamicExcerptPaths = @(Get-PromptContextExcerptPaths ([string]$DynamicProjectContext.text) -1)
+    }
+    foreach ($path in $dynamicExcerptPaths) {
+        $source = if ($dynamicSourceMap.ContainsKey($path)) { [string]$dynamicSourceMap[$path] } else { "dynamic" }
+        Add-PromptSnippetSource $snippetRows $snippetIndex $path $source
+    }
+
+    $baseExcerptPaths = @(Get-PromptContextExcerptPaths ([string]$ProjectScan.promptContext) -1)
+    foreach ($path in $baseExcerptPaths) {
+        Add-PromptSnippetSource $snippetRows $snippetIndex $path "base"
+    }
+
+    Write-Host "`nPROMPT SNIPPETS SENT:" -ForegroundColor DarkCyan
+    if ($snippetRows.Count -eq 0) {
+        Write-Host "  - none" -ForegroundColor DarkGray
+    } else {
+        $shown = 0
+        $limit = 24
+        foreach ($row in $snippetRows) {
+            if ($shown -ge $limit) { break }
+            Write-Host "  - $($row.path) [$($row.sources -join ' + ')]"
+            $shown++
+        }
+        if ($snippetRows.Count -gt $shown) {
+            Write-Host "  - ... +$($snippetRows.Count - $shown) more" -ForegroundColor DarkGray
+        }
+    }
+
+    $referencedRows = New-Object System.Collections.Generic.List[string]
+    $referencedSeen = @{}
+    $addReferencedOnly = {
+        param([string]$Path, [string]$Label)
+        if ([string]::IsNullOrWhiteSpace($Path)) { return }
+        if ($snippetIndex.ContainsKey($Path) -or $referencedSeen.ContainsKey($Path)) { return }
+        $referencedSeen[$Path] = $true
+        if ([string]::IsNullOrWhiteSpace($Label)) {
+            $referencedRows.Add($Path) | Out-Null
+        } else {
+            $referencedRows.Add("$Path [$Label]") | Out-Null
+        }
+    }
+
+    $primaryLabel = if (-not [string]::IsNullOrWhiteSpace([string]$ProjectScan.primaryQuestionCandidateGroup)) { "primary; $($ProjectScan.primaryQuestionCandidateGroup)" } else { "primary" }
+    & $addReferencedOnly ([string]$ProjectScan.primaryQuestionCandidateFile) $primaryLabel
+    if ($ProjectScan.questionCandidateDetails) {
+        foreach ($candidate in @($ProjectScan.questionCandidateDetails)) {
+            $label = if (-not [string]::IsNullOrWhiteSpace([string]$candidate.questionGroupLabel)) { "candidate; $($candidate.questionGroupLabel)" } else { "candidate" }
+            & $addReferencedOnly ([string]$candidate.path) $label
+        }
+    } elseif ($ProjectScan.questionCandidateFiles) {
+        foreach ($path in @($ProjectScan.questionCandidateFiles)) {
+            & $addReferencedOnly ([string]$path) "candidate"
+        }
+    }
+
+    Write-PromptPathList "REFERENCED ONLY (no snippet block)" $referencedRows 10
+    if ($DynamicProjectContext -and -not [string]::IsNullOrWhiteSpace([string]$DynamicProjectContext.error)) {
+        Write-Host "Dynamic snippet lookup warning: $($DynamicProjectContext.error)" -ForegroundColor DarkGray
+    }
+}
+
 function Select-ProjectQuestionCandidateSet($Items, [int]$Count, [int]$PoolSize, $ExistingPaths) {
     $items = @($Items | Where-Object { $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.path) })
     if ($items.Count -eq 0 -or $Count -lt 1) { return @() }
@@ -3537,6 +3685,7 @@ if ($DryRun) {
     Write-Host "- $(Join-Path $WorkDir 'dry_run_request_headers.json')"
     Write-Host "- $(Join-Path $WorkDir 'dry_run_request_body.json')"
     if ($projectScan) { Write-Host "- $dynamicProjectContextPath" }
+    Write-ProjectPromptFileSummary $projectScan $dryRunDynamicProjectContext
     Write-Host "Endpoint$(if ($EndpointFallbacks) { ' candidates' } else { '' }):" -ForegroundColor Yellow
     Get-EndpointCandidates $providerInfo.BaseUrl | ForEach-Object { Write-Host "- $_" }
     exit 0
@@ -3611,6 +3760,7 @@ $projectPromptSection
 
         Write-Host "`n[$($started.ToString('yyyy-MM-dd HH:mm:ss'))] RUN #$runCount QUESTION:" -ForegroundColor Green
         Write-Host $question
+        Write-ProjectPromptFileSummary $projectScan $dynamicProjectContext
 
         $requestAt = Get-Date
         $chatResult = Invoke-QwenChat $providerInfo $settings $networkIdentity $systemPrompt $userPrompt
