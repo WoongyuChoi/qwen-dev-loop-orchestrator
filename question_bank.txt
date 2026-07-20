@@ -1,28 +1,29 @@
-# 첫 루프나 복구 불가능한 상태에서 사용할 질문 seed 모음입니다.
+# 첫 루프나 복구 불가능한 상태에서 업무 도메인 탐색을 시작할 질문 seed 모음입니다.
 # 형식: [track] 질문
-# Java/Spring, React/TypeScript를 한 질문에 억지로 묶지 말고, 필요한 경우 API contract 같은 경계 트랙을 별도로 둡니다.
+# 기술 구조 자체보다 업무 목적, 사용자/배치 트리거, 업무 용어와 상태, 정상 데이터 lineage, downstream 소비를 코드와 주석의 증거로 복원합니다.
+# Java/Spring, React/TypeScript를 한 질문에 억지로 묶지 않고 API contract처럼 실제 업무 데이터가 경계를 넘는 경우에만 함께 추적합니다.
 
-[java-spring] Spring Boot 서비스 계층에서 트랜잭션 경계가 컨트롤러, 서비스, MyBatis mapper 사이에 흩어져 있을 때 어떤 실패 모드가 생기는지, 재현 가능한 테스트 관점에서 분석해줘.
-[java-spring] Spring Boot 애플리케이션에서 도메인 규칙이 service, mapper XML, controller validation에 분산되어 있을 때 응집도를 회복하기 위한 리팩토링 순서를 설계해줘.
-[java-spring] MyBatis XML 쿼리가 화면 요구사항에 맞춰 계속 커지는 상황에서 N+1, 동적 조건 폭발, resultMap 결합도를 어떻게 진단하고 줄일 수 있는지 분석해줘.
-[java-spring] Spring MVC API에서 예외 처리, 오류 코드, 로깅 correlation id가 일관되지 않을 때 운영 장애 분석 비용이 어떻게 증가하는지와 개선 전략을 설명해줘.
-[java-concurrency] Java 서버에서 캐시, static 상태, 트랜잭션 격리 수준이 함께 얽힐 때 동시성 버그를 어떻게 모델링하고 테스트해야 하는지 분석해줘.
-[java-testing] Spring Boot 통합 테스트가 느리고 취약할 때 slice test, contract test, testcontainer, fixture 전략을 어떤 기준으로 나눌지 설계해줘.
+[java-spring] Java/Spring 코드에서 실제 업무 기능 하나를 골라 사용자 요청 또는 배치 트리거가 Controller·Job·Tasklet에서 시작해 Service와 Mapper를 거쳐 어떤 업무 결과를 만드는지 추적해줘. Mapper XML의 statement·테이블·컬럼·주석과 VO/DTO 필드·주석을 근거로 업무 용어, 정상 상태 흐름, 원천-대상 데이터 lineage와 downstream 소비처를 복원하고 기술 리스크는 업무 영향이 있을 때 마지막에만 점검해줘.
+[java-spring] Service나 Tasklet의 대표 메서드 하나를 출발점으로 호출되는 Mapper id와 XML SQL, parameter/result VO를 연결하여 이 프로그램이 누구를 위해 어떤 업무 판단·복제·집계·확정 작업을 수행하는지 설명해줘. 정상 처리 순서와 각 단계의 입력·상태 변화·저장 결과를 먼저 밝히고 트랜잭션이나 예외 처리는 그 업무 결과를 깨뜨릴 수 있는 경우에만 마지막 리스크로 다뤄줘.
+[java-spring] MyBatis Mapper XML 하나를 골라 namespace와 statement id, SQL/XML 주석, 읽고 쓰는 테이블·컬럼, resultMap의 property-column 관계를 관련 Mapper interface와 VO/DTO 필드·주석에 연결해줘. 이를 통해 코드명이 아닌 실제 업무 용어, 조회·등록·변경의 목적, 원천-대상 데이터 lineage와 결과를 소비하는 화면·API·후속 배치를 복원하고 쿼리 기술 이슈는 마지막에만 점검해줘.
+[java-spring] Controller validation, VO/DTO annotation과 필드 주석, Service 조건문, Mapper XML의 WHERE·UPDATE 컬럼에 흩어진 업무 상태와 전이 규칙을 찾아줘. 누가 어떤 입력으로 상태를 바꾸며 정상적으로 다음 어떤 업무가 가능해지는지 근거별로 설명하고, 확인된 사실·추론·미확인 용어를 구분한 뒤 예외·보안·트랜잭션 문제는 업무 상태가 잘못될 위험으로 마지막에만 다뤄줘.
+[java-concurrency] 동일 데이터에 동시에 접근하는 실제 업무 명령(예: 승인, 마감, 월별 복제, 순번 발급)을 코드에서 먼저 식별하고, 요청/배치 트리거와 VO 필드, Service 판단, Mapper XML의 대상 테이블·상태 컬럼을 연결해 정상 업무 결과와 충돌 시 달라지는 결과를 비교해줘. 캐시·static 상태·격리 수준은 그 업무 결과를 훼손하는 근거가 있을 때 마지막 리스크로 분석해줘.
+[java-testing] Controller·Job·Tasklet, Service, Mapper XML, VO/DTO 주석에서 실제 업무 시나리오 하나를 복원한 뒤, 정상 입력과 기대 상태 전이·DB 저장·downstream 소비를 검증하는 인수 시나리오를 만들어줘. 불명확한 업무 용어와 데이터 계약을 먼저 드러내고 slice test·contract test·fixture 같은 기술 선택은 해당 업무 증거를 가장 잘 검증하는 마지막 수단으로 제안해줘.
 
-[react-typescript] React 컴포넌트가 서버 DTO 모양을 그대로 따라가면서 상태와 렌더링 책임이 뒤섞일 때 어떤 유지보수 문제가 생기는지 TypeScript 타입 설계 관점에서 분석해줘.
-[react-typescript] React 화면에서 form state, server state, derived state가 섞여 있을 때 불변식이 깨지는 경로를 어떻게 찾고 분리할지 설계해줘.
-[react-rendering] React 목록/트리 화면에서 불필요한 재렌더링이 누적될 때 profiler 없이도 의심 지점을 좁히는 방법과 memoization의 부작용을 분석해줘.
-[react-state] React 앱에서 Zustand나 Context 같은 전역 상태가 화면 편의를 위해 커질 때 domain state와 UI state를 분리하는 기준을 제안해줘.
-[react-testing] React Testing Library 테스트가 DOM 문구에 과도하게 의존할 때 리팩토링 내성을 높이는 테스트 설계 원칙을 설명해줘.
-[react-accessibility] 업무용 React 화면에서 키보드 접근성, focus trap, aria 상태가 누락될 때 실제 사용자 흐름과 테스트 자동화에 어떤 문제가 생기는지 분석해줘.
+[react-typescript] React 화면 하나를 골라 화면명·버튼·컬럼·도움말 같은 사용자 언어와 TypeScript 타입, 요청/응답 DTO, API 경로를 연결해 사용자가 어떤 업무를 시작하고 어떤 결과를 확인하는지 복원해줘. 서버 코드가 함께 보이면 VO/DTO 필드와 Mapper XML의 테이블·컬럼·주석까지 추적하여 정상 데이터 lineage와 상태 표시 의미를 설명하고 타입 설계 문제는 마지막 리스크로만 다뤄줘.
+[react-typescript] 입력 폼 화면에서 사용자가 어떤 업무 결정을 등록·변경·승인하는지 라벨, validation 문구, form field, API payload와 응답 상태를 근거로 복원해줘. 가능한 경우 백엔드 VO/DTO 및 Mapper 컬럼까지 이어 정상 입력이 저장되고 다시 조회되는 흐름과 downstream 소비를 설명한 뒤 state 분리 같은 기술 개선은 업무 의미가 흐려지는 부분에 한해 마지막에 제안해줘.
+[react-rendering] 목록·트리·대시보드 화면이 어떤 사용자 역할의 어떤 판단 업무를 지원하는지 화면 문구, 필터, 정렬, 행 동작, API 응답 필드에서 먼저 복원해줘. 조회 조건부터 표시 데이터와 후속 사용자 행동까지 정상 흐름을 설명하고 불필요한 렌더링이나 memoization은 업무 화면의 응답성과 정확성에 영향을 주는 경우에만 마지막 리스크로 분석해줘.
+[react-state] Zustand나 Context 상태를 사용하는 화면에서 각 값이 실제 업무 상태인지 일시적인 UI 상태인지 사용자 행동, API 요청·응답, 저장소 필드명을 근거로 분류해줘. 업무 상태의 생성·변경·초기화와 다음 화면/업무에서의 소비를 정상 흐름으로 설명하고 전역 상태 구조 문제는 업무 상태가 오염되거나 잘못 재사용될 위험으로 마지막에만 다뤄줘.
+[react-testing] React 화면의 문구·버튼·입력·결과 표와 API 계약에서 사용자의 실제 업무 시나리오를 먼저 복원하고, 정상적으로 업무를 시작해 결과를 확인하는 인수 테스트와 핵심 상태 전이를 작성해줘. DOM 구현 세부보다 업무 용어와 사용자 결과를 기준으로 삼고 테스트 도구·mock 구조는 이를 안정적으로 검증하는 마지막 수단으로 설명해줘.
+[react-accessibility] 업무용 React 화면에서 키보드나 보조기술 사용자가 수행해야 하는 실제 조회·입력·승인·다운로드 흐름을 화면 요소와 상태 변화 근거로 복원해줘. 어느 단계에서 업무 완료나 결과 확인이 막히는지 먼저 설명하고 focus·aria 같은 기술 항목은 사용자 업무 결과에 미치는 영향과 함께 마지막 리스크로 정리해줘.
 
-[api-contract] 백엔드 API 응답 스키마가 화면별 편의에 맞춰 흔들릴 때 contract test와 versioning으로 변경 위험을 어떻게 관리할지 분석해줘.
-[api-contract] pagination, filtering, sorting API가 화면마다 다르게 구현될 때 서버/클라이언트 양쪽의 복잡도가 어떻게 증가하는지 contract-first 관점에서 설계해줘.
+[api-contract] 화면 라벨과 사용자 동작에서 시작해 API request/response DTO, 백엔드 VO, Service, Mapper XML의 property-column·테이블 주석까지 추적하여 하나의 업무 데이터 계약을 복원해줘. 같은 업무 용어가 경계마다 어떻게 이름과 상태값을 바꾸는지, 정상 데이터가 어디서 생성되어 누가 소비하는지 설명하고 versioning·contract test는 업무 의미가 깨질 위험을 막는 마지막 검증 수단으로 다뤄줘.
+[api-contract] pagination·filtering·sorting을 사용하는 실제 목록 화면에서 사용자가 무엇을 찾고 어떤 후속 업무를 수행하는지 먼저 식별해줘. 화면 조건, API parameter, DTO/VO 필드, Mapper XML WHERE·ORDER BY·테이블·컬럼 주석을 연결해 정상 조회 lineage와 결과 소비를 복원하고 성능·계약 일관성은 업무 누락이나 오판을 만들 수 있는 경우에만 마지막에 점검해줘.
 
-[database] 운영 DB 테이블의 공통 컬럼, 이력 관리, soft delete 정책이 일관되지 않을 때 데이터 정합성과 감사 추적에 어떤 위험이 생기는지 분석해줘.
-[database] 복잡한 조회 화면에서 DB index, where 조건 선택도, 정렬 조건, pagination 방식이 충돌할 때 병목을 체계적으로 찾는 절차를 설명해줘.
+[database] Mapper XML과 SQL의 테이블·컬럼·주석, resultMap, VO/DTO 필드·주석을 연결하여 핵심 업무 엔터티와 코드·상태·기준일·이력 컬럼의 실제 의미를 데이터 사전으로 복원해줘. 어떤 트리거가 데이터를 생성·변경하고 어느 화면·API·후속 배치가 소비하는지 정상 lineage를 설명한 뒤 정합성·감사 위험은 업무 결과 영향 기준으로 마지막에 점검해줘.
+[database] 복잡한 조회 SQL 하나를 골라 화면 또는 배치가 답하려는 업무 질문이 무엇인지, 입력 조건과 테이블 JOIN·계산 컬럼·코드값·정렬이 어떤 업무 의미를 만드는지 주석과 VO/DTO 필드에서 복원해줘. 원천 데이터부터 결과 화면·리포트·후속 처리까지 lineage를 설명하고 index·pagination 같은 성능 이슈는 사용자의 업무 판단에 영향을 줄 때 마지막 리스크로 다뤄줘.
 
-[security] 사내 업무 시스템에서 인증 주체, 권한 정책, 화면 버튼 제어, API 권한 검증이 분리되어 있을 때 우회 가능성을 어떻게 검증할지 분석해줘.
-[observability] 장애가 났을 때 프론트 이벤트, API 요청, DB 쿼리, 배치 작업 로그가 이어지지 않는다면 어떤 correlation 체계를 먼저 설계해야 하는지 설명해줘.
-[architecture] 레거시 모듈을 한 번에 갈아엎지 못하는 상황에서 strangler pattern, anti-corruption layer, feature toggle을 어떤 기준으로 적용할지 분석해줘.
-[performance] 응답 시간이 느린 업무 화면에서 브라우저 렌더링, API latency, DB query, serialization 중 병목을 분해하는 실험 설계를 제안해줘.
+[security] 화면·API·배치에서 실제 사용자/운영자 역할이 수행하는 업무 행동과 허용된 상태 전이를 먼저 복원해줘. 버튼 조건, 요청 DTO, Service 판단, Mapper XML의 대상 테이블·권한/상태 컬럼을 근거로 누가 어떤 데이터를 조회·변경하며 결과가 어디서 소비되는지 설명하고 인증·권한 우회는 그 업무 권한을 침해하는 마지막 리스크 항목으로 검증해줘.
+[observability] 프론트 이벤트, API, Service, Mapper SQL, 배치 로그 중 하나의 실제 업무 거래를 골라 사용자의 시작 행동 또는 배치 트리거부터 DB 상태 변화와 downstream 결과까지 정상 lineage를 복원해줘. 업무 식별자·기준일·상태 코드가 각 계층에서 어떻게 이어지는지 먼저 설명하고 correlation과 장애 추적 설계는 누락된 업무 결과를 찾기 위한 마지막 보완책으로 제안해줘.
+[architecture] 레거시 모듈과 신규 모듈 사이에서 이동 중인 실제 업무 기능 하나를 골라 각 모듈의 사용자/배치 트리거, 업무 규칙, VO/DTO 계약, Mapper 테이블 소유권과 downstream 소비를 근거로 현재 업무 경계를 복원해줘. 무엇을 보존해야 하는지 먼저 밝히고 strangler pattern·anti-corruption layer·feature toggle은 업무 의미와 데이터 lineage를 지키는 마지막 구현 수단으로 평가해줘.
+[performance] 응답이 느린 화면이나 배치가 어떤 사용자 판단·마감·정산·보고 업무를 언제까지 완료해야 하는지 먼저 코드와 주석에서 복원해줘. 트리거, 입력 조건, API/Service, Mapper XML의 테이블·컬럼, VO/DTO 결과와 downstream 소비까지 정상 lineage를 설명한 뒤 브라우저·API·DB 병목은 업무 기한이나 결과 완전성에 영향을 주는 마지막 리스크로만 분석해줘.

@@ -1,0 +1,13 @@
+<mapper namespace="example.ord.Ord1001Mapper">
+  <!-- 출고 기준일의 기존 확정 자료를 삭제한다. -->
+  <delete id="deleteShipmentBase" parameterType="string">
+    DELETE FROM TB_SHIPMENT_BASE WHERE BUSINESS_DATE = #{businessDate}
+  </delete>
+  <!-- 승인된 주문을 출고 준비 대상으로 확정한다. -->
+  <insert id="insertShipmentBase" parameterType="string">
+    INSERT INTO TB_SHIPMENT_BASE (ORDER_NO, BUSINESS_DATE, SHIPMENT_STATUS)
+    SELECT ORDER_NO, #{businessDate}, 'READY'
+      FROM TB_ORDER
+     WHERE APPROVAL_STATUS = 'APPROVED'
+  </insert>
+</mapper>

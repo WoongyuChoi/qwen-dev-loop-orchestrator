@@ -12,22 +12,29 @@
     [int]$IntervalSeconds = 600,
     [int]$MinIntervalMinutes = 8,
     [int]$MaxIntervalMinutes = 15,
-    [int]$MaxTokens = 8192,
+    [int]$MaxTokens = 32768,
     [double]$Temperature = 0.35,
     [int]$TimeoutSec = 120,
-    [int]$MaxContextChars = 30000,
+    [int]$MaxContextChars = 16000,
     [int]$ProjectScanMaxFiles = 60,
-    [int]$ProjectScanMaxFileChars = 2500,
-    [int]$ProjectScanMaxTotalChars = 30000,
-    [int]$DynamicProjectContextMaxFiles = 8,
-    [int]$DynamicProjectContextMaxFileChars = 2500,
-    [int]$DynamicProjectContextMaxTotalChars = 18000,
-    [int]$LastTurnChars = 12000,
+    [int]$ProjectScanMaxFileChars = 5000,
+    [int]$ProjectScanMaxTotalChars = 14000,
+    [int]$DynamicProjectContextMaxFiles = 10,
+    [int]$DynamicProjectContextMaxFileChars = 6000,
+    [int]$DynamicProjectContextMaxTotalChars = 42000,
+    [switch]$NewProjectSession,
+    [int]$ProjectTurnsPerCycle = 5,
+    [int]$ProjectSessionKeepCount = 12,
+    [int]$ProjectSessionKeepDays = 30,
+    [int]$ProjectSessionMaxTotalMB = 750,
+    [int]$ProjectTargetOutputTokens = 3500,
+    [int]$ProjectTargetAnswerChars = 8000,
+    [int]$LastTurnChars = 6000,
     [int]$CountdownRefreshSeconds = 1,
-    [int]$AnswerPreviewLines = 4,
-    [int]$AnswerPreviewChars = 1000,
-    [int]$TokenLowThreshold = 1000,
-    [int]$TokenRichThreshold = 4000,
+    [int]$AnswerPreviewLines = 10,
+    [int]$AnswerPreviewChars = 2500,
+    [int]$TokenLowThreshold = 2500,
+    [int]$TokenRichThreshold = 6000,
     [int]$MaxWorkDirMB = 100,
     [int]$MaxTranscriptMB = 25,
     [int]$MaxErrorLogMB = 5,
@@ -100,6 +107,72 @@ function Get-DirectorySizeBytes([string]$Path) {
     return $total
 }
 
+function Test-ManagedProjectSubtreePath([string]$Root, [string]$Path) {
+    try {
+        $defaultRoot = Get-NormalizedFullPath (Join-Path $PSScriptRoot "qwen-loop-data")
+        $actualRoot = Get-NormalizedFullPath $Root
+        if (-not $actualRoot.Equals($defaultRoot, [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
+        $relative = Get-RelativeWorkPath $actualRoot $Path
+        return ($relative -match '^project([\\/]|$)')
+    } catch {
+        return $true
+    }
+}
+
+function Get-ManagedWorkDirFiles([string]$Root) {
+    if (!(Test-Path -LiteralPath $Root -PathType Container)) { return @() }
+    $files = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+    $topItems = @(Get-ChildItem -LiteralPath $Root -Force -ErrorAction SilentlyContinue)
+    foreach ($item in $topItems) {
+        if (-not $item.PSIsContainer) { $files.Add([System.IO.FileInfo]$item) | Out-Null; continue }
+        if (Test-ManagedProjectSubtreePath $Root $item.FullName) { continue }
+        foreach ($file in @(Get-ChildItem -LiteralPath $item.FullName -Recurse -File -Force -ErrorAction SilentlyContinue)) {
+            $files.Add($file) | Out-Null
+        }
+    }
+    return @($files.ToArray())
+}
+
+function Get-ManagedWorkDirDirectories([string]$Root) {
+    if (!(Test-Path -LiteralPath $Root -PathType Container)) { return @() }
+    $dirs = New-Object System.Collections.Generic.List[System.IO.DirectoryInfo]
+    foreach ($dir in @(Get-ChildItem -LiteralPath $Root -Directory -Force -ErrorAction SilentlyContinue)) {
+        if (Test-ManagedProjectSubtreePath $Root $dir.FullName) { continue }
+        $dirs.Add($dir) | Out-Null
+        foreach ($nested in @(Get-ChildItem -LiteralPath $dir.FullName -Recurse -Directory -Force -ErrorAction SilentlyContinue)) {
+            $dirs.Add($nested) | Out-Null
+        }
+    }
+    return @($dirs.ToArray())
+}
+
+function Test-ManagedWorkDirTreeSafe([string]$Root) {
+    try {
+        $rootItem = Get-Item -LiteralPath $Root -Force -ErrorAction Stop
+        if (($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
+        $queue = New-Object System.Collections.Generic.Queue[System.IO.DirectoryInfo]
+        $queue.Enqueue([System.IO.DirectoryInfo]$rootItem)
+        while ($queue.Count -gt 0) {
+            $dir = $queue.Dequeue()
+            foreach ($child in @(Get-ChildItem -LiteralPath $dir.FullName -Force -ErrorAction Stop)) {
+                if ($dir.FullName -eq $rootItem.FullName -and $child.PSIsContainer -and (Test-ManagedProjectSubtreePath $Root $child.FullName)) { continue }
+                if (($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
+                if ($child.PSIsContainer) { $queue.Enqueue([System.IO.DirectoryInfo]$child) }
+            }
+        }
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Get-ManagedWorkDirSizeBytes([string]$Root) {
+    if (!(Test-Path -LiteralPath $Root -PathType Container)) { return 0 }
+    $total = [int64]0
+    Get-ManagedWorkDirFiles $Root | ForEach-Object { $total += [int64]$_.Length }
+    return $total
+}
+
 function Get-RelativeWorkPath([string]$Root, [string]$Path) {
     try {
         $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd([char[]]@('\', '/'))
@@ -130,9 +203,8 @@ function Assert-CleanupConfig() {
 }
 
 function Test-ProtectedWorkFile([string]$Root, [string]$FileFullName) {
+    if (Test-ManagedProjectSubtreePath $Root $FileFullName) { return $true }
     $relative = Get-RelativeWorkPath $Root $FileFullName
-    if ($relative -match '[\\/]') { return $false }
-
     $name = [System.IO.Path]::GetFileName($relative)
     $protected = @(
         "next_question.txt",
@@ -149,7 +221,17 @@ function Test-ProtectedWorkFile([string]$Root, [string]$FileFullName) {
         "last_request_headers.json",
         "last_request_headers_sensitive.json",
         "last_request_body.json",
-        "last_response_status.json"
+        "last_response_status.json",
+        "last_dynamic_project_context.json",
+        "exploration_state.json",
+        "exploration_history.jsonl",
+        "cycle_history.jsonl",
+        "cycle_evidence.md",
+        "session_identity.json",
+        ".qwen-loop-workdir.json",
+        ".active.lock",
+        ".exploration.lock",
+        ".retention.lock"
     )
     return ($protected -contains $name)
 }
@@ -283,7 +365,7 @@ function Remove-StaleCleanupFiles([string]$Root, [int]$KeepDays, $Actions) {
     if (!(Test-Path -LiteralPath $Root -PathType Container)) { return }
 
     $cutoff = (Get-Date).AddDays(-$KeepDays)
-    $files = @(Get-ChildItem -LiteralPath $Root -Recurse -File -Force -ErrorAction SilentlyContinue)
+    $files = @(Get-ManagedWorkDirFiles $Root)
     foreach ($file in $files) {
         if ($file.LastWriteTime -ge $cutoff) { continue }
         if (-not (Test-StaleCleanupCandidate $Root $file)) { continue }
@@ -302,8 +384,9 @@ function Remove-StaleCleanupFiles([string]$Root, [int]$KeepDays, $Actions) {
 function Remove-EmptyWorkDirectories([string]$Root) {
     if (!(Test-Path -LiteralPath $Root -PathType Container)) { return }
 
-    $dirs = @(Get-ChildItem -LiteralPath $Root -Recurse -Directory -Force -ErrorAction SilentlyContinue | Sort-Object { $_.FullName.Length } -Descending)
+    $dirs = @(Get-ManagedWorkDirDirectories $Root | Sort-Object { $_.FullName.Length } -Descending)
     foreach ($dir in $dirs) {
+        if (Test-ManagedProjectSubtreePath $Root $dir.FullName) { continue }
         try {
             $children = @(Get-ChildItem -LiteralPath $dir.FullName -Force -ErrorAction SilentlyContinue)
             if ($children.Count -eq 0) { Remove-Item -LiteralPath $dir.FullName -Force }
@@ -316,10 +399,10 @@ function Enforce-WorkDirSize([string]$Root, [int]$MaxMB, $Actions) {
     if (!(Test-Path -LiteralPath $Root -PathType Container)) { return "" }
 
     $maxBytes = [int64]$MaxMB * 1MB
-    $total = Get-DirectorySizeBytes $Root
+    $total = Get-ManagedWorkDirSizeBytes $Root
     if ($total -le $maxBytes) { return "" }
 
-    $candidates = @(Get-ChildItem -LiteralPath $Root -Recurse -File -Force -ErrorAction SilentlyContinue |
+    $candidates = @(Get-ManagedWorkDirFiles $Root |
         Where-Object { -not (Test-ProtectedWorkFile $Root $_.FullName) } |
         Sort-Object LastWriteTimeUtc, Length)
 
@@ -344,18 +427,23 @@ function Enforce-WorkDirSize([string]$Root, [int]$MaxMB, $Actions) {
 
 function Invoke-WorkDirCleanup([string]$Root, [string]$TranscriptPath, [string]$JsonlPath, [string]$ErrorLogPath) {
     $actions = New-Object System.Collections.Generic.List[object]
-    $beforeBytes = Get-DirectorySizeBytes $Root
+    $beforeBytes = [int64]0
     $warning = ""
 
-    if ($NoAutoCleanup) {
+    $ownershipValid = Test-QwenLoopWorkDirOwnership $Root
+    $treeSafe = if ($ownershipValid -and -not $DryRun -and -not $NoAutoCleanup) { Test-ManagedWorkDirTreeSafe $Root } else { $true }
+    if ($NoAutoCleanup -or $DryRun -or -not $ownershipValid -or -not $treeSafe) {
+        $disabledReason = if ($NoAutoCleanup) { "disabled by -NoAutoCleanup" } elseif ($DryRun) { "disabled during DryRun" } elseif (-not $ownershipValid) { "disabled because WorkDir ownership marker is missing or invalid" } else { "disabled because WorkDir contains a junction/symlink/reparse point" }
         return [PSCustomObject]@{
             enabled = $false
             beforeBytes = $beforeBytes
             afterBytes = $beforeBytes
             actions = [object[]]@()
-            warning = ""
+            warning = $disabledReason
         }
     }
+
+    $beforeBytes = Get-ManagedWorkDirSizeBytes $Root
 
     Compact-TranscriptMarkdown $TranscriptPath $MaxTranscriptMB $CleanupKeepTurns $actions $Root
     Compact-TranscriptJsonl $JsonlPath $MaxTranscriptMB $CleanupKeepTurns $actions $Root
@@ -364,7 +452,7 @@ function Invoke-WorkDirCleanup([string]$Root, [string]$TranscriptPath, [string]$
     $warning = Enforce-WorkDirSize $Root $MaxWorkDirMB $actions
     Remove-EmptyWorkDirectories $Root
 
-    $afterBytes = Get-DirectorySizeBytes $Root
+    $afterBytes = Get-ManagedWorkDirSizeBytes $Root
     return [PSCustomObject]@{
         enabled = $true
         beforeBytes = $beforeBytes
@@ -376,6 +464,8 @@ function Invoke-WorkDirCleanup([string]$Root, [string]$TranscriptPath, [string]$
 
 function Get-CleanupPolicyText() {
     if ($NoAutoCleanup) { return "disabled" }
+    if ($DryRun) { return "disabled during DryRun" }
+    if ($script:workDirCleanupOwned -eq $false) { return "disabled for unowned custom WorkDir" }
 
     $folder = if ($MaxWorkDirMB -gt 0) { "folder <= $MaxWorkDirMB MB" } else { "folder cap off" }
     $transcript = if ($MaxTranscriptMB -gt 0) { "transcript <= $MaxTranscriptMB MB" } else { "transcript compact off" }
@@ -388,7 +478,10 @@ function Write-WorkDirCleanupStatus($Summary, [bool]$Always) {
     if ($null -eq $Summary) { return }
 
     if (-not $Summary.enabled) {
-        if ($Always) { Write-Host "Cleanup     : disabled" -ForegroundColor DarkGray }
+        if ($Always) {
+            $reason = if ([string]::IsNullOrWhiteSpace([string]$Summary.warning)) { "disabled" } else { [string]$Summary.warning }
+            Write-Host "Cleanup     : $reason" -ForegroundColor DarkGray
+        }
         return
     }
 
@@ -413,6 +506,363 @@ function Write-WorkDirCleanupStatus($Summary, [bool]$Always) {
     }
 }
 
+function Get-NormalizedFullPath([string]$Path) {
+    $full = [System.IO.Path]::GetFullPath($Path)
+    $trimmed = $full.TrimEnd([char[]]@('\', '/'))
+    $root = [System.IO.Path]::GetPathRoot($full)
+    if (-not [string]::IsNullOrWhiteSpace($root)) {
+        $trimmedRoot = $root.TrimEnd([char[]]@('\', '/'))
+        if ($trimmed.Equals($trimmedRoot, [System.StringComparison]::OrdinalIgnoreCase)) { return $root }
+    }
+    return $trimmed
+}
+
+function Test-PathInsideRoot([string]$Root, [string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Root) -or [string]::IsNullOrWhiteSpace($Path)) { return $false }
+    $rootFull = (Get-NormalizedFullPath $Root).TrimEnd([char[]]@('\', '/'))
+    $pathFull = (Get-NormalizedFullPath $Path).TrimEnd([char[]]@('\', '/'))
+    if ($pathFull.Equals($rootFull, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    return $pathFull.StartsWith(($rootFull + [System.IO.Path]::DirectorySeparatorChar), [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Test-PathHasReparsePointInExistingAncestry([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $true }
+    try {
+        $current = Get-NormalizedFullPath $Path
+        while (-not (Test-Path -LiteralPath $current) -and -not [string]::IsNullOrWhiteSpace($current)) {
+            $parent = [System.IO.Path]::GetDirectoryName($current.TrimEnd([char[]]@('\', '/')))
+            if ([string]::IsNullOrWhiteSpace($parent) -or $parent -eq $current) { break }
+            $current = $parent
+        }
+        while (-not [string]::IsNullOrWhiteSpace($current)) {
+            $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+            if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { return $true }
+            $parent = [System.IO.Directory]::GetParent($item.FullName)
+            if ($null -eq $parent) { break }
+            $current = $parent.FullName
+        }
+        return $false
+    } catch {
+        return $true
+    }
+}
+
+function Test-QwenLoopWorkDirOwnership([string]$Root) {
+    if ([string]::IsNullOrWhiteSpace($Root)) { return $false }
+    $markerPath = Join-Path $Root ".qwen-loop-workdir.json"
+    if (!(Test-Path -LiteralPath $markerPath -PathType Leaf)) { return $false }
+    try {
+        $marker = (Read-Utf8File $markerPath) | ConvertFrom-Json
+        if ([string]$marker.schema -ne "qwen-loop-workdir/v1") { return $false }
+        $markerRoot = Get-NormalizedFullPath ([string]$marker.normalizedWorkDir)
+        $actualRoot = Get-NormalizedFullPath $Root
+        return $markerRoot.Equals($actualRoot, [System.StringComparison]::OrdinalIgnoreCase)
+    } catch {
+        return $false
+    }
+}
+
+function Initialize-QwenLoopWorkDirOwnership([string]$Root, [bool]$CanClaim) {
+    if (Test-QwenLoopWorkDirOwnership $Root) { return $true }
+    if (-not $CanClaim -or $DryRun) { return $false }
+    if (Test-PathHasReparsePointInExistingAncestry $Root) { return $false }
+    $marker = [ordered]@{
+        schema = "qwen-loop-workdir/v1"
+        normalizedWorkDir = Get-NormalizedFullPath $Root
+        orchestratorRoot = Get-NormalizedFullPath $PSScriptRoot
+        createdAt = (Get-Date).ToString("o")
+    }
+    Write-Utf8File (Join-Path $Root ".qwen-loop-workdir.json") ($marker | ConvertTo-Json -Depth 10)
+    return $true
+}
+
+function Assert-SafeWorkDir([string]$Path, [string]$ActiveProjectRoot) {
+    $full = (Get-NormalizedFullPath $Path).TrimEnd([char[]]@('\', '/'))
+    $driveRoot = [System.IO.Path]::GetPathRoot($full).TrimEnd([char[]]@('\', '/'))
+    $scriptRoot = (Get-NormalizedFullPath $PSScriptRoot).TrimEnd([char[]]@('\', '/'))
+    $profileRoot = ""
+    if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+        $profileRoot = (Get-NormalizedFullPath $env:USERPROFILE).TrimEnd([char[]]@('\', '/'))
+    }
+
+    if ($full.Equals($driveRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "WorkDir로 드라이브 루트를 사용할 수 없습니다: $Path"
+    }
+    if ($full.Equals($scriptRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "WorkDir로 오케스트레이터 소스 루트를 사용할 수 없습니다: $Path"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($profileRoot) -and $full.Equals($profileRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "WorkDir로 사용자 프로필 루트를 사용할 수 없습니다: $Path"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ActiveProjectRoot)) {
+        $projectFull = (Get-NormalizedFullPath $ActiveProjectRoot).TrimEnd([char[]]@('\', '/'))
+        if (Test-PathInsideRoot $projectFull $full) {
+            throw "WorkDir는 ProjectRoot와 같거나 그 하위일 수 없습니다. 자동 정리가 프로젝트 소스를 건드리지 않도록 오케스트레이터의 별도 qwen-loop-data 폴더를 사용하세요."
+        }
+        if (Test-PathInsideRoot $full $projectFull) {
+            throw "WorkDir는 ProjectRoot의 상위 폴더일 수 없습니다. 자동 정리 범위가 프로젝트 소스나 형제 폴더를 포함하지 않도록 별도 qwen-loop-data 폴더를 사용하세요."
+        }
+    }
+    if (Test-PathHasReparsePointInExistingAncestry $full) {
+        throw "WorkDir 또는 그 상위 경로에 junction/symlink/reparse point가 있어 실제 정리 경계를 안전하게 확정할 수 없습니다: $Path"
+    }
+}
+
+function Get-StablePathHash([string]$Path, [int]$Length = 10) {
+    $normalized = (Get-NormalizedFullPath $Path).ToLowerInvariant()
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($normalized)
+        $hashBytes = $sha.ComputeHash($bytes)
+        $hex = (($hashBytes | ForEach-Object { $_.ToString("x2") }) -join "")
+        return $hex.Substring(0, [Math]::Min($Length, $hex.Length))
+    } finally {
+        $sha.Dispose()
+    }
+}
+
+function Get-SafeProjectSlug([string]$Root) {
+    $full = [System.IO.Path]::GetFullPath($Root)
+    $trimmed = $full.TrimEnd([char[]]@('\', '/'))
+    $name = [System.IO.Path]::GetFileName($trimmed)
+    if ([string]::IsNullOrWhiteSpace($name)) {
+        $drive = [System.IO.Path]::GetPathRoot($full).TrimEnd([char[]]@('\', '/')).Replace(":", "")
+        $name = "drive-$drive"
+    }
+    $slug = [regex]::Replace($name, '[^\p{L}\p{Nd}._-]+', '-')
+    $slug = $slug.Trim('-').Trim()
+    if ([string]::IsNullOrWhiteSpace($slug)) { $slug = "project" }
+    if ($slug.Length -gt 60) { $slug = $slug.Substring(0, 60).TrimEnd('-') }
+    return $slug
+}
+
+function New-ProjectSessionLayout([string]$Root, [string]$SessionRoot) {
+    $resolvedRoot = Resolve-ProjectRoot $Root
+    $baseInput = Expand-PathInput $SessionRoot
+    if (-not [System.IO.Path]::IsPathRooted($baseInput)) { $baseInput = Join-Path $PSScriptRoot $baseInput }
+    $baseRoot = Get-NormalizedFullPath $baseInput
+    $identity = "$(Get-SafeProjectSlug $resolvedRoot)-$(Get-StablePathHash $resolvedRoot 10)"
+    $projectBase = Join-Path $baseRoot $identity
+    $sessionsRoot = Join-Path $projectBase "sessions"
+    do {
+        $sessionId = "$(Get-Date -Format 'yyyyMMdd-HHmmss-fff')-p$PID-$(Get-Random -Minimum 1000 -Maximum 10000)"
+        $sessionDir = Join-Path $sessionsRoot $sessionId
+    } while (Test-Path -LiteralPath $sessionDir)
+
+    return [PSCustomObject]@{
+        ProjectRoot = $resolvedRoot
+        Identity = $identity
+        ProjectBase = $projectBase
+        SessionsRoot = $sessionsRoot
+        SessionId = $sessionId
+        SessionDir = $sessionDir
+        ExplorationHistoryPath = (Join-Path $projectBase "exploration_history.jsonl")
+    }
+}
+
+function Get-ValidatedProjectSessionDirectories($Layout) {
+    if ($null -eq $Layout -or !(Test-Path -LiteralPath $Layout.SessionsRoot -PathType Container)) { return @() }
+    $sessionsRoot = (Get-NormalizedFullPath ([string]$Layout.SessionsRoot)).TrimEnd([char[]]@('\', '/'))
+    $projectRoot = Get-NormalizedFullPath ([string]$Layout.ProjectRoot)
+    $valid = New-Object System.Collections.Generic.List[object]
+
+    foreach ($dir in @(Get-ChildItem -LiteralPath $sessionsRoot -Directory -Force -ErrorAction SilentlyContinue)) {
+        if ($dir.Name -notmatch '^\d{8}-\d{6}-\d{3}-p\d+-\d{4}$') { continue }
+        if (($dir.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+        $parent = (Get-NormalizedFullPath $dir.Parent.FullName).TrimEnd([char[]]@('\', '/'))
+        if (-not $parent.Equals($sessionsRoot, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+        $markerPath = Join-Path $dir.FullName "session_identity.json"
+        if (!(Test-Path -LiteralPath $markerPath -PathType Leaf)) { continue }
+        try {
+            $marker = (Read-Utf8File $markerPath) | ConvertFrom-Json
+            if ([string]$marker.schema -ne "qwen-loop-project-session/v1") { continue }
+            if ([string]$marker.identity -ne [string]$Layout.Identity) { continue }
+            $markerProjectRoot = Get-NormalizedFullPath ([string]$marker.canonicalProjectRoot)
+            if (-not $markerProjectRoot.Equals($projectRoot, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+            if ([string]$marker.sessionId -ne $dir.Name) { continue }
+            $valid.Add([PSCustomObject]@{ Directory = $dir; Marker = $marker; LockPath = (Join-Path $dir.FullName ".active.lock") }) | Out-Null
+        } catch { }
+    }
+    return @($valid.ToArray())
+}
+
+function Test-ProjectSessionInactive($SessionInfo) {
+    if ($null -eq $SessionInfo) { return $false }
+    $lockPath = [string]$SessionInfo.LockPath
+    if (!(Test-Path -LiteralPath $lockPath -PathType Leaf)) { return $true }
+    $probe = $null
+    try {
+        $probe = [System.IO.File]::Open($lockPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        return $true
+    } catch {
+        return $false
+    } finally {
+        if ($probe) { $probe.Dispose() }
+    }
+}
+
+function Open-ExclusiveFileLock([string]$Path, [int]$TimeoutMilliseconds = 3000) {
+    $deadline = [DateTime]::UtcNow.AddMilliseconds([Math]::Max(0, $TimeoutMilliseconds))
+    do {
+        try {
+            return [System.IO.File]::Open($Path, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        } catch [System.IO.IOException] {
+            if ([DateTime]::UtcNow -ge $deadline) { return $null }
+            Start-Sleep -Milliseconds 50
+        } catch [System.UnauthorizedAccessException] {
+            return $null
+        }
+    } while ($true)
+}
+
+function Test-DirectoryTreeSafeForRemoval([string]$RootPath) {
+    try {
+        $rootItem = Get-Item -LiteralPath $RootPath -Force -ErrorAction Stop
+        if (-not $rootItem.PSIsContainer) { return $false }
+        if (($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
+
+        $pending = New-Object System.Collections.Generic.Stack[System.IO.DirectoryInfo]
+        $pending.Push([System.IO.DirectoryInfo]$rootItem)
+        while ($pending.Count -gt 0) {
+            $current = $pending.Pop()
+            foreach ($child in @(Get-ChildItem -LiteralPath $current.FullName -Force -ErrorAction Stop)) {
+                if (($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
+                if ($child.PSIsContainer) { $pending.Push([System.IO.DirectoryInfo]$child) }
+            }
+        }
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Remove-ValidatedProjectSession($SessionInfo, $Layout) {
+    if ($null -eq $SessionInfo) { return $false }
+    try {
+        $sessionsRoot = (Get-NormalizedFullPath ([string]$Layout.SessionsRoot)).TrimEnd([char[]]@('\', '/'))
+        $full = Get-NormalizedFullPath ([string]$SessionInfo.Directory.FullName)
+        $current = Get-NormalizedFullPath ([string]$Layout.SessionDir)
+        if ($full.Equals($current, [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
+
+        # Refresh every safety decision immediately before recursive removal.  A
+        # stale DirectoryInfo or marker must never authorize deletion.
+        $fresh = @(Get-ValidatedProjectSessionDirectories $Layout | Where-Object {
+            (Get-NormalizedFullPath ([string]$_.Directory.FullName)).Equals($full, [System.StringComparison]::OrdinalIgnoreCase)
+        } | Select-Object -First 1)[0]
+        if ($null -eq $fresh) { return $false }
+        $dir = Get-Item -LiteralPath $full -Force -ErrorAction Stop
+        if (($dir.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
+        $parent = (Get-NormalizedFullPath $dir.Parent.FullName).TrimEnd([char[]]@('\', '/'))
+        if (-not $parent.Equals($sessionsRoot, [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
+        if (-not (Test-ProjectSessionInactive $fresh)) { return $false }
+        if (-not (Test-DirectoryTreeSafeForRemoval $full)) { return $false }
+
+        Remove-Item -LiteralPath $full -Recurse -Force -ErrorAction Stop
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Invoke-ProjectSessionRetention($Layout) {
+    $actions = New-Object System.Collections.Generic.List[object]
+    $warnings = New-Object System.Collections.Generic.List[string]
+    if ($null -eq $Layout -or $NoAutoCleanup -or $DryRun) {
+        return [PSCustomObject]@{ enabled = $false; actions = @(); remainingSessions = 0; remainingBytes = 0 }
+    }
+    if ($ProjectSessionKeepCount -lt 1) { throw "ProjectSessionKeepCount는 1 이상이어야 합니다." }
+    if ($ProjectSessionKeepDays -lt 0) { throw "ProjectSessionKeepDays는 0 이상이어야 합니다." }
+    if ($ProjectSessionMaxTotalMB -lt 0) { throw "ProjectSessionMaxTotalMB는 0 이상이어야 합니다." }
+
+    $sessionsRoot = Get-NormalizedFullPath ([string]$Layout.SessionsRoot)
+    $projectBase = Get-NormalizedFullPath ([string]$Layout.ProjectBase)
+    if (-not (Test-PathInsideRoot $projectBase $sessionsRoot)) {
+        throw "세션 정리 경로가 프로젝트 세션 루트 밖입니다: $sessionsRoot"
+    }
+    if (!(Test-Path -LiteralPath $sessionsRoot -PathType Container)) {
+        return [PSCustomObject]@{ enabled = $true; actions = @(); remainingSessions = 0; remainingBytes = 0 }
+    }
+
+    $retentionLock = Open-ExclusiveFileLock (Join-Path $projectBase ".retention.lock") 3000
+    if ($null -eq $retentionLock) {
+        return [PSCustomObject]@{
+            enabled = $true
+            actions = @()
+            remainingSessions = @(Get-ValidatedProjectSessionDirectories $Layout).Count
+            remainingBytes = (Get-DirectorySizeBytes $sessionsRoot)
+            warning = "another process owns project-session retention; cleanup was skipped"
+        }
+    }
+
+    try {
+        $current = Get-NormalizedFullPath ([string]$Layout.SessionDir)
+        $cutoff = if ($ProjectSessionKeepDays -gt 0) { (Get-Date).AddDays(-$ProjectSessionKeepDays) } else { $null }
+        $sessions = @(Get-ValidatedProjectSessionDirectories $Layout | Sort-Object { $_.Directory.LastWriteTimeUtc } -Descending)
+
+    for ($i = 0; $i -lt $sessions.Count; $i++) {
+        $info = $sessions[$i]
+        $dir = $info.Directory
+        if ($dir.FullName.Equals($current, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+        $beyondCount = $i -ge $ProjectSessionKeepCount
+        $tooOld = ($null -ne $cutoff -and $dir.LastWriteTime -lt $cutoff)
+        if (-not $beyondCount -and -not $tooOld) { continue }
+
+        $before = Get-DirectorySizeBytes $dir.FullName
+        if (Remove-ValidatedProjectSession $info $Layout) {
+            $actions.Add([PSCustomObject]@{ kind = "deleted-session"; path = $dir.FullName; beforeBytes = $before; note = if ($tooOld) { "retention-days" } else { "retention-count" } }) | Out-Null
+        } else {
+            $warnings.Add("active or unvalidated session was preserved: $($dir.Name)") | Out-Null
+        }
+    }
+
+    if ($ProjectSessionMaxTotalMB -gt 0) {
+        $limit = [int64]$ProjectSessionMaxTotalMB * 1MB
+        $remaining = @(Get-ValidatedProjectSessionDirectories $Layout | Sort-Object { $_.Directory.LastWriteTimeUtc })
+        $total = [int64]0
+        $sizes = @{}
+        foreach ($info in $remaining) {
+            $dir = $info.Directory
+            $size = Get-DirectorySizeBytes $dir.FullName
+            $sizes[$dir.FullName] = $size
+            $total += $size
+        }
+        foreach ($info in $remaining) {
+            $dir = $info.Directory
+            if ($total -le $limit) { break }
+            if ($dir.FullName.Equals($current, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+            $size = [int64]$sizes[$dir.FullName]
+            if (Remove-ValidatedProjectSession $info $Layout) {
+                $total -= $size
+                $actions.Add([PSCustomObject]@{ kind = "deleted-session"; path = $dir.FullName; beforeBytes = $size; note = "aggregate-size-cap" }) | Out-Null
+            } else {
+                $warnings.Add("size cap could not remove active session: $($dir.Name)") | Out-Null
+            }
+        }
+        if ($total -gt $limit) { $warnings.Add("aggregate size remains above cap because active sessions are preserved") | Out-Null }
+    }
+
+        $finalSessions = @(Get-ValidatedProjectSessionDirectories $Layout)
+        return [PSCustomObject]@{
+            enabled = $true
+            actions = @($actions.ToArray())
+            remainingSessions = $finalSessions.Count
+            remainingBytes = (Get-DirectorySizeBytes $sessionsRoot)
+            warning = ($warnings -join "; ")
+        }
+    } catch {
+        $warnings.Add("session retention failed safely: $($_.Exception.Message)") | Out-Null
+        return [PSCustomObject]@{
+            enabled = $true
+            actions = @($actions.ToArray())
+            remainingSessions = @(Get-ValidatedProjectSessionDirectories $Layout).Count
+            remainingBytes = (Get-DirectorySizeBytes $sessionsRoot)
+            warning = ($warnings -join "; ")
+        }
+    } finally {
+        $retentionLock.Dispose()
+    }
+}
+
 function Remove-BomAndTrim([string]$Text) {
     if ($null -eq $Text) { return "" }
     return ([string]$Text).TrimStart([char]0xFEFF).Trim()
@@ -424,11 +874,30 @@ function Get-TextPrefix([string]$Text, [int]$MaxChars) {
     return $Text.Substring(0, $MaxChars) + "`n...[truncated]..."
 }
 
+function Get-TextSuffix([string]$Text, [int]$MaxChars) {
+    if ([string]::IsNullOrEmpty($Text)) { return "" }
+    if ($Text.Length -le $MaxChars) { return $Text }
+    return "...[older content omitted]...`n" + $Text.Substring($Text.Length - $MaxChars)
+}
+
 function Get-JsonProperty($obj, [string]$name) {
     if ($null -eq $obj) { return $null }
+    if ($obj -is [System.Collections.IDictionary]) {
+        foreach ($key in $obj.Keys) {
+            if ([string]$key -ieq $name) { return $obj[$key] }
+        }
+    }
     $prop = $obj.PSObject.Properties | Where-Object { $_.Name -eq $name } | Select-Object -First 1
     if ($prop) { return $prop.Value }
     return $null
+}
+
+function ConvertTo-BooleanValue($Value, [bool]$DefaultValue = $false) {
+    if ($null -eq $Value) { return $DefaultValue }
+    if ($Value -is [bool]) { return [bool]$Value }
+    $parsed = $false
+    if ([bool]::TryParse(([string]$Value).Trim(), [ref]$parsed)) { return $parsed }
+    try { return [System.Convert]::ToBoolean($Value, [System.Globalization.CultureInfo]::InvariantCulture) } catch { return $DefaultValue }
 }
 
 function ConvertTo-PlainObject($obj) {
@@ -1023,6 +1492,9 @@ function Assert-ProjectScanConfig() {
     if ($DynamicProjectContextMaxFiles -lt 0) { throw "DynamicProjectContextMaxFiles는 0 이상이어야 합니다." }
     if ($DynamicProjectContextMaxFileChars -lt 200) { throw "DynamicProjectContextMaxFileChars는 200 이상이어야 합니다." }
     if ($DynamicProjectContextMaxTotalChars -lt 1000) { throw "DynamicProjectContextMaxTotalChars는 1000 이상이어야 합니다." }
+    if ($ProjectTurnsPerCycle -lt 1) { throw "ProjectTurnsPerCycle은 1 이상이어야 합니다." }
+    if ($ProjectTargetOutputTokens -lt 1) { throw "ProjectTargetOutputTokens는 1 이상이어야 합니다." }
+    if ($ProjectTargetAnswerChars -lt 500) { throw "ProjectTargetAnswerChars는 500 이상이어야 합니다." }
 }
 
 function Resolve-ProjectRoot([string]$PathText) {
@@ -1030,13 +1502,13 @@ function Resolve-ProjectRoot([string]$PathText) {
     if ([string]::IsNullOrWhiteSpace($p)) { return "" }
     if (-not [System.IO.Path]::IsPathRooted($p)) { $p = Join-Path $PSScriptRoot $p }
     if (!(Test-Path -LiteralPath $p -PathType Container)) { throw "ProjectRoot 디렉터리를 찾지 못했습니다: $PathText" }
-    return [System.IO.Path]::GetFullPath($p).TrimEnd([char[]]@('\', '/'))
+    return (Get-NormalizedFullPath $p)
 }
 
 function Test-ProjectExcludedDirectoryName([string]$Name) {
     if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
     $excluded = @(
-        ".git", ".svn", ".hg", ".idea", ".vscode", ".gradle",
+        ".git", ".svn", ".hg", ".idea", ".vscode", ".gradle", ".qwen", ".codex", ".agents",
         "node_modules", "dist", "build", "target", "out", "coverage",
         ".next", ".nuxt", ".cache", ".turbo", "logs", "log",
         "qwen-loop-data", "bin", "obj", "vendor"
@@ -1055,9 +1527,29 @@ function Test-ProjectIncludedFile([System.IO.FileInfo]$File) {
     if ($allowed -notcontains $ext) { return $false }
     if ($File.Length -gt 1MB) { return $false }
     if ($File.Name -match '(?i)^\.env($|\.)|^\.npmrc$|^\.pypirc$') { return $false }
+    if ($File.Name -match '(?i)(secret|credential|private[-_.]?key|service[-_.]?account|keystore|truststore|vault)') { return $false }
+    if ($ext -in @(".pem", ".key", ".p12", ".pfx", ".jks", ".keystore")) { return $false }
     if ($File.Name -match '(?i)^(package-lock\.json|yarn\.lock|pnpm-lock\.(yaml|yml)|gradle\.lockfile)$') { return $false }
     if ($File.Name -match '(?i)(\.min\.js|\.map)$') { return $false }
     return $true
+}
+
+function Protect-ProjectSnippetSecrets([string]$Text) {
+    if ([string]::IsNullOrEmpty($Text)) { return "" }
+    $protected = New-Object System.Collections.Generic.List[string]
+    foreach ($line in ($Text -split "`r?`n")) {
+        if ($line -match '(?i)-----BEGIN\s+(?:RSA\s+|EC\s+|OPENSSH\s+)?PRIVATE\s+KEY-----') {
+            $protected.Add("[REDACTED PRIVATE KEY]") | Out-Null
+            continue
+        }
+        if ($line -match '(?i)(password|passwd|pwd|secret|api[-_.]?key|access[-_.]?token|refresh[-_.]?token|authorization|private[-_.]?key)\s*["'']?\s*[:=]') {
+            $indent = ([regex]::Match($line, '^\s*')).Value
+            $protected.Add("${indent}[REDACTED SENSITIVE CONFIG LINE]") | Out-Null
+            continue
+        }
+        $protected.Add([string]$line) | Out-Null
+    }
+    return ($protected -join "`n")
 }
 
 function Get-ProjectRelativePath([string]$Root, [string]$Path) {
@@ -1071,11 +1563,11 @@ function Get-ProjectRelativePath([string]$Root, [string]$Path) {
 
 function Read-ProjectFilePrefix([string]$Path, [int]$MaxChars) {
     try {
-        $raw = Read-Utf8File $Path
+        $raw = Protect-ProjectSnippetSecrets (Read-Utf8File $Path)
         return Get-TextPrefix $raw $MaxChars
     } catch {
         try {
-            $raw = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::Default)
+            $raw = Protect-ProjectSnippetSecrets ([System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::Default))
             return Get-TextPrefix $raw $MaxChars
         } catch {
             return ""
@@ -1085,10 +1577,10 @@ function Read-ProjectFilePrefix([string]$Path, [int]$MaxChars) {
 
 function Read-ProjectFileText([string]$Path) {
     try {
-        return (Read-Utf8File $Path)
+        return (Protect-ProjectSnippetSecrets (Read-Utf8File $Path))
     } catch {
         try {
-            return [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::Default)
+            return (Protect-ProjectSnippetSecrets ([System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::Default)))
         } catch {
             return ""
         }
@@ -1097,6 +1589,33 @@ function Read-ProjectFileText([string]$Path) {
 
 function Add-ProjectScoreReason($Reasons, [string]$Reason) {
     if (-not [string]::IsNullOrWhiteSpace($Reason) -and -not $Reasons.Contains($Reason)) { $Reasons.Add($Reason) | Out-Null }
+}
+
+function Get-BusinessFamilyKeyFromPath([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path)) { return "" }
+    $base = [System.IO.Path]::GetFileNameWithoutExtension($Path)
+    if ([string]::IsNullOrWhiteSpace($base)) { return "" }
+
+    if ($base -match '^([A-Za-z]{2,}(?:[_-]?[A-Za-z]+)*[_-]?\d{3,})') {
+        return $Matches[1].ToLowerInvariant()
+    }
+
+    $familySuffixPattern = '(?i)(Mapper|MapperImpl|ServiceImpl|Service|Controller|Repository|Dao|DAO|Tasklet|Job|Step|Decider|Listener|VO|Vo|DTO|Dto|Entity|Model|Request|Response|Query|Command|Store|Provider)$'
+    if ($base -notmatch $familySuffixPattern) { return "" }
+    $stem = $base -replace $familySuffixPattern, ''
+    $stem = $stem.Trim('_-')
+    $variantSuffixPattern = '(?i)(History|Detail|Details|Item|Items|List|Info|Data|Result|Payload|Param|Params|Parameter|Parameters|Form|Summary|Search|Filter|Create|Update|Delete|Save|Job|Batch)$'
+    $normalizedStem = ($stem -replace $variantSuffixPattern, '').Trim('_-')
+    if ($stem -match $variantSuffixPattern -and $normalizedStem.Length -lt 3) { return "" }
+    if ($normalizedStem.Length -ge 3) { $stem = $normalizedStem }
+    if ($stem.Length -lt 3) { return "" }
+    if ($stem -match '(?i)^(common|base|abstract|default|global|shared|core|main|application|app|config|configuration|security|util|utils|helper|constant|constants)$') { return "" }
+    return $stem.ToLowerInvariant()
+}
+
+function Get-ProjectBusinessFamilyKey($Item) {
+    if ($null -eq $Item) { return "" }
+    return (Get-BusinessFamilyKeyFromPath ([string]$Item.path))
 }
 
 function Get-ProjectFileScore([System.IO.FileInfo]$File, [string]$Root, [string]$Content) {
@@ -1137,7 +1656,33 @@ function Get-ProjectFileScore([System.IO.FileInfo]$File, [string]$Root, [string]
         $score += 22; Add-ProjectScoreReason $reasons "frontend data/state boundary"
     }
 
+    $businessFamily = Get-BusinessFamilyKeyFromPath $relative
+    if (-not [string]::IsNullOrWhiteSpace($businessFamily)) {
+        $score += 12; Add-ProjectScoreReason $reasons "business family:$businessFamily"
+    }
+    if ($nameLower -match '(vo|dto|entity|model|request|response)\.(java|kt|ts|tsx)$') {
+        $score += 30; Add-ProjectScoreReason $reasons "business data model"
+    }
+    if ($nameLower -match '(tasklet|job|step|decider)\.(java|kt)$') {
+        $score += 32; Add-ProjectScoreReason $reasons "batch business process"
+    }
+
     $contentLower = if ($Content) { $Content.ToLowerInvariant() } else { "" }
+    if ($Content -match '[가-힣]{2,}') {
+        $score += 18; Add-ProjectScoreReason $reasons "Korean business labels/comments"
+    }
+    if ($contentLower -match '<resultmap|\bresultmap\b|\bparameterType\b|\bresultType\b') {
+        $score += 18; Add-ProjectScoreReason $reasons "mapper data contract"
+    }
+    if ($Content -match '(?i)\b(?:TB|TBL|VW|V)_[A-Z0-9_]{3,}\b') {
+        $score += 18; Add-ProjectScoreReason $reasons "business table evidence"
+    }
+    if ($contentLower -match '@schema\s*\(|@column\s*\(|@apimodelproperty|@notnull|@size\s*\(') {
+        $score += 14; Add-ProjectScoreReason $reasons "field meaning/validation evidence"
+    }
+    if ($contentLower -match 'jobparameter|jobparameters|@value\s*\(') {
+        $score += 14; Add-ProjectScoreReason $reasons "business execution parameter"
+    }
     $keywordRules = @(
         @("@transactional", 25, "transaction boundary"),
         @("@requestmapping", 18, "spring route mapping"),
@@ -1186,14 +1731,21 @@ function Get-ProjectFileScore([System.IO.FileInfo]$File, [string]$Root, [string]
         Add-ProjectScoreReason $reasons "many executable blocks"
     }
 
+    if ($nameLower -match '^(common|base|abstract|global|shared|core|default).*(listener|service|util|helper|config)?\.(java|kt|ts|tsx)$' -or
+        $nameLower -match '(application|configuration|config|util|utils|helper)\.(java|kt|ts|tsx)$') {
+        $score = [Math]::Max(1, $score - 35)
+        Add-ProjectScoreReason $reasons "technical core/support only"
+    }
+
     return [PSCustomObject]@{
         path = $relative
         fullName = $File.FullName
         extension = $File.Extension
         sizeBytes = [int64]$File.Length
-        score = $score
+        score = [Math]::Max(1, $score)
         reasons = @($reasons)
         excerpt = $Content
+        businessFamilyKey = $businessFamily
     }
 }
 
@@ -1215,8 +1767,14 @@ function Get-ProjectQuestionRole($Item) {
     $reasonText = ((@($Item.reasons) | ForEach-Object { [string]$_ }) -join " ").ToLowerInvariant()
 
     if ($ext -eq ".md") { return "docs" }
+    if ($pathKey -match '(^|/)(test|tests|spec|specs|__tests__)(/|$)' -or $name -match '(?i)(test|tests|spec)\.') { return "test" }
+    if ($ext -in @(".bat", ".cmd", ".sh")) { return "script-launcher" }
+    if ($ext -in @(".ps1", ".psm1")) { return "script-main" }
     if ($reasonText -match 'project/build|entry point') { return "entry-build" }
     if ($reasonText -match 'runtime config|cross-cutting config|security') { return "config-security" }
+    if ($reasonText -match 'technical core/support only' -or $name -match '^(common|base|abstract|global|shared|core|default).*(listener|service|util|helper|config)?\.') { return "technical-core" }
+    if ($reasonText -match 'batch business process' -or $name -match '(tasklet|job|step|decider)\.(java|kt)$') { return "batch-process" }
+    if ($reasonText -match 'business data model' -or $name -match '(vo|dto|entity|model|request|response)\.(java|kt|ts|tsx)$') { return "domain-model" }
     if ($reasonText -match 'service/domain') { return "service-domain" }
     if ($reasonText -match 'api boundary|spring route') { return "api-boundary" }
     if ($reasonText -match 'db boundary|sql ') { return "db-sql" }
@@ -1229,7 +1787,6 @@ function Get-ProjectQuestionRole($Item) {
         if ($ext -in @(".ps1", ".psm1")) { return "script-main" }
         return "script-automation"
     }
-    if ($name -match '(?i)(test|spec)\.') { return "test" }
     if ($ext -in @(".json", ".yml", ".yaml", ".properties", ".gradle")) { return "config-data" }
     return "code"
 }
@@ -1261,7 +1818,7 @@ function Test-ProjectPrimaryQuestionSeedCandidate($Item) {
     }
 
     if ($anchorPath -eq "public") { return $false }
-    return ($role -notin @("entry-build", "config-security", "config-data", "docs", "script-launcher", "test"))
+    return ($role -notin @("entry-build", "config-security", "config-data", "docs", "script-launcher", "test", "technical-core"))
 }
 
 function Get-ProjectQuestionGroup($Item) {
@@ -1270,6 +1827,18 @@ function Get-ProjectQuestionGroup($Item) {
     $segments = @($normalized -split "/" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     $role = Get-ProjectQuestionRole $Item
     $anchor = "root"
+    $businessFamily = Get-ProjectBusinessFamilyKey $Item
+
+    $businessRoles = @("code", "service-domain", "api-boundary", "db-sql", "domain-model", "batch-process", "ui-route-page", "state-store", "hook-composable", "data-api-client")
+    if (-not [string]::IsNullOrWhiteSpace($businessFamily) -and $businessRoles -contains $role) {
+        return [PSCustomObject]@{
+            key = "business/$businessFamily"
+            label = "$businessFamily (business family)"
+            anchorPath = "business/$businessFamily"
+            role = $role
+            businessFamily = $businessFamily
+        }
+    }
 
     if ($segments.Count -gt 1) {
         $dirs = @()
@@ -1314,6 +1883,7 @@ function Get-ProjectQuestionGroup($Item) {
         label = $label
         anchorPath = $anchor
         role = $role
+        businessFamily = $businessFamily
     }
 }
 
@@ -1324,6 +1894,7 @@ function Set-ProjectQuestionGroup($Item) {
     $Item | Add-Member -NotePropertyName questionGroupLabel -NotePropertyValue $group.label -Force
     $Item | Add-Member -NotePropertyName questionGroupRole -NotePropertyValue $group.role -Force
     $Item | Add-Member -NotePropertyName questionGroupAnchorPath -NotePropertyValue $group.anchorPath -Force
+    $Item | Add-Member -NotePropertyName businessFamilyKey -NotePropertyValue $group.businessFamily -Force
     return $Item
 }
 
@@ -1342,6 +1913,7 @@ function Get-ProjectQuestionGroups($Files) {
                 label = [string]$item.questionGroupLabel
                 role = [string]$item.questionGroupRole
                 anchorPath = [string]$item.questionGroupAnchorPath
+                businessFamily = [string]$item.businessFamilyKey
                 files = (New-Object System.Collections.Generic.List[object])
             }
         }
@@ -1360,6 +1932,7 @@ function Get-ProjectQuestionGroups($Files) {
             label = $group.label
             role = $group.role
             anchorPath = $group.anchorPath
+            businessFamily = $group.businessFamily
             fileCount = $files.Count
             maxScore = $maxScore
             groupWeight = [Math]::Max(1, $maxScore + $countBonus)
@@ -1428,10 +2001,14 @@ function Get-ProjectCandidateFiles([string]$Root) {
 
         try {
             foreach ($childDir in @(Get-ChildItem -LiteralPath $dir.FullName -Directory -Force -ErrorAction SilentlyContinue)) {
+                if (($childDir.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
                 if (-not (Test-ProjectExcludedDirectoryName $childDir.Name)) { $queue.Enqueue($childDir) }
             }
-            foreach ($file in @(Get-ChildItem -LiteralPath $dir.FullName -File -Force -ErrorAction SilentlyContinue)) {
-                if (Test-ProjectIncludedFile $file) { $result.Add($file) | Out-Null }
+            $includedFiles = @(Get-ChildItem -LiteralPath $dir.FullName -File -Force -ErrorAction SilentlyContinue | Where-Object { Test-ProjectIncludedFile $_ })
+            if ($includedFiles.Count -gt 120) { $includedFiles = @($includedFiles | Get-Random -Count 120) }
+            foreach ($file in $includedFiles) {
+                if ($result.Count -ge 2000) { break }
+                $result.Add($file) | Out-Null
             }
         } catch { }
     }
@@ -1461,7 +2038,12 @@ function Test-DynamicProjectNoiseTerm([string]$Value) {
     $noise = @(
         "SQL", "DB", "HTTP", "HTTPS", "JSON", "XML", "API", "URI", "URL",
         "GET", "POST", "PUT", "PATCH", "DELETE", "TRUE", "FALSE", "NULL",
-        "SELECT", "INSERT", "UPDATE", "WHERE", "FROM", "JOIN", "AND", "OR"
+        "SELECT", "INSERT", "UPDATE", "WHERE", "FROM", "JOIN", "AND", "OR",
+        "JAVA", "SPRING", "SERVICE", "MAPPER", "CONTROLLER", "TRANSACTION", "TRANSACTIONAL",
+        "TASKLET", "JOB", "STEP", "DECIDER", "LISTENER", "DTO", "VO", "ENTITY", "MODEL", "REQUEST", "RESPONSE",
+        "EXECUTE", "RUN", "PROCESS", "HANDLE", "START", "FINISH", "BEFORE", "AFTER", "MAIN",
+        "CLASS", "METHOD", "PUBLIC", "PRIVATE", "RETURN", "VOID", "STRING", "INTEGER", "OBJECT",
+        "FIELD", "TABLE", "COLUMN", "COMMENT", "PARAMETER", "JOBPARAMETER", "DOWNSTREAM", "FLOW"
     )
     return ($noise -contains $v.ToUpperInvariant())
 }
@@ -1473,6 +2055,9 @@ function Add-DynamicProjectSearchTerm($Terms, [string]$Value, [string]$Kind, [in
     if (Test-DynamicProjectNoiseTerm $clean) { return }
 
     $key = $clean.ToLowerInvariant()
+    if ($Kind -in @("file", "symbol") -and $clean -match '(?i)\.(java|kt|kts|xml|ts|tsx|js|jsx|vue|sql)$') {
+        $key = [System.IO.Path]::GetFileNameWithoutExtension($clean).ToLowerInvariant()
+    }
     if ((-not $Terms.ContainsKey($key)) -or ([int]$Terms[$key].weight -lt $Weight)) {
         $Terms[$key] = [PSCustomObject]@{
             value = $clean
@@ -1510,6 +2095,10 @@ function Get-DynamicProjectSearchTerms([string]$Question, [string]$LastTurn) {
             Add-DynamicProjectSearchTerm $terms $match.Value "symbol" ([int]$source.Weight)
         }
 
+        foreach ($match in [regex]::Matches($text, '\b[A-Z][A-Z0-9_]{3,80}\b')) {
+            Add-DynamicProjectSearchTerm $terms $match.Value "table-column" ([int]$source.Weight + 25)
+        }
+
         foreach ($match in [regex]::Matches($text, '\b[a-z][A-Za-z0-9_]*[A-Z][A-Za-z0-9_]{2,80}\b')) {
             Add-DynamicProjectSearchTerm $terms $match.Value "symbol" ([int]($source.Weight * 0.8))
         }
@@ -1525,20 +2114,36 @@ function Get-DynamicProjectFocusTerms($Candidate, $Terms) {
 
     foreach ($value in @($Candidate.matchedTerms)) {
         $text = [string]$value
-        $key = $text.ToLowerInvariant()
-        if (-not [string]::IsNullOrWhiteSpace($text) -and -not $seen.ContainsKey($key)) {
-            $items.Add([PSCustomObject]@{ Value = $text; Priority = (Get-DynamicProjectFocusTermPriority $text); Order = $order }) | Out-Null
-            $seen[$key] = $true
-            $order++
+        $focusValues = New-Object System.Collections.Generic.List[string]
+        if ($text -match '(?i)\.(java|kt|kts|xml|ts|tsx|js|jsx|vue|sql)$') {
+            $baseName = [System.IO.Path]::GetFileNameWithoutExtension($text)
+            if (-not [string]::IsNullOrWhiteSpace($baseName)) { $focusValues.Add($baseName) | Out-Null }
+        }
+        $focusValues.Add($text) | Out-Null
+        foreach ($focusValue in $focusValues) {
+            $key = ([string]$focusValue).ToLowerInvariant()
+            if (-not [string]::IsNullOrWhiteSpace([string]$focusValue) -and -not $seen.ContainsKey($key)) {
+                $items.Add([PSCustomObject]@{ Value = $focusValue; Priority = (Get-DynamicProjectFocusTermPriority $focusValue); Order = $order }) | Out-Null
+                $seen[$key] = $true
+                $order++
+            }
         }
     }
     foreach ($term in @($Terms)) {
         $value = [string]$term.value
-        $key = $value.ToLowerInvariant()
-        if (-not [string]::IsNullOrWhiteSpace($value) -and -not $seen.ContainsKey($key)) {
-            $items.Add([PSCustomObject]@{ Value = $value; Priority = (Get-DynamicProjectFocusTermPriority $value); Order = $order }) | Out-Null
-            $seen[$key] = $true
-            $order++
+        $focusValues = New-Object System.Collections.Generic.List[string]
+        if ($value -match '(?i)\.(java|kt|kts|xml|ts|tsx|js|jsx|vue|sql)$') {
+            $baseName = [System.IO.Path]::GetFileNameWithoutExtension($value)
+            if (-not [string]::IsNullOrWhiteSpace($baseName)) { $focusValues.Add($baseName) | Out-Null }
+        }
+        $focusValues.Add($value) | Out-Null
+        foreach ($focusValue in $focusValues) {
+            $key = ([string]$focusValue).ToLowerInvariant()
+            if (-not [string]::IsNullOrWhiteSpace([string]$focusValue) -and -not $seen.ContainsKey($key)) {
+                $items.Add([PSCustomObject]@{ Value = $focusValue; Priority = (Get-DynamicProjectFocusTermPriority $focusValue); Order = $order }) | Out-Null
+                $seen[$key] = $true
+                $order++
+            }
         }
     }
     return @($items |
@@ -1589,17 +2194,29 @@ function Get-FocusedProjectSnippet([string]$Path, $Candidate, $Terms, [int]$MaxC
     if ([string]::IsNullOrWhiteSpace($raw)) {
         return [PSCustomObject]@{ Text = ""; Mode = "empty"; FocusTerms = @() }
     }
+    if ($raw.Length -le $MaxChars) {
+        return [PSCustomObject]@{ Text = $raw; Mode = "whole-small-business-file"; FocusTerms = @() }
+    }
 
     $focusTerms = @(Get-DynamicProjectFocusTerms $Candidate $Terms |
         Where-Object { -not (Test-DynamicProjectNoiseTerm $_) } |
         Select-Object -First 24)
-    if ($focusTerms.Count -eq 0) {
-        return [PSCustomObject]@{ Text = (Get-TextPrefix $raw $MaxChars); Mode = "prefix"; FocusTerms = @() }
-    }
-
     $lines = @($raw -split "`r?`n", 0, "RegexMatch")
     if ($lines.Count -eq 0) {
         return [PSCustomObject]@{ Text = (Get-TextPrefix $raw $MaxChars); Mode = "prefix"; FocusTerms = $focusTerms }
+    }
+
+    $businessEvidence = New-Object System.Collections.Generic.List[string]
+    for ($lineIndex = 0; $lineIndex -lt $lines.Count -and $businessEvidence.Count -lt 36; $lineIndex++) {
+        $line = [string]$lines[$lineIndex]
+        if ($line -match '[가-힣]{2,}|(?i)<(?:select|insert|update|delete|resultMap)\b|\b(property|column|parameterType|resultType|jobParameter)\b|\b(?:TB|TBL|VW|V)_[A-Z0-9_]{3,}\b|\b(?:SELECT|INSERT|UPDATE|DELETE|MERGE|FROM|INTO|JOIN)\b|@(?:Schema|Column|ApiModelProperty)|#\{[^}]+\}|^\s*(?:private|protected|public)\s+(?:final\s+)?[A-Za-z0-9_<>,.?\[\]]+\s+[A-Za-z_][A-Za-z0-9_]*\s*(?:[;=])') {
+            $businessEvidence.Add(("{0,5}: {1}" -f ($lineIndex + 1), $line)) | Out-Null
+        }
+    }
+    $evidenceBlock = ""
+    if ($businessEvidence.Count -gt 0) {
+        $evidenceBlock = "... business evidence index (comments/table/column/field/parameter) ...`n" + ($businessEvidence -join "`n") + "`n"
+        $evidenceBlock = Get-TextPrefix $evidenceBlock ([Math]::Max(800, [int]($MaxChars * 0.35)))
     }
 
     $ranges = New-Object System.Collections.Generic.List[object]
@@ -1622,12 +2239,23 @@ function Get-FocusedProjectSnippet([string]$Path, $Candidate, $Terms, [int]$MaxC
         }
     }
 
-    if ($ranges.Count -eq 0) {
-        return [PSCustomObject]@{ Text = (Get-TextPrefix $raw $MaxChars); Mode = "prefix-no-term-hit"; FocusTerms = $focusTerms }
-    }
-
     $parts = New-Object System.Collections.Generic.List[string]
     $used = 0
+    if (-not [string]::IsNullOrWhiteSpace($evidenceBlock)) {
+        $parts.Add($evidenceBlock) | Out-Null
+        $used += $evidenceBlock.Length
+    }
+    if ($ranges.Count -eq 0) {
+        $remaining = $MaxChars - $used
+        if ($remaining -gt 120) {
+            $parts.Add("... file prefix (no focus-term hit) ...`n$(Get-TextPrefix $raw $remaining)") | Out-Null
+        }
+        return [PSCustomObject]@{
+            Text = (($parts -join "`n").TrimEnd())
+            Mode = if ([string]::IsNullOrWhiteSpace($evidenceBlock)) { "prefix-no-term-hit" } else { "business-evidence-prefix-no-term-hit" }
+            FocusTerms = $focusTerms
+        }
+    }
     $orderedRanges = @(Merge-LineRanges $ranges | Sort-Object @{ Expression = "Priority"; Descending = $false }, @{ Expression = "Start"; Descending = $false })
     foreach ($range in $orderedRanges) {
         $header = "... lines $([int]$range.Start + 1)-$([int]$range.End + 1) ...`n"
@@ -1655,7 +2283,7 @@ function Get-FocusedProjectSnippet([string]$Path, $Candidate, $Terms, [int]$MaxC
 }
 
 function Add-DynamicExpansionTerm($Terms, [string]$Value, [string]$Kind, [int]$Weight) {
-    if ([string]$Value -match '^(Controller|Service|ServiceImpl|Mapper|Repository|Dao|DAO|Request|Response|Provider|Store|Util|Utils|GetResponse|HttpWebRequest)$') { return }
+    if ([string]$Value -match '(?i)^(Controller|Service|ServiceImpl|Mapper|Repository|Dao|Request|Response|Provider|Store|Util|Utils|GetResponse|HttpWebRequest|Tasklet|Job|Step|Decider|Listener|DTO|VO|Entity|Model|execute|run|process|handle|start|finish|before|after|main)$') { return }
     Add-DynamicProjectSearchTerm $Terms $Value $Kind $Weight
 }
 
@@ -1677,6 +2305,7 @@ function Get-DynamicProjectExpansionTerms($Selected, [string]$Root, $ExistingTer
 
         foreach ($match in [regex]::Matches($raw, '(?m)^\s*import\s+(?:static\s+)?([A-Za-z_][A-Za-z0-9_.]*)(?:\.[A-Za-z_][A-Za-z0-9_]*)?\s*;')) {
             $full = $match.Groups[1].Value
+            if ($full -match '^(java|javax|jakarta|kotlin|org\.springframework|org\.slf4j|lombok)\.') { continue }
             $simple = ($full -split '\.')[-1]
             Add-DynamicExpansionTerm $terms $simple "import" 72
             Add-DynamicExpansionTerm $terms "$simple.java" "import-file" 78
@@ -1694,6 +2323,26 @@ function Get-DynamicProjectExpansionTerms($Selected, [string]$Root, $ExistingTer
             Add-DynamicExpansionTerm $terms $match.Groups[1].Value "xml-id" 82
         }
 
+        foreach ($match in [regex]::Matches($raw, '(?i)\b(?:parameterType|resultType|resultMap|type)\s*=\s*["'']([^"'']{3,140})["'']')) {
+            $typeValue = $match.Groups[1].Value
+            Add-DynamicExpansionTerm $terms (($typeValue -split '\.')[-1]) "data-contract-type" 96
+        }
+
+        foreach ($match in [regex]::Matches($raw, '(?i)\b(?:property|column)\s*=\s*["'']([^"'']{2,100})["'']')) {
+            Add-DynamicExpansionTerm $terms $match.Groups[1].Value "property-column" 92
+        }
+
+        foreach ($match in [regex]::Matches($raw, '\b(?:TB|TBL|VW|V)_[A-Z0-9_]{3,}\b')) {
+            Add-DynamicExpansionTerm $terms $match.Value "business-table" 104
+        }
+
+        foreach ($match in [regex]::Matches($raw, '[$#]\{([^}]{1,80})\}')) {
+            Add-DynamicExpansionTerm $terms $match.Groups[1].Value "business-parameter" 98
+        }
+
+        $family = Get-BusinessFamilyKeyFromPath ([string]$item.path)
+        if (-not [string]::IsNullOrWhiteSpace($family)) { Add-DynamicExpansionTerm $terms $family "business-family" 115 }
+
         foreach ($match in [regex]::Matches($raw, '\b[A-Z][A-Za-z0-9_]{3,90}\b')) {
             $value = $match.Value
             if ($value -match '(Service|ServiceImpl|Mapper|Repository|Dao|DAO|Controller|Util|Utils|Vo|VO|Dto|DTO|Request|Response|Provider|Store)$') {
@@ -1703,7 +2352,7 @@ function Get-DynamicProjectExpansionTerms($Selected, [string]$Root, $ExistingTer
 
         foreach ($match in [regex]::Matches($raw, '\b([a-z][A-Za-z0-9_]{2,80})\s*\(')) {
             $value = $match.Groups[1].Value
-            if ($value -match '^(get|set|is|toString|equals|hashCode|size|add|put|trim|substring|if|for|while|switch|catch|return|throw|this|super)$') { continue }
+            if ($value -match '(?i)^(get|set|is|toString|equals|hashCode|size|add|put|trim|substring|if|for|while|switch|catch|return|throw|this|super|execute|run|process|handle|start|finish|before|after|main)$') { continue }
             Add-DynamicExpansionTerm $terms $value "call-ref" 38
         }
     }
@@ -1790,7 +2439,32 @@ function Get-DynamicProjectCandidateScore($File, [string]$Root, $Terms, [string]
         score = $score
         reasons = @($reasons)
         matchedTerms = @($matchedTerms)
+        businessFamilyKey = Get-BusinessFamilyKeyFromPath $relative
+        businessRole = if ($nameLower -match '(vo|dto|entity|model|request|response)\.(java|kt|ts|tsx)$') { "domain-model" } elseif ($nameLower -match '(mapper|repository|dao)\.(java|kt|xml)$' -or $File.Extension.ToLowerInvariant() -eq ".sql") { "db-sql" } elseif ($nameLower -match '(tasklet|job|step|decider)\.(java|kt)$') { "batch-process" } elseif ($nameLower -match 'service\.(java|kt)$') { "service-domain" } elseif ($nameLower -match '(controller|resource)\.(java|kt)$') { "api-boundary" } else { "code" }
     }
+}
+
+function Select-DynamicBusinessContextCandidates($Candidates, [int]$Limit) {
+    $ranked = @($Candidates | Sort-Object @{ Expression = "score"; Descending = $true }, @{ Expression = "sizeBytes"; Descending = $false })
+    if ($ranked.Count -eq 0 -or $Limit -lt 1) { return @() }
+    $selected = New-Object System.Collections.Generic.List[object]
+    $paths = @{}
+    $anchor = $ranked[0]
+    $selected.Add($anchor) | Out-Null
+    $paths[[string]$anchor.path] = $true
+    $family = [string]$anchor.businessFamilyKey
+    if (-not [string]::IsNullOrWhiteSpace($family)) {
+        foreach ($role in @("db-sql", "domain-model", "batch-process", "service-domain", "api-boundary", "code")) {
+            if ($selected.Count -ge $Limit) { break }
+            $item = @($ranked | Where-Object { [string]$_.businessFamilyKey -eq $family -and [string]$_.businessRole -eq $role -and -not $paths.ContainsKey([string]$_.path) } | Select-Object -First 1)[0]
+            if ($item) { $selected.Add($item) | Out-Null; $paths[[string]$item.path] = $true }
+        }
+    }
+    foreach ($item in $ranked) {
+        if ($selected.Count -ge $Limit) { break }
+        if (-not $paths.ContainsKey([string]$item.path)) { $selected.Add($item) | Out-Null; $paths[[string]$item.path] = $true }
+    }
+    return @($selected.ToArray())
 }
 
 function Add-DynamicProjectSelectedTermHits($Selected, $Terms, $MatchedTermSet) {
@@ -1826,12 +2500,14 @@ function Add-DynamicProjectSelectedTermHits($Selected, $Terms, $MatchedTermSet) 
     }
 }
 
-function Build-DynamicProjectContext([string]$Root, [string]$Question, [string]$LastTurn) {
+function Build-DynamicProjectContext([string]$Root, [string]$Question, [string]$LastTurn, [string]$PreferredBusinessFamily = "") {
+    $preferredFamily = ([string]$PreferredBusinessFamily).Trim().ToLowerInvariant()
     $empty = [PSCustomObject]@{
         text = ""
         terms = @()
         files = @()
         missingTerms = @()
+        preferredBusinessFamily = $preferredFamily
         error = ""
     }
     if ([string]::IsNullOrWhiteSpace($Root) -or $DynamicProjectContextMaxFiles -eq 0) { return $empty }
@@ -1848,7 +2524,8 @@ function Build-DynamicProjectContext([string]$Root, [string]$Question, [string]$
         foreach ($file in $files) {
             try {
                 $candidate = Get-DynamicProjectCandidateScore $file $Root $terms $questionLower
-                if ($candidate.score -gt 0) {
+                $sameBusinessFamily = [string]::IsNullOrWhiteSpace($preferredFamily) -or ([string]$candidate.businessFamilyKey -eq $preferredFamily)
+                if ($candidate.score -gt 0 -and $sameBusinessFamily) {
                     foreach ($term in $candidate.matchedTerms) { $matchedTermSet[[string]$term] = $true }
                     $scored.Add($candidate) | Out-Null
                 }
@@ -1856,7 +2533,7 @@ function Build-DynamicProjectContext([string]$Root, [string]$Question, [string]$
         }
 
         $initialLimit = [Math]::Max(1, [Math]::Min($DynamicProjectContextMaxFiles, [int][Math]::Ceiling($DynamicProjectContextMaxFiles * 0.65)))
-        $selected = @($scored | Sort-Object @{ Expression = "score"; Descending = $true }, @{ Expression = "sizeBytes"; Descending = $false } | Select-Object -First $initialLimit)
+        $selected = @(Select-DynamicBusinessContextCandidates $scored $initialLimit)
         $selectedPathSet = @{}
         foreach ($item in $selected) {
             $selectedPathSet[[string]$item.path] = $true
@@ -1870,7 +2547,8 @@ function Build-DynamicProjectContext([string]$Root, [string]$Question, [string]$
             foreach ($file in $files) {
                 try {
                     $candidate = Get-DynamicProjectCandidateScore $file $Root $expansionTerms $questionLower
-                    if ($candidate.score -gt 0 -and -not $selectedPathSet.ContainsKey([string]$candidate.path)) {
+                    $sameBusinessFamily = [string]::IsNullOrWhiteSpace($preferredFamily) -or ([string]$candidate.businessFamilyKey -eq $preferredFamily)
+                    if ($candidate.score -gt 0 -and $sameBusinessFamily -and -not $selectedPathSet.ContainsKey([string]$candidate.path)) {
                         $candidate | Add-Member -NotePropertyName contextSource -NotePropertyValue "linked-reference-expansion" -Force
                         $expandedScored.Add($candidate) | Out-Null
                     }
@@ -1878,7 +2556,7 @@ function Build-DynamicProjectContext([string]$Root, [string]$Question, [string]$
             }
 
             $remainingSlots = $DynamicProjectContextMaxFiles - $selected.Count
-            $expanded = @($expandedScored | Sort-Object @{ Expression = "score"; Descending = $true }, @{ Expression = "sizeBytes"; Descending = $false } | Select-Object -First $remainingSlots)
+            $expanded = @(Select-DynamicBusinessContextCandidates $expandedScored $remainingSlots)
             if ($expanded.Count -gt 0) {
                 $combined = New-Object System.Collections.Generic.List[object]
                 foreach ($item in $selected) { $combined.Add($item) | Out-Null }
@@ -1900,6 +2578,9 @@ function Build-DynamicProjectContext([string]$Root, [string]$Question, [string]$
 
         $parts = New-Object System.Collections.Generic.List[string]
         $parts.Add("동적 프로젝트 컨텍스트(현재 질문 기준 best-effort 관련 파일 검색 + 연결 파일 확장)") | Out-Null
+        if (-not [string]::IsNullOrWhiteSpace($preferredFamily)) {
+            $parts.Add("- 현재 탐색 업무 패밀리 제한: $preferredFamily (다른 업무군/공통 기술 파일은 이번 컨텍스트에서 제외)") | Out-Null
+        }
         $parts.Add("- 추출 검색어: $termText") | Out-Null
         $parts.Add("- 연결 확장 검색어(import/XML id/클래스 참조 기반): $expansionTermText") | Out-Null
         if ($missing.Count -gt 0) {
@@ -1919,7 +2600,7 @@ function Build-DynamicProjectContext([string]$Root, [string]$Question, [string]$
                 Select-Object -First 5 |
                 ForEach-Object { $_.path })
             if ($pivotCandidates.Count -gt 0) {
-                $parts.Add("- 다음 질문 확장 힌트: 현재 파일/메서드만 반복하지 말고, 가능하면 연결 확장 파일($($pivotCandidates -join ', ')) 중 하나를 주 대상으로 삼아 책임/데이터 계약/호출 흐름을 검증합니다.") | Out-Null
+                $parts.Add("- 다음 질문 증거 힌트: 연결 파일($($pivotCandidates -join ', ')) 자체를 새 주제로 삼지 말고, 현재 미확인 업무 용어·상태·원천/대상 데이터·downstream을 검증하는 증거로 사용합니다.") | Out-Null
             } elseif ($selected.Count -gt 1) {
                 $primaryPath = [string]$selected[0].path
                 $relatedCandidates = @($selected |
@@ -1927,7 +2608,7 @@ function Build-DynamicProjectContext([string]$Root, [string]$Question, [string]$
                     Select-Object -First 5 |
                     ForEach-Object { $_.path })
                 if ($relatedCandidates.Count -gt 0) {
-                    $parts.Add("- 다음 질문 확장 힌트: 현재 주 대상($primaryPath)만 반복하지 말고, 가능하면 함께 발견된 연결/보조 파일($($relatedCandidates -join ', ')) 중 하나를 주 대상으로 삼아 책임/데이터 계약/호출 흐름을 검증합니다.") | Out-Null
+                    $parts.Add("- 다음 질문 증거 힌트: 보조 파일($($relatedCandidates -join ', '))은 파일 기술 구조가 아니라 현재 업무 가설과 데이터 의미를 교차 검증하는 데 사용합니다.") | Out-Null
                 }
             }
         }
@@ -1966,9 +2647,11 @@ $excerpt
                     source = $_.contextSource
                     reasons = $_.reasons
                     matchedTerms = $_.matchedTerms
+                    businessFamilyKey = $_.businessFamilyKey
                 }
             })
             missingTerms = $missing
+            preferredBusinessFamily = $preferredFamily
             error = ""
         }
     } catch {
@@ -1977,6 +2660,7 @@ $excerpt
             terms = @()
             files = @()
             missingTerms = @()
+            preferredBusinessFamily = $preferredFamily
             error = [string]$_.Exception.Message
         }
     }
@@ -2188,7 +2872,181 @@ function Select-ProjectQuestionCandidateSet($Items, [int]$Count, [int]$PoolSize,
     return @($selected.ToArray())
 }
 
-function Select-ProjectQuestionCandidates($Files, [int]$Count, [int]$PoolSize) {
+function Get-ExplorationHistoryKey([string]$Value) {
+    if ([string]::IsNullOrWhiteSpace($Value)) { return "" }
+    return (($Value -replace '\\', '/') -replace '/+', '/').Trim().ToLowerInvariant()
+}
+
+function Get-ProjectExplorationAvoidance([string]$HistoryPath, [int]$MaxRecords = 80) {
+    $paths = @{}
+    $groups = @{}
+    $families = @{}
+    $records = New-Object System.Collections.Generic.List[object]
+    if (-not [string]::IsNullOrWhiteSpace($HistoryPath) -and (Test-Path -LiteralPath $HistoryPath -PathType Leaf)) {
+        $lines = @(Get-Content -LiteralPath $HistoryPath -Encoding UTF8 -ErrorAction SilentlyContinue | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        $start = [Math]::Max(0, $lines.Count - $MaxRecords)
+        for ($i = $start; $i -lt $lines.Count; $i++) {
+            try {
+                $record = $lines[$i] | ConvertFrom-Json
+                $records.Add($record) | Out-Null
+                $pathKey = Get-ExplorationHistoryKey ([string]$record.primaryPath)
+                $groupKey = Get-ExplorationHistoryKey ([string]$record.primaryGroupKey)
+                $familyKey = Get-ExplorationHistoryKey ([string]$record.businessFamily)
+                if ($pathKey) { $paths[$pathKey] = $true }
+                if ($groupKey) { $groups[$groupKey] = $true }
+                if ($familyKey) { $families[$familyKey] = $true }
+            } catch { }
+        }
+    }
+    $recent = @($records.ToArray() | Select-Object -Last 12 | ForEach-Object {
+        $label = if (-not [string]::IsNullOrWhiteSpace([string]$_.businessFamily)) { [string]$_.businessFamily } elseif (-not [string]::IsNullOrWhiteSpace([string]$_.primaryGroupKey)) { [string]$_.primaryGroupKey } else { [string]$_.primaryPath }
+        if (-not [string]::IsNullOrWhiteSpace($label)) { $label }
+    })
+    $recentFamilies = @{}
+    foreach ($record in @($records.ToArray() | Select-Object -Last 4)) {
+        $familyKey = Get-ExplorationHistoryKey ([string]$record.businessFamily)
+        if ($familyKey) { $recentFamilies[$familyKey] = $true }
+    }
+    $lastRecord = @($records.ToArray() | Select-Object -Last 1)[0]
+    $immediateFamily = if ($lastRecord) { Get-ExplorationHistoryKey ([string]$lastRecord.businessFamily) } else { "" }
+    return [PSCustomObject]@{
+        historyPath = $HistoryPath
+        recordCount = $records.Count
+        paths = $paths
+        groups = $groups
+        families = $families
+        recentFamilies = $recentFamilies
+        immediateFamily = $immediateFamily
+        recentLabels = $recent
+    }
+}
+
+function Add-ProjectExplorationHistory([string]$HistoryPath, $Scan, [string]$SessionId, [string]$Reason) {
+    if ([string]::IsNullOrWhiteSpace($HistoryPath) -or $null -eq $Scan) { return }
+    $record = [ordered]@{
+        schema = "qwen-loop-project-exploration/v1"
+        selectedAt = (Get-Date).ToString("o")
+        projectRoot = $Scan.root
+        sessionId = $SessionId
+        cycle = $Scan.explorationCycle
+        reason = $Reason
+        primaryPath = $Scan.primaryQuestionCandidateFile
+        primaryGroupKey = $Scan.primaryQuestionCandidateGroupKey
+        primaryGroupLabel = $Scan.primaryQuestionCandidateGroup
+        businessFamily = $Scan.primaryBusinessFamily
+        candidatePaths = @($Scan.questionCandidateFiles)
+    }
+    Append-Utf8File $HistoryPath (($record | ConvertTo-Json -Compress -Depth 20) + "`n")
+}
+
+function Get-ProjectExplorationPhase([int]$Turn, [int]$TurnsPerCycle) {
+    $safeTurns = [Math]::Max(1, $TurnsPerCycle)
+    $safeTurn = [Math]::Max(1, [Math]::Min($Turn, $safeTurns))
+    if ($safeTurn -eq 1) {
+        return [PSCustomObject]@{ index = 1; key = "business-discovery"; label = "업무 발견"; instruction = "새 업무 슬라이스의 actor, trigger, precondition, 목적, 결과를 코드 근거로 가설화한다." }
+    }
+    if ($safeTurn -eq $safeTurns) {
+        return [PSCustomObject]@{ index = 5; key = "business-report"; label = "업무 보고서"; instruction = "이 프로그램이 수행하는 업무를 결론 내리고 evidence/confidence/gaps 및 다음 탐색 후보를 정리한다." }
+    }
+    $middleIndex = [Math]::Min(4, [Math]::Max(2, 1 + [int][Math]::Ceiling((($safeTurn - 1) * 3.0) / [Math]::Max(1, $safeTurns - 1))))
+    switch ($middleIndex) {
+        2 { return [PSCustomObject]@{ index = 2; key = "business-data-contract"; label = "업무 용어·데이터 계약"; instruction = "Mapper XML의 statement/table/column/comment와 VO·DTO field/comment를 연결해 업무 용어와 데이터 의미를 확정한다." } }
+        3 { return [PSCustomObject]@{ index = 3; key = "normal-process"; label = "정상 업무 프로세스"; instruction = "Tasklet·Controller에서 Service, Mapper, DB, downstream까지 정상 흐름과 상태 변화를 8~12단계로 추적한다." } }
+        default { return [PSCustomObject]@{ index = 4; key = "cross-validation"; label = "업무 가설 교차 검증"; instruction = "다른 계층과 upstream/downstream 증거로 앞선 업무 가설을 확인 또는 반증하고 미확인 항목을 줄인다." } }
+    }
+}
+
+function Get-CycleBusinessEvidenceExcerpt([string]$Answer, [int]$MaxChars = 1500) {
+    if ([string]::IsNullOrWhiteSpace($Answer)) { return "" }
+    $priority = New-Object System.Collections.Generic.List[string]
+    $priority.Add("[opening conclusion] $(Get-TextPrefix (($Answer -replace '\s+', ' ').Trim()) 350)") | Out-Null
+    foreach ($line in ($Answer -split "`r?`n")) {
+        $trimmed = (Remove-BomAndTrim $line)
+        if ([string]::IsNullOrWhiteSpace($trimmed) -or $trimmed -match '^NEXT_QUESTION\s*[:：]') { continue }
+        if ($trimmed -match '업무|목적|사용자|배치|입력|판단|상태|테이블|컬럼|필드|근거|사실|추론|미확인|정상|흐름|결과|용어|단계|원천|저장|소비|승인|확정|기준일|(?i)\b(actor|trigger|precondition|result|table|column|field|status|state|downstream|fact|inference|unknown)\b|\b(?:TB|TBL|VW|V)_[A-Z0-9_]{3,}\b|#\{[^}]+\}') {
+            $priority.Add($trimmed) | Out-Null
+        }
+        if (($priority -join "`n").Length -ge $MaxChars) { break }
+    }
+    $text = ($priority -join "`n").Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) { $text = Get-TextPrefix $Answer $MaxChars }
+    return Get-TextPrefix $text $MaxChars
+}
+
+function Add-CycleEvidenceMemory([string]$Path, [int]$Cycle, [int]$Turn, [string]$Status, [string]$Question, [string]$Answer) {
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+    $excerpt = Get-CycleBusinessEvidenceExcerpt $Answer 1500
+    if ([string]::IsNullOrWhiteSpace($excerpt)) { return }
+    $block = "## cycle $Cycle / turn $Turn / $Status`nQuestion: $(Get-TextPrefix (($Question -replace '\s+', ' ').Trim()) 350)`nEvidence:`n$excerpt`n"
+    $blocks = New-Object System.Collections.Generic.List[string]
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+        $existing = Read-Utf8File $Path
+        foreach ($existingBlock in @([regex]::Split($existing, '(?m)(?=^## cycle )') | Where-Object { $_ -match '^## cycle ' })) {
+            $blocks.Add($existingBlock.Trim()) | Out-Null
+        }
+    }
+    $blocks.Add($block.Trim()) | Out-Null
+    $combined = "# Compact business evidence memory`n`n" + (($blocks.ToArray()) -join "`n`n") + "`n"
+    while ($combined.Length -gt 9000 -and $blocks.Count -gt 1) {
+        $blocks.RemoveAt(0)
+        $combined = "# Compact business evidence memory`n`n" + (($blocks.ToArray()) -join "`n`n") + "`n"
+    }
+    Write-Utf8File $Path $combined
+}
+
+function Select-NovelProjectPrimary($Items, $Avoidance) {
+    $all = @($Items | Where-Object { $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.path) })
+    if ($all.Count -eq 0) { return $null }
+    $tiers = New-Object System.Collections.Generic.List[object]
+    if ($Avoidance) {
+        $tiers.Add(@($all | Where-Object {
+            $pathKey = Get-ExplorationHistoryKey ([string]$_.path)
+            $groupKey = Get-ExplorationHistoryKey ([string]$_.questionGroupKey)
+            $familyKey = Get-ExplorationHistoryKey ([string]$_.businessFamilyKey)
+            -not $Avoidance.paths.ContainsKey($pathKey) -and -not $Avoidance.groups.ContainsKey($groupKey) -and ([string]::IsNullOrWhiteSpace($familyKey) -or -not $Avoidance.families.ContainsKey($familyKey))
+        })) | Out-Null
+        if ($Avoidance.recentFamilies -and $Avoidance.recentFamilies.Count -gt 0) {
+            $tiers.Add(@($all | Where-Object {
+                $familyKey = Get-ExplorationHistoryKey ([string]$_.businessFamilyKey)
+                -not $Avoidance.paths.ContainsKey((Get-ExplorationHistoryKey ([string]$_.path))) -and
+                    ([string]::IsNullOrWhiteSpace($familyKey) -or -not $Avoidance.recentFamilies.ContainsKey($familyKey))
+            })) | Out-Null
+        }
+        if (-not [string]::IsNullOrWhiteSpace([string]$Avoidance.immediateFamily)) {
+            $tiers.Add(@($all | Where-Object {
+                $familyKey = Get-ExplorationHistoryKey ([string]$_.businessFamilyKey)
+                -not $Avoidance.paths.ContainsKey((Get-ExplorationHistoryKey ([string]$_.path))) -and
+                    ([string]::IsNullOrWhiteSpace($familyKey) -or $familyKey -ne [string]$Avoidance.immediateFamily)
+            })) | Out-Null
+        }
+        $tiers.Add(@($all | Where-Object { -not $Avoidance.paths.ContainsKey((Get-ExplorationHistoryKey ([string]$_.path))) })) | Out-Null
+        if (-not [string]::IsNullOrWhiteSpace([string]$Avoidance.immediateFamily)) {
+            $tiers.Add(@($all | Where-Object {
+                $familyKey = Get-ExplorationHistoryKey ([string]$_.businessFamilyKey)
+                [string]::IsNullOrWhiteSpace($familyKey) -or $familyKey -ne [string]$Avoidance.immediateFamily
+            })) | Out-Null
+        }
+    }
+    $tiers.Add($all) | Out-Null
+
+    foreach ($tier in $tiers) {
+        $pool = @($tier)
+        if ($pool.Count -eq 0) { continue }
+        $groups = @(Get-ProjectQuestionGroups $pool)
+        if ($groups.Count -eq 0) { return (Select-WeightedProjectFile ($pool | Select-Object -First 20)) }
+        $businessGroups = @($groups | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.businessFamily) })
+        if ($businessGroups.Count -gt 0) { $groups = $businessGroups }
+        $group = $groups[(Get-Random -Minimum 0 -Maximum $groups.Count)]
+        $evidenceFiles = @($group.files | Where-Object {
+            [string]$_.questionGroupRole -in @("domain-model", "batch-process") -or ([string]$_.extension).ToLowerInvariant() -in @(".xml", ".sql")
+        } | Select-Object -First 12)
+        if ($evidenceFiles.Count -eq 0) { $evidenceFiles = @($group.files | Select-Object -First 12) }
+        return (Select-WeightedProjectFile $evidenceFiles)
+    }
+    return $all[0]
+}
+
+function Select-ProjectQuestionCandidates($Files, [int]$Count, [int]$PoolSize, $Avoidance = $null) {
     $rawItems = @($Files | Where-Object { $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.path) })
     $items = @($rawItems | Where-Object { Test-ProjectQuestionSeedCandidate $_ })
     if ($items.Count -eq 0) { $items = $rawItems }
@@ -2200,12 +3058,42 @@ function Select-ProjectQuestionCandidates($Files, [int]$Count, [int]$PoolSize) {
     $primaryItems = @($items | Where-Object { Test-ProjectPrimaryQuestionSeedCandidate $_ })
     if ($primaryItems.Count -eq 0) { $primaryItems = $items }
 
-    $primary = @(Select-ProjectQuestionCandidateSet $primaryItems 1 $PoolSize $selectedPaths)
-    foreach ($file in $primary) { $selected.Add($file) | Out-Null }
+    $primary = Select-NovelProjectPrimary $primaryItems $Avoidance
+    if ($primary) {
+        $selected.Add($primary) | Out-Null
+        $selectedPaths[[string]$primary.path] = $true
+    }
+
+    $sliceItems = $items
+    if ($primary) {
+        $primaryFamily = ([string]$primary.businessFamilyKey).Trim().ToLowerInvariant()
+        $primaryGroupKey = [string]$primary.questionGroupKey
+        if (-not [string]::IsNullOrWhiteSpace($primaryFamily)) {
+            $sliceItems = @($items | Where-Object { ([string]$_.businessFamilyKey).Trim().ToLowerInvariant() -eq $primaryFamily })
+        } elseif (-not [string]::IsNullOrWhiteSpace($primaryGroupKey)) {
+            $sliceItems = @($items | Where-Object { [string]$_.questionGroupKey -eq $primaryGroupKey })
+        }
+        if ($sliceItems.Count -eq 0) { $sliceItems = @($primary) }
+    }
+
+    # A business slice is assembled from different roles in the same family/group.
+    if ($primary -and $selected.Count -lt $Count) {
+        $sameGroup = @($sliceItems | Where-Object { -not $selectedPaths.ContainsKey([string]$_.path) })
+        $roleOrder = @("domain-model", "db-sql", "batch-process", "service-domain", "api-boundary", "code")
+        foreach ($role in $roleOrder) {
+            if ($selected.Count -ge $Count) { break }
+            $rolePool = @($sameGroup | Where-Object { [string]$_.questionGroupRole -eq $role } | Select-Object -First 12)
+            $supportFile = Select-WeightedProjectFile $rolePool
+            if ($supportFile -and -not $selectedPaths.ContainsKey([string]$supportFile.path)) {
+                $selected.Add($supportFile) | Out-Null
+                $selectedPaths[[string]$supportFile.path] = $true
+            }
+        }
+    }
 
     $remainingCount = $Count - $selected.Count
     if ($remainingCount -gt 0) {
-        $support = @(Select-ProjectQuestionCandidateSet $items $remainingCount $PoolSize $selectedPaths)
+        $support = @(Select-ProjectQuestionCandidateSet $sliceItems $remainingCount $PoolSize $selectedPaths)
         foreach ($file in $support) { $selected.Add($file) | Out-Null }
     }
 
@@ -2227,7 +3115,7 @@ function Test-ProjectScanBootstrapQuestion([string]$Question) {
     return $false
 }
 
-function New-ProjectScanContext([string]$Root) {
+function New-ProjectScanContext([string]$Root, $Avoidance = $null, [int]$ExplorationCycle = 1) {
     if ([string]::IsNullOrWhiteSpace($Root)) { return $null }
 
     Assert-ProjectScanConfig
@@ -2254,19 +3142,23 @@ function New-ProjectScanContext([string]$Root) {
             label = $_.label
             role = $_.role
             anchorPath = $_.anchorPath
+            businessFamily = $_.businessFamily
             fileCount = $_.fileCount
             maxScore = $_.maxScore
             representativeFile = $_.representativeFile
             topFiles = @($_.files | Select-Object -First 5 | ForEach-Object { $_.path })
         }
     })
-    $questionCandidates = @(Select-ProjectQuestionCandidates $ranked 5 80)
+    $questionCandidates = @(Select-ProjectQuestionCandidates $ranked 7 80 $Avoidance)
     $primaryQuestionCandidate = if ($questionCandidates.Count -gt 0) { $questionCandidates[0] } else { $null }
+    $primaryBusinessFamily = if ($primaryQuestionCandidate) { ([string]$primaryQuestionCandidate.businessFamilyKey).Trim().ToLowerInvariant() } else { "" }
+    $primaryQuestionGroupKey = if ($primaryQuestionCandidate) { [string]$primaryQuestionCandidate.questionGroupKey } else { "" }
 
     $contextParts = New-Object System.Collections.Generic.List[string]
     $contextParts.Add("Project root: $resolvedRoot") | Out-Null
     $contextParts.Add("Detected stack: $($stack -join ', ')") | Out-Null
     $contextParts.Add("Scanned text files: $($files.Count); selected key files: $($selected.Count)") | Out-Null
+    $contextParts.Add("Exploration cycle: $ExplorationCycle; recent project-specific selections excluded first: $(if ($Avoidance) { $Avoidance.recordCount } else { 0 })") | Out-Null
     $contextParts.Add("") | Out-Null
     $contextParts.Add("Diversity groups discovered from project structure:") | Out-Null
     if ($questionGroupSummaries.Count -gt 0) {
@@ -2308,11 +3200,30 @@ function New-ProjectScanContext([string]$Root) {
     $contextParts.Add("") | Out-Null
     $contextParts.Add("Selected excerpts, with this startup's question candidates first:") | Out-Null
     $candidatePathSet = @{}
-    foreach ($item in $questionCandidates) { $candidatePathSet[[string]$item.path] = $true }
     $excerptItems = New-Object System.Collections.Generic.List[object]
-    foreach ($item in $questionCandidates) { $excerptItems.Add($item) | Out-Null }
+    $excludedExcerptRoles = @("technical-core", "config-security", "config-data", "docs", "script-launcher", "script-main", "test", "entry-build")
+    foreach ($item in $questionCandidates) {
+        $sameSlice = if (-not [string]::IsNullOrWhiteSpace($primaryBusinessFamily)) {
+            ([string]$item.businessFamilyKey).Trim().ToLowerInvariant() -eq $primaryBusinessFamily
+        } elseif (-not [string]::IsNullOrWhiteSpace($primaryQuestionGroupKey)) {
+            [string]$item.questionGroupKey -eq $primaryQuestionGroupKey
+        } else { $true }
+        $itemRole = [string]$item.questionGroupRole
+        if ($sameSlice -and -not ($excludedExcerptRoles -contains $itemRole)) {
+            $candidatePathSet[[string]$item.path] = $true
+            $excerptItems.Add($item) | Out-Null
+        }
+    }
     foreach ($item in $selected) {
-        if (-not $candidatePathSet.ContainsKey([string]$item.path)) { $excerptItems.Add($item) | Out-Null }
+        $sameSlice = if (-not [string]::IsNullOrWhiteSpace($primaryBusinessFamily)) {
+            ([string]$item.businessFamilyKey).Trim().ToLowerInvariant() -eq $primaryBusinessFamily
+        } elseif (-not [string]::IsNullOrWhiteSpace($primaryQuestionGroupKey)) {
+            [string]$item.questionGroupKey -eq $primaryQuestionGroupKey
+        } else { $true }
+        $itemRole = [string]$item.questionGroupRole
+        if ($sameSlice -and -not ($excludedExcerptRoles -contains $itemRole) -and -not $candidatePathSet.ContainsKey([string]$item.path)) {
+            $excerptItems.Add($item) | Out-Null
+        }
     }
     $usedChars = ($contextParts -join "`n").Length
     foreach ($item in $excerptItems) {
@@ -2333,12 +3244,13 @@ $excerpt
 
     $promptContext = Get-TextPrefix (($contextParts -join "`n") + "`n") $ProjectScanMaxTotalChars
 
-    $seedQuestion = "아래 프로젝트 스캔 결과의 핵심 파일과 코드 조각을 바탕으로, 이번 실행에서 실제 업무 도메인 또는 사용자 시나리오 하나를 새롭게 골라 정상 흐름의 구조, 주요 데이터/상태 이동, 연결 파일, 마지막 점검 포인트를 구체적으로 분석해줘. 예외나 장애 가능성은 중요하지만 전체 답변의 중심이 아니라 마지막 리스크 점검 항목으로 다뤄줘."
+    $seedQuestion = "프로젝트 탐색 주기 ${ExplorationCycle}의 새 업무 슬라이스를 시작한다. 코드 구조가 아니라 이 프로그램이 누가·언제·왜 수행하는 무슨 업무인지 먼저 복원해줘. Mapper XML의 statement/table/column/comment, VO·DTO의 field/comment, Tasklet·Job의 입력값과 정상 데이터 흐름을 교차 확인하고 확인된 사실·추론·미확인을 구분해줘. 기술 구현과 리스크는 업무 결과에 영향을 주는 범위에서 마지막 15~20%에만 다뤄줘."
     if ($primaryQuestionCandidate -and -not [string]::IsNullOrWhiteSpace([string]$primaryQuestionCandidate.path)) {
         $supportNames = (($questionCandidates | Select-Object -Skip 1 | ForEach-Object { $_.path }) -join ", ")
         if ([string]::IsNullOrWhiteSpace($supportNames)) { $supportNames = "없음" }
         $groupName = if (-not [string]::IsNullOrWhiteSpace([string]$primaryQuestionCandidate.questionGroupLabel)) { [string]$primaryQuestionCandidate.questionGroupLabel } else { "미분류 구조 그룹" }
-        $seedQuestion = "이번 실행의 업무 도메인 탐색 출발점은 구조 그룹 $groupName, 주 대상 파일 $($primaryQuestionCandidate.path)입니다. 이 파일이 담당하는 화면/기능/사용자 업무를 먼저 식별하고, 입력값·상태·API/DB·렌더링/응답으로 이어지는 정상 업무 흐름을 중심으로 분석해줘. 보조 후보 파일은 $supportNames 입니다. 보조 후보와 import/호출 관계는 연결 확인용으로 활용하되 주제를 임의로 바꾸지 마. 답변은 1) 업무 도메인/사용자 시나리오, 2) 주 대상 파일의 책임과 주요 데이터 흐름, 3) 다음에 확인해야 할 연결 파일과 확인 이유, 4) 예외·성능·보안 등 리스크 점검 순서로 작성해줘. 오류 가능성은 전체 분석을 대체하지 말고 마지막 점검 항목으로만 다뤄줘."
+        $familyName = if (-not [string]::IsNullOrWhiteSpace([string]$primaryQuestionCandidate.businessFamilyKey)) { [string]$primaryQuestionCandidate.businessFamilyKey } else { "미확인 업무군" }
+        $seedQuestion = "프로젝트 탐색 주기 ${ExplorationCycle}의 새 업무 슬라이스는 $familyName, 출발 근거는 $($primaryQuestionCandidate.path)입니다. 파일 자체의 기술 구조를 설명하는 데 머물지 말고 누가·언제·왜 실행하여 어떤 업무 결과를 만드는지 복원해줘. 보조 증거 파일은 $supportNames 입니다. Mapper XML의 table/column/comment와 statement, VO·DTO field/comment, Tasklet·Job parameter, Service 호출을 연결하여 업무 용어 사전과 정상 데이터 lineage를 제시해줘. 답변은 업무 목적·actor/trigger/result, 업무 용어/상태, 정상 흐름 8~12단계, read/write 데이터와 downstream, 사실/추론/미확인 및 파일+identifier 근거 순서로 작성하고 기술 리스크는 마지막 15~20%에만 다뤄줘."
     } elseif ($selected.Count -gt 0) {
         $candidateNames = (($questionCandidates | ForEach-Object { $_.path }) -join ", ")
         $seedQuestion = "프로젝트 핵심 후보 파일($candidateNames)을 바탕으로, 이번 실행에서는 후보 중 하나를 새롭게 골라 실제 업무 도메인 또는 사용자 시나리오 하나의 정상 흐름, 주요 데이터/상태 이동, 다음에 확인해야 할 연결 파일, 마지막 리스크 점검 포인트를 구체적으로 분석해줘. 예외나 장애 가능성은 전체 주제가 아니라 마지막 점검 항목으로 다뤄줘."
@@ -2347,11 +3259,14 @@ $excerpt
     return [PSCustomObject]@{
         root = $resolvedRoot
         generatedAt = (Get-Date).ToString("o")
+        explorationCycle = $ExplorationCycle
         scannedFileCount = $files.Count
         selectedFileCount = $selected.Count
         detectedStack = $stack
         primaryQuestionCandidateFile = if ($primaryQuestionCandidate) { $primaryQuestionCandidate.path } else { "" }
         primaryQuestionCandidateGroup = if ($primaryQuestionCandidate) { $primaryQuestionCandidate.questionGroupLabel } else { "" }
+        primaryQuestionCandidateGroupKey = if ($primaryQuestionCandidate) { $primaryQuestionCandidate.questionGroupKey } else { "" }
+        primaryBusinessFamily = $primaryBusinessFamily
         questionGroupCount = $questionGroups.Count
         questionGroups = $questionGroupSummaries
         selectedFiles = @($selected | ForEach-Object {
@@ -2365,6 +3280,7 @@ $excerpt
                 questionGroupLabel = $_.questionGroupLabel
                 questionGroupRole = $_.questionGroupRole
                 questionGroupAnchorPath = $_.questionGroupAnchorPath
+                businessFamilyKey = $_.businessFamilyKey
                 excerptChars = ([string]$_.excerpt).Length
             }
         })
@@ -2378,6 +3294,7 @@ $excerpt
                 questionGroupLabel = $_.questionGroupLabel
                 questionGroupRole = $_.questionGroupRole
                 questionGroupAnchorPath = $_.questionGroupAnchorPath
+                businessFamilyKey = $_.businessFamilyKey
             }
         })
         promptContext = $promptContext
@@ -2420,11 +3337,13 @@ function Write-ProjectScanFiles($Scan, [string]$WorkDirPath) {
 
 - Root: $($Scan.root)
 - Generated: $($Scan.generatedAt)
+- Exploration cycle: $($Scan.explorationCycle)
 - Detected stack: $($Scan.detectedStack -join ", ")
 - Scanned files: $($Scan.scannedFileCount)
 - Selected key files: $($Scan.selectedFileCount)
 - Primary question target: $($Scan.primaryQuestionCandidateFile)
 - Primary question group: $($Scan.primaryQuestionCandidateGroup)
+- Primary business family: $($Scan.primaryBusinessFamily)
 - Diversity groups: $($Scan.questionGroupCount)
 
 ## Key File Candidates
@@ -2456,20 +3375,42 @@ $(Get-TextPrefix $Scan.promptContext 12000)
 
     Write-Utf8File $mdPath $md
     Write-Utf8File $jsonPath ($Scan | ConvertTo-Json -Depth 50)
+    if ([int]$Scan.explorationCycle -gt 0) {
+        Write-Utf8File (Join-Path $WorkDirPath ("project_scan_cycle_{0:D3}.md" -f [int]$Scan.explorationCycle)) $md
+        Write-Utf8File (Join-Path $WorkDirPath ("project_scan_cycle_{0:D3}.json" -f [int]$Scan.explorationCycle)) ($Scan | ConvertTo-Json -Depth 50)
+    }
+}
+
+function Get-NextQuestionExtraction([string]$content, [int]$MaxQuestionChars = 1500) {
+    $lines = @($content -split "`r?`n" | ForEach-Object { Remove-BomAndTrim $_ } | Where-Object { $_ -ne "" })
+    for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+        $line = [string]$lines[$i]
+        if ($line -match '^NEXT_QUESTION\s*[:：]\s*(.*)$') {
+            $question = $Matches[1].Trim()
+            if (-not [string]::IsNullOrWhiteSpace($question)) {
+                if ($question.Length -gt $MaxQuestionChars) { $question = $question.Substring(0, $MaxQuestionChars).TrimEnd() }
+                $isFinalLine = ($i -eq ($lines.Count - 1))
+                return [PSCustomObject]@{ question = $question; explicitMarkerFound = $isFinalLine; markerLineIndex = $i; markerIsFinalLine = $isFinalLine }
+            }
+        }
+    }
+    return [PSCustomObject]@{
+        question = "직전 답변에서 아직 확인되지 않은 업무 용어·상태·데이터 흐름 하나를 골라, 관련 Mapper XML과 VO/DTO 증거로 검증할 후속 질문을 만들어줘."
+        explicitMarkerFound = $false
+        markerLineIndex = -1
+        markerIsFinalLine = $false
+    }
 }
 
 function Extract-NextQuestion([string]$content) {
-    $lines = $content -split "`r?`n" | ForEach-Object { Remove-BomAndTrim $_ } | Where-Object { $_ -ne "" }
-    foreach ($line in $lines) {
-        if ($line -match '^NEXT_QUESTION\s*[:：]\s*(.+)$') { return $Matches[1].Trim() }
-    }
-    if ($lines.Count -gt 0) {
-        $candidate = $lines[0] -replace '^[-#\d\.\s]+', ''
-        $candidate = $candidate -replace '^다음\s*질문\s*[:：]\s*', ''
-        if ($candidate.Length -gt 300) { $candidate = $candidate.Substring(0, 300) }
-        return $candidate.Trim()
-    }
-    return "직전 답변에서 아직 검증되지 않은 핵심 가정 하나를 골라, 같은 기술 트랙 안에서 더 좁고 깊게 분석할 후속 질문을 만들어줘."
+    return [string](Get-NextQuestionExtraction $content).question
+}
+
+function New-PartialResponseContinuationQuestion([string]$OriginalQuestion, [string]$FinishReason, [bool]$MarkerFound) {
+    $question = (($OriginalQuestion -replace '\s+', ' ').Trim())
+    if ($question.Length -gt 900) { $question = $question.Substring(0, 900).TrimEnd() + "..." }
+    $reason = if ($FinishReason -in @("length", "content_filter")) { "finish_reason=$FinishReason 로 응답이 완결되지 않았습니다" } elseif (-not $MarkerFound) { "응답에 명시적인 NEXT_QUESTION 마지막 줄이 없었습니다" } else { "응답을 완결 상태로 확인하지 못했습니다" }
+    return "직전 업무 질문 '$question'의 분석을 이어서 완성해줘. $reason. 이미 확정한 내용은 짧게만 연결하고, 누락된 업무 목적·용어·정상 흐름·Mapper table/column·VO field·상태 변화·downstream 근거를 우선 보충한 뒤, 마지막 비어 있지 않은 한 줄에 NEXT_QUESTION: 형식의 후속 업무 질문을 반드시 작성해줘."
 }
 
 function Get-AnswerPreview([string]$content, [int]$maxLines, [int]$maxChars) {
@@ -2573,7 +3514,7 @@ function Get-RecoveryQuestionFromLastTurn([string]$path) {
     $lastTurn = (Read-Utf8File $path).Trim()
     if ([string]::IsNullOrWhiteSpace($lastTurn)) { return "" }
 
-    return "아래 직전 루프 요약을 바탕으로, 이미 다룬 내용을 반복하지 말고 같은 기술 트랙 안에서 아직 검증되지 않은 핵심 가정 하나를 더 좁고 깊게 분석해줘.`n`n$lastTurn"
+    return "아래 직전 루프 요약을 바탕으로 이미 다룬 파일 기술 설명은 반복하지 말고, 아직 확인되지 않은 업무 용어·판단 규칙·상태 변화·원천/대상 데이터·downstream 소비 중 하나를 관련 Mapper XML과 VO/DTO 증거로 더 깊게 검증해줘.`n`n$lastTurn"
 }
 
 function Test-SameQuestionText([string]$Left, [string]$Right) {
@@ -2875,7 +3816,7 @@ function Build-SettingsAwareSystemPrompt($settings, $providerInfo) {
     if ($generationConfig) { $generationConfigJson = ($generationConfig | ConvertTo-Json -Depth 30) }
 
 @"
-너는 Java Spring Boot, MyBatis/JPA, React, TypeScript, 운영 배포 환경을 함께 보는 시니어 개발 아키텍트다.
+너는 코드 증거를 이용해 사용자의 업무와 도메인 프로세스를 복원하는 시니어 업무 분석가다. Java/Spring, MyBatis/JPA, React/TypeScript, 배치와 DB 지식은 업무 의미를 확인하는 도구이지 답변의 주제가 아니다.
 
 아래 정보는 Qwen settings에서 읽은 클라이언트 설정이다. 이 설정을 무시하지 말고 응답 방식과 작업 범위 판단에 반영한다.
 
@@ -2893,21 +3834,17 @@ $allowText
 
 매 응답은 반드시 아래 규칙을 지킨다.
 
-1. 첫 번째 줄은 반드시 다음 형식 한 줄로만 작성한다.
-NEXT_QUESTION: 여기에 다음 루프에서 물어볼 구체적인 후속 질문을 한 문장으로 작성
-
-2. NEXT_QUESTION은 이전 답변이 없어도 이해될 정도로 구체적이고 자기완결적인 질문이어야 한다.
-3. 두 번째 줄부터는 현재 질문에 대한 답변을 settings.general.outputLanguage($outputLanguage)에 맞춰 자세히 작성한다.
-4. 답변은 실무 개발자가 바로 사용할 수 있게 구체적으로 작성한다.
-5. 프로젝트 파일 분석 질문에서는 예외/장애/보안 분석만으로 답변을 끌고 가지 말고, 먼저 업무 도메인 또는 사용자 시나리오, 파일의 책임, 정상 데이터/상태 흐름, 연결 파일을 설명한 뒤 리스크를 별도 점검 항목으로 다룬다.
-6. Java/Spring, React/TypeScript, DB, 운영, 보안, 테스트 중 현재 질문의 주 트랙을 먼저 판별하고, 명시적 이유가 없으면 다음 질문도 같은 트랙 안에서 이어간다.
-7. Java/Spring 질문과 React 질문을 한 질문 안에 억지로 묶지 않는다. 단, API contract, 데이터 계약, 상태 전파, 인증 경계처럼 경계 자체가 주제일 때만 양쪽을 함께 다룬다.
-8. NEXT_QUESTION은 최근 질문과 중복되지 않아야 하며, 단순한 "분석 순서"가 아니라 하나의 검증 가능한 업무 흐름, 데이터 계약, 상태 전이, 설계 trade-off, 성능/동시성/보안/테스트 쟁점으로 좁힌다. 실패 모드만 반복해서 다음 질문의 중심으로 삼지 않는다.
-9. 코드베이스 내용이 제공되지 않은 경우에는 추측을 확정처럼 말하지 말고, 확인해야 할 파일과 명령을 제시한다.
-10. 다음 질문은 현재 답변에서 가장 중요한 미해결 지점이나 더 깊게 파고들 가치가 있는 지점으로 만든다.
-11. NEXT_QUESTION에는 가능하면 다음 루프에서 확인해야 할 구체적인 파일명, 클래스명, 메서드명, Mapper id, SQL/설정 키를 포함한다.
-12. 동적 프로젝트 컨텍스트에 "다음 질문 확장 힌트" 또는 linked-reference-expansion 파일이 있으면, NEXT_QUESTION은 현재 파일/메서드만 반복하지 말고 그 연결 파일 중 하나를 주 대상으로 삼아 책임, 데이터 계약, 호출 흐름을 검증하도록 만든다.
-13. 너무 짧게 답하지 말고, 가능한 한 깊이 있는 분석, 체크리스트, 예시, 반례, 검증 방법을 포함한다.
+1. 현재 질문의 상세 분석을 먼저 끝낸다. 마지막 비어 있지 않은 한 줄만 반드시 다음 형식으로 작성한다.
+NEXT_QUESTION: 여기에 다음 루프에서 검증할 자기완결적인 업무 질문 한 문장을 작성
+2. 프로젝트 분석 답변의 가시 본문 목표는 최소 $ProjectTargetAnswerChars 자, 대략 $ProjectTargetOutputTokens output tokens 이상이다. 충분한 근거가 있으면 8,000~12,000자 수준으로 깊게 작성하되 일반론이나 반복으로 분량을 채우지 않는다.
+3. 프로젝트 분석은 다음 구조를 사용한다: (a) 이 프로그램이 하는 업무 한 문장, (b) actor/trigger/precondition/result, (c) 업무 용어·데이터 사전 8개 이상, (d) 정상 업무 흐름 8~12단계, (e) read/write table·column·상태 변화와 downstream, (f) 확인된 사실/추론/미확인, (g) 각 핵심 결론의 file path+identifier 근거, (h) 마지막 기술 리스크.
+4. Mapper XML에서는 SQL 문법 자체보다 statement id, table, column, resultMap property-column, parameter/result type, 주석을 업무 의미의 증거로 사용한다. VO/DTO에서는 field, type, JavaDoc/한글 주석, Schema/Column/validation을 업무 용어의 증거로 사용한다.
+5. Tasklet/Job/Controller의 실행 계기와 입력부터 Service, Mapper, DB, 후속 Job/API/화면까지 정상 데이터 lineage를 우선 복원한다. @Transactional, 알고리즘, 디자인 패턴, 성능, 보안은 업무 결과에 영향을 주는 경우에만 전체의 15~20% 이내에서 마지막에 다룬다.
+6. 파일명·클래스명·연결 파일 자체를 다음 주제로 삼지 않는다. 연결 파일은 현재의 미확인 업무 용어, 판단 규칙, 상태 전이, 원천-대상 데이터, downstream 소비를 확인하는 증거다.
+7. 제공된 코드로 확정할 수 없는 내용은 추측을 사실처럼 말하지 않고 명시적으로 '추론' 또는 '미확인'으로 표시하며 필요한 파일/identifier를 적는다.
+8. NEXT_QUESTION은 답변을 모두 분석한 뒤 가장 가치 있는 미확인 업무 의미에서 만든다. 최근 업무군과 질문을 반복하지 말고, 기술 쟁점보다 업무 목적 → 용어/입력 → 판단/상태 → 데이터 lineage → downstream 순으로 우선한다.
+9. NEXT_QUESTION에는 필요한 경우 구체적인 Mapper id, table/column, VO field, JobParameter, 파일명을 포함하되 그 파일의 기술 구조가 아니라 어떤 업무 가설을 검증할지 명시한다.
+10. settings.general.outputLanguage($outputLanguage)에 맞춰 작성하고, 근거가 부족하면 억지로 길게 쓰지 말고 미확인 목록과 다음 검증 계획을 충실히 남긴다.
 "@
 }
 
@@ -2948,6 +3885,19 @@ function Build-RequestBody($settings, $providerInfo, [string]$systemPrompt, [str
                 if ($null -ne $p.Value) { $bodyObj[[string]$p.Name] = ConvertTo-PlainObject $p.Value }
             }
         }
+    }
+
+    # samplingParams/extra_body are settings-first overrides.  Normalize the
+    # final wire mode after those merges so transport and parser behavior can
+    # follow the request that is actually sent.
+    $effectiveStream = ConvertTo-BooleanValue (Get-JsonProperty $bodyObj "stream") (-not [bool]$NonStreaming)
+    $bodyObj["stream"] = $effectiveStream
+    if ($effectiveStream) {
+        if ($null -eq (Get-JsonProperty $bodyObj "stream_options")) {
+            $bodyObj["stream_options"] = @{ include_usage = $true }
+        }
+    } else {
+        $bodyObj.Remove("stream_options")
     }
     return $bodyObj
 }
@@ -3058,12 +4008,103 @@ function Get-OpenAIUsageFromRaw([string]$raw, [bool]$isStreaming) {
     }
 }
 
+function Get-OpenAIResponseMetadata([string]$raw, [bool]$isStreaming) {
+    $finishReason = ""
+    $usageRaw = $null
+    if ($isStreaming) {
+        foreach ($line in ($raw -split "`r?`n")) {
+            $trimmed = $line.Trim()
+            if (-not $trimmed.StartsWith("data:")) { continue }
+            $data = $trimmed.Substring(5).Trim()
+            if ([string]::IsNullOrWhiteSpace($data) -or $data -eq "[DONE]") { continue }
+            try {
+                $payload = $data | ConvertFrom-Json
+                $usage = Get-JsonProperty $payload "usage"
+                if ($usage) { $usageRaw = $usage }
+                foreach ($choice in @(Get-JsonProperty $payload "choices")) {
+                    if ($null -eq $choice) { continue }
+                    $finish = Get-JsonProperty $choice "finish_reason"
+                    if (-not [string]::IsNullOrWhiteSpace([string]$finish)) { $finishReason = [string]$finish }
+                }
+            } catch { }
+        }
+    } else {
+        try {
+            $payload = $raw | ConvertFrom-Json
+            $usage = Get-JsonProperty $payload "usage"
+            if ($usage) { $usageRaw = $usage }
+            foreach ($choice in @(Get-JsonProperty $payload "choices")) {
+                if ($null -eq $choice) { continue }
+                $finish = Get-JsonProperty $choice "finish_reason"
+                if (-not [string]::IsNullOrWhiteSpace([string]$finish)) { $finishReason = [string]$finish }
+            }
+        } catch { }
+    }
+
+    $reasoningTokens = $null
+    if ($usageRaw) {
+        $details = Get-JsonProperty $usageRaw "completion_tokens_details"
+        if ($null -eq $details) { $details = Get-JsonProperty $usageRaw "output_tokens_details" }
+        if ($details) { $reasoningTokens = Get-UsageNumber $details @("reasoning_tokens") }
+    }
+    return [PSCustomObject]@{
+        finishReason = if ([string]::IsNullOrWhiteSpace($finishReason)) { "unknown" } else { $finishReason }
+        reasoningTokens = $reasoningTokens
+    }
+}
+
+function Get-AnswerDepthFacts($usage, $metadata, [string]$answer, $effectiveMaxTokens, [bool]$isProject) {
+    $outputTokens = if ($usage) { $usage.outputTokens } else { $null }
+    $reasoningTokens = if ($metadata) { $metadata.reasoningTokens } else { $null }
+    $visibleOutputTokens = $outputTokens
+    $visibleTokenBasis = if ($null -ne $outputTokens) { "reported-output-no-reasoning-breakdown" } else { "unavailable" }
+    $reasoningAccountingValid = $null
+    if ($null -ne $outputTokens -and $null -ne $reasoningTokens) {
+        if ([int64]$reasoningTokens -le [int64]$outputTokens) {
+            $visibleOutputTokens = [int64]$outputTokens - [int64]$reasoningTokens
+            $visibleTokenBasis = "reported-output-minus-reasoning"
+            $reasoningAccountingValid = $true
+        } else {
+            $visibleOutputTokens = $null
+            $visibleTokenBasis = "invalid-reasoning-exceeds-output"
+            $reasoningAccountingValid = $false
+        }
+    }
+    $inputTokens = if ($usage) { $usage.inputTokens } else { $null }
+    $inputLoad = if ($null -eq $inputTokens) { "unknown" } elseif ($inputTokens -lt 18000) { "focused" } elseif ($inputTokens -le 30000) { "normal" } else { "heavy" }
+    $visibleClass = if ($null -eq $visibleOutputTokens) { "unknown" } elseif ($visibleOutputTokens -lt 2500) { "short" } elseif ($visibleOutputTokens -lt 6000) { "developed" } else { "extended" }
+    $answerChars = if ($null -eq $answer) { 0 } else { $answer.Length }
+    $outputTargetMet = if ($isProject -and $null -ne $visibleOutputTokens) { $visibleOutputTokens -ge $ProjectTargetOutputTokens } else { $null }
+    $charTargetMet = if ($isProject) { $answerChars -ge $ProjectTargetAnswerChars } else { $null }
+    $contextYield = if ($null -ne $inputTokens -and [int64]$inputTokens -gt 0 -and $null -ne $visibleOutputTokens) { [Math]::Round(([double]$visibleOutputTokens / [double]$inputTokens) * 100, 2) } else { $null }
+    $finishReason = if ($metadata) { [string]$metadata.finishReason } else { "unknown" }
+    return [PSCustomObject]@{
+        inputLoad = $inputLoad
+        visibleOutput = $visibleClass
+        inputTokens = $inputTokens
+        outputTokens = $outputTokens
+        reasoningTokens = $reasoningTokens
+        visibleOutputTokens = $visibleOutputTokens
+        visibleTokenBasis = $visibleTokenBasis
+        reasoningAccountingValid = $reasoningAccountingValid
+        answerChars = $answerChars
+        targetOutputTokens = if ($isProject) { $ProjectTargetOutputTokens } else { $null }
+        targetAnswerChars = if ($isProject) { $ProjectTargetAnswerChars } else { $null }
+        outputTargetMet = $outputTargetMet
+        charTargetMet = $charTargetMet
+        contextYieldPercent = $contextYield
+        finishReason = $finishReason
+        truncated = ($finishReason -eq "length")
+        effectiveMaxTokens = $effectiveMaxTokens
+    }
+}
+
 function Format-TokenNumber($value) {
     if ($null -eq $value) { return "n/a" }
     return ("{0:N0}" -f [int64]$value)
 }
 
-function Get-TokenUsageProfile($usage) {
+function Get-TokenUsageProfile($usage, $answerDepth = $null) {
     Assert-TokenUsageConfig
 
     if ($null -eq $usage) {
@@ -3076,11 +4117,14 @@ function Get-TokenUsageProfile($usage) {
         }
     }
 
-    $score = $usage.outputTokens
-    $basis = "output"
+    $score = if ($answerDepth) { $answerDepth.visibleOutputTokens } else { $null }
+    $basis = if ($null -ne $score) { "visible-output" } else { "reported-output" }
+    $noteSubject = if ($null -ne $score) { "visible output" } else { "reported output" }
+    if ($null -eq $score) { $score = $usage.outputTokens }
     if ($null -eq $score) {
         $score = $usage.totalTokens
         $basis = "total"
+        $noteSubject = "total token count"
     }
 
     if ($null -eq $score) {
@@ -3096,9 +4140,9 @@ function Get-TokenUsageProfile($usage) {
     if ($score -lt $TokenLowThreshold) {
         return [PSCustomObject]@{
             available = $true
-            level = "light"
-            color = "Green"
-            note = "fast and cheap, but may be shallow"
+            level = "short"
+            color = "Yellow"
+            note = "$noteSubject below the configured short threshold"
             basis = $basis
         }
     }
@@ -3106,18 +4150,18 @@ function Get-TokenUsageProfile($usage) {
     if ($score -lt $TokenRichThreshold) {
         return [PSCustomObject]@{
             available = $true
-            level = "balanced"
-            color = "Yellow"
-            note = "reasonable depth and cost"
+            level = "developed"
+            color = "Cyan"
+            note = "$noteSubject in the developed range"
             basis = $basis
         }
     }
 
     return [PSCustomObject]@{
         available = $true
-        level = "rich"
+        level = "extended"
         color = "Magenta"
-        note = "deep answer, intentionally higher token use"
+        note = "$noteSubject in the extended range"
         basis = $basis
     }
 }
@@ -3132,6 +4176,25 @@ function Write-TokenUsage($usage, $profile) {
 
     $line = "TokenUse     : input=$(Format-TokenNumber $usage.inputTokens), output=$(Format-TokenNumber $usage.outputTokens), total=$(Format-TokenNumber $usage.totalTokens) | $($profile.level) ($($profile.note))"
     Write-Host $line -ForegroundColor $profile.color
+}
+
+function Write-AnswerDepth($facts) {
+    if ($null -eq $facts) { return }
+    $targetText = if ($null -eq $facts.outputTargetMet) { "n/a" } else { "tokens=$($facts.outputTargetMet), chars=$($facts.charTargetMet)" }
+    $yieldText = if ($null -eq $facts.contextYieldPercent) { "n/a" } else { "$($facts.contextYieldPercent)%" }
+    $targetState = if ($null -eq $facts.outputTargetMet) {
+        "n/a"
+    } elseif ($facts.outputTargetMet -and $facts.charTargetMet) {
+        "both"
+    } elseif ($facts.outputTargetMet) {
+        "token-only"
+    } elseif ($facts.charTargetMet) {
+        "char-only"
+    } else {
+        "neither"
+    }
+    $color = if ($facts.truncated) { "Red" } elseif ($targetState -eq "both") { "Green" } elseif ($targetState -in @("token-only", "char-only")) { "Cyan" } else { "Yellow" }
+    Write-Host "AnswerDepth : input=$($facts.inputLoad), output=$($facts.visibleOutput), target[$targetText; state=$targetState], yield=$yieldText, finish=$($facts.finishReason)" -ForegroundColor $color
 }
 
 function Format-TokenUsageForMarkdown($usage, $profile) {
@@ -3285,6 +4348,9 @@ function Convert-OpenAIResponseToText([string]$raw, [bool]$isStreaming) {
 
 function Invoke-QwenChat($providerInfo, $settings, $networkIdentity, [string]$systemPrompt, [string]$userPrompt) {
     $bodyObj = Build-RequestBody $settings $providerInfo $systemPrompt $userPrompt $networkIdentity
+    $requestStreaming = ConvertTo-BooleanValue (Get-JsonProperty $bodyObj "stream") (-not [bool]$NonStreaming)
+    $effectiveMaxTokens = Get-JsonProperty $bodyObj "max_tokens"
+    if ($null -eq $effectiveMaxTokens) { $effectiveMaxTokens = Get-JsonProperty $bodyObj "max_completion_tokens" }
     $body = $bodyObj | ConvertTo-Json -Depth 80 -Compress
     $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($body)
 
@@ -3303,11 +4369,24 @@ function Invoke-QwenChat($providerInfo, $settings, $networkIdentity, [string]$sy
             try {
                 $attemptText = "$($attempt + 1)/$($MaxRetries + 1)"
                 Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] POST $endpoint (attempt $attemptText, retry-count=$attempt)" -ForegroundColor Cyan
-                $response = Invoke-JsonPostUtf8 -Uri $endpoint -Headers $headers -BodyBytes $bodyBytes -TimeoutSeconds $EffectiveTimeoutSec -StopOnSseDone:(-not [bool]$NonStreaming)
+                $response = Invoke-JsonPostUtf8 -Uri $endpoint -Headers $headers -BodyBytes $bodyBytes -TimeoutSeconds $EffectiveTimeoutSec -StopOnSseDone:$requestStreaming
                 Write-Host ("[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] HTTP {0} {1} ({2} ms, {3} bytes, retry-count={4})" -f $response.StatusCode, $response.StatusDescription, $response.DurationMs, $response.ReceivedBytes, $attempt) -ForegroundColor Green
-                $answerText = Convert-OpenAIResponseToText $response.Body (-not [bool]$NonStreaming)
-                $tokenUsage = Get-OpenAIUsageFromRaw $response.Body (-not [bool]$NonStreaming)
-                $tokenProfile = Get-TokenUsageProfile $tokenUsage
+                $contentType = ([string]$response.ContentType).ToLowerInvariant()
+                $responseStreaming = if ($contentType.Contains("text/event-stream")) {
+                    $true
+                } elseif ($contentType.Contains("application/json")) {
+                    $false
+                } elseif (([string]$response.Body).TrimStart().StartsWith("data:")) {
+                    $true
+                } else {
+                    $requestStreaming
+                }
+                $responseParseMode = if ($responseStreaming) { "sse" } else { "json" }
+                $answerText = Convert-OpenAIResponseToText $response.Body $responseStreaming
+                $tokenUsage = Get-OpenAIUsageFromRaw $response.Body $responseStreaming
+                $responseMetadata = Get-OpenAIResponseMetadata $response.Body $responseStreaming
+                $answerDepth = Get-AnswerDepthFacts $tokenUsage $responseMetadata $answerText $effectiveMaxTokens (-not [string]::IsNullOrWhiteSpace($ProjectRoot))
+                $tokenProfile = Get-TokenUsageProfile $tokenUsage $answerDepth
                 Write-Utf8File (Join-Path $WorkDir "last_response_status.json") (([ordered]@{
                     ok = $true
                     endpoint = $endpoint
@@ -3319,16 +4398,36 @@ function Invoke-QwenChat($providerInfo, $settings, $networkIdentity, [string]$sy
                     contentType = $response.ContentType
                     receivedBytes = $response.ReceivedBytes
                     durationMs = $response.DurationMs
+                    requestStreaming = $requestStreaming
+                    responseParseMode = $responseParseMode
+                    requestBodyChars = $body.Length
+                    systemPromptChars = $systemPrompt.Length
+                    userPromptChars = $userPrompt.Length
                     usage = ConvertTo-PlainObject $tokenUsage
                     tokenUse = ConvertTo-PlainObject $tokenProfile
+                    finishReason = $responseMetadata.finishReason
+                    reasoningTokens = $responseMetadata.reasoningTokens
+                    effectiveMaxTokens = $effectiveMaxTokens
+                    answerChars = $answerText.Length
+                    answerDepth = ConvertTo-PlainObject $answerDepth
                     completedAt = (Get-Date).ToString("o")
                 }) | ConvertTo-Json -Depth 10)
                 Write-Host ("ResponseText : {0} chars extracted" -f $answerText.Length) -ForegroundColor DarkGreen
                 Write-TokenUsage $tokenUsage $tokenProfile
+                Write-AnswerDepth $answerDepth
                 return [PSCustomObject]@{
                     Text = $answerText
                     Usage = $tokenUsage
                     TokenUse = $tokenProfile
+                    AnswerDepth = $answerDepth
+                    FinishReason = $responseMetadata.finishReason
+                    ReasoningTokens = $responseMetadata.reasoningTokens
+                    EffectiveMaxTokens = $effectiveMaxTokens
+                    RequestStreaming = $requestStreaming
+                    ResponseParseMode = $responseParseMode
+                    RequestBodyChars = $body.Length
+                    SystemPromptChars = $systemPrompt.Length
+                    UserPromptChars = $userPrompt.Length
                     Endpoint = $endpoint
                     Attempt = ($attempt + 1)
                     RetryCount = $attempt
@@ -3379,8 +4478,49 @@ function Invoke-QwenChat($providerInfo, $settings, $networkIdentity, [string]$sy
     throw "모든 endpoint 호출 실패. 마지막 오류: $lastError"
 }
 
+$projectSessionLayout = $null
+$projectSessionRetention = $null
+$projectSessionLockStream = $null
+if ($NewProjectSession) {
+    if ([string]::IsNullOrWhiteSpace($ProjectRoot)) { throw "-NewProjectSession은 -ProjectRoot와 함께 사용해야 합니다." }
+    $resolvedSessionProjectRoot = Resolve-ProjectRoot $ProjectRoot
+    $sessionRootInput = Expand-PathInput $WorkDir
+    if (-not [System.IO.Path]::IsPathRooted($sessionRootInput)) { $sessionRootInput = Join-Path $PSScriptRoot $sessionRootInput }
+    Assert-SafeWorkDir $sessionRootInput $resolvedSessionProjectRoot
+    $projectSessionLayout = New-ProjectSessionLayout $ProjectRoot $WorkDir
+    $ProjectRoot = $projectSessionLayout.ProjectRoot
+    $WorkDir = $projectSessionLayout.SessionDir
+}
+
+Assert-SafeWorkDir $WorkDir $ProjectRoot
 if (!(Test-Path -LiteralPath $SettingsPath)) { throw "settings.json을 찾지 못했습니다: $SettingsPath" }
+$workDirExistedBefore = Test-Path -LiteralPath $WorkDir -PathType Container
+$workDirWasEmpty = $false
+if ($workDirExistedBefore) {
+    $workDirWasEmpty = (@(Get-ChildItem -LiteralPath $WorkDir -Force -ErrorAction SilentlyContinue).Count -eq 0)
+}
 New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
+$defaultLoopDataRoot = Get-NormalizedFullPath (Join-Path $PSScriptRoot "qwen-loop-data")
+$workDirCanBeClaimed = ($null -ne $projectSessionLayout) -or (Test-PathInsideRoot $defaultLoopDataRoot $WorkDir) -or (-not $workDirExistedBefore) -or $workDirWasEmpty
+$workDirCleanupOwned = Initialize-QwenLoopWorkDirOwnership $WorkDir $workDirCanBeClaimed
+if ($projectSessionLayout) {
+    $lockPath = Join-Path $WorkDir ".active.lock"
+    $projectSessionLockStream = [System.IO.File]::Open($lockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+}
+
+try {
+if ($projectSessionLayout) {
+    $sessionIdentity = [ordered]@{
+        schema = "qwen-loop-project-session/v1"
+        identity = $projectSessionLayout.Identity
+        canonicalProjectRoot = $projectSessionLayout.ProjectRoot
+        sessionId = $projectSessionLayout.SessionId
+        createdAt = (Get-Date).ToString("o")
+        processId = $PID
+    }
+    Write-Utf8File (Join-Path $WorkDir "session_identity.json") ($sessionIdentity | ConvertTo-Json -Depth 10)
+    $projectSessionRetention = Invoke-ProjectSessionRetention $projectSessionLayout
+}
 
 $settingsRaw = Read-Utf8File $SettingsPath
 try {
@@ -3408,19 +4548,29 @@ $runHistoryJsonlPath = Join-Path $WorkDir "run_history.jsonl"
 $errorLogPath = Join-Path $WorkDir "error.log"
 $pendingQuestionPath = Join-Path $WorkDir "pending_question.txt"
 $dynamicProjectContextPath = Join-Path $WorkDir "last_dynamic_project_context.json"
+$projectExplorationStatePath = Join-Path $WorkDir "exploration_state.json"
+$projectCycleHistoryPath = Join-Path $WorkDir "cycle_history.jsonl"
+$projectCycleEvidencePath = Join-Path $WorkDir "cycle_evidence.md"
 
 $projectScan = $null
 $projectContext = ""
-if (-not [string]::IsNullOrWhiteSpace($ProjectRoot)) {
-    $projectScan = New-ProjectScanContext $ProjectRoot
+$projectCycleNumber = 1
+$projectSuccessfulTurnsInCycle = 0
+$projectExplorationHistoryPath = if ($projectSessionLayout) { $projectSessionLayout.ExplorationHistoryPath } else { Join-Path $WorkDir "exploration_history.jsonl" }
+$projectExplorationLockPath = if ($projectSessionLayout) { Join-Path $projectSessionLayout.ProjectBase ".exploration.lock" } else { Join-Path $WorkDir ".exploration.lock" }
+$projectExplorationLockStream = $null
+if (-not [string]::IsNullOrWhiteSpace($ProjectRoot) -and -not $DryRun) {
+    $projectExplorationLockStream = Open-ExclusiveFileLock $projectExplorationLockPath 30000
+    if ($null -eq $projectExplorationLockStream) {
+        throw "다른 실행이 이 프로젝트의 업무 영역을 선택하고 있습니다. 중복 family 예약을 피하기 위해 시작을 중단합니다. 잠시 후 다시 실행하세요: $projectExplorationLockPath"
+    }
+}
+try {
+    $projectExplorationAvoidance = Get-ProjectExplorationAvoidance $projectExplorationHistoryPath
+    if (-not [string]::IsNullOrWhiteSpace($ProjectRoot)) {
+    $projectScan = New-ProjectScanContext $ProjectRoot $projectExplorationAvoidance $projectCycleNumber
     Write-ProjectScanFiles $projectScan $WorkDir
     $projectContext = $projectScan.promptContext
-
-    $existingProjectQuestion = ""
-    $hadExistingProjectQuestionFile = Test-Path -LiteralPath $nextQuestionPath -PathType Leaf
-    if ($hadExistingProjectQuestionFile) {
-        $existingProjectQuestion = (Read-Utf8File $nextQuestionPath).Trim()
-    }
 
     if ($FreshProjectQuestion) {
         Write-Utf8File $nextQuestionPath $projectScan.seedQuestion
@@ -3429,55 +4579,61 @@ if (-not [string]::IsNullOrWhiteSpace($ProjectRoot)) {
             Source = "project-fresh-scan"
             SeedSource = (Join-Path $WorkDir "project_scan_summary.md")
         }
-    }
-
-    $hasUsableProjectQuestion = (-not [string]::IsNullOrWhiteSpace($existingProjectQuestion)) -and `
-        (-not (Test-SameQuestionText $existingProjectQuestion $projectScan.seedQuestion)) -and `
-        (-not (Test-ProjectScanBootstrapQuestion $existingProjectQuestion))
-
-    if ($null -eq $initialQuestion -and $hasUsableProjectQuestion) {
-        $initialQuestion = [PSCustomObject]@{
-            Question = $existingProjectQuestion
-            Source = "project-next_question.txt"
-            SeedSource = $nextQuestionPath
-        }
     } else {
-        $candidate = Get-LastJsonlNextQuestion $jsonlPath
-        if (-not [string]::IsNullOrWhiteSpace($candidate) -and -not (Test-SameQuestionText $candidate $projectScan.seedQuestion) -and -not (Test-ProjectScanBootstrapQuestion $candidate)) {
-            Write-Utf8File $nextQuestionPath $candidate
-            $initialQuestion = [PSCustomObject]@{ Question = $candidate; Source = "project-transcript.jsonl"; SeedSource = $jsonlPath }
+        $existingProjectQuestion = ""
+        $hadExistingProjectQuestionFile = Test-Path -LiteralPath $nextQuestionPath -PathType Leaf
+        if ($hadExistingProjectQuestionFile) {
+            $existingProjectQuestion = (Read-Utf8File $nextQuestionPath).Trim()
         }
-    }
 
-    if ($null -eq $initialQuestion) {
-        $candidate = Get-LastTranscriptNextQuestion $transcriptPath
-        if (-not [string]::IsNullOrWhiteSpace($candidate) -and -not (Test-SameQuestionText $candidate $projectScan.seedQuestion) -and -not (Test-ProjectScanBootstrapQuestion $candidate)) {
-            Write-Utf8File $nextQuestionPath $candidate
-            $initialQuestion = [PSCustomObject]@{ Question = $candidate; Source = "project-transcript.md"; SeedSource = $transcriptPath }
-        }
-    }
+        $hasUsableProjectQuestion = (-not [string]::IsNullOrWhiteSpace($existingProjectQuestion)) -and `
+            (-not (Test-SameQuestionText $existingProjectQuestion $projectScan.seedQuestion)) -and `
+            (-not (Test-ProjectScanBootstrapQuestion $existingProjectQuestion))
 
-    if ($null -eq $initialQuestion) {
-        $candidate = Get-RecoveryQuestionFromLastTurn $lastTurnPath
-        if (-not [string]::IsNullOrWhiteSpace($candidate)) {
-            Write-Utf8File $nextQuestionPath $candidate
-            $initialQuestion = [PSCustomObject]@{ Question = $candidate; Source = "project-last_turn.txt"; SeedSource = $lastTurnPath }
+        if ($hasUsableProjectQuestion) {
+            $initialQuestion = [PSCustomObject]@{
+                Question = $existingProjectQuestion
+                Source = "project-next_question.txt"
+                SeedSource = $nextQuestionPath
+            }
+        } else {
+            $candidate = Get-LastJsonlNextQuestion $jsonlPath
+            if (-not [string]::IsNullOrWhiteSpace($candidate) -and -not (Test-SameQuestionText $candidate $projectScan.seedQuestion) -and -not (Test-ProjectScanBootstrapQuestion $candidate)) {
+                Write-Utf8File $nextQuestionPath $candidate
+                $initialQuestion = [PSCustomObject]@{ Question = $candidate; Source = "project-transcript.jsonl"; SeedSource = $jsonlPath }
+            }
         }
-    }
 
-    if ($null -eq $initialQuestion) {
-        $pendingQuestion = ""
-        if (Test-Path -LiteralPath $pendingQuestionPath -PathType Leaf) {
-            $pendingQuestion = (Read-Utf8File $pendingQuestionPath).Trim()
+        if ($null -eq $initialQuestion) {
+            $candidate = Get-LastTranscriptNextQuestion $transcriptPath
+            if (-not [string]::IsNullOrWhiteSpace($candidate) -and -not (Test-SameQuestionText $candidate $projectScan.seedQuestion) -and -not (Test-ProjectScanBootstrapQuestion $candidate)) {
+                Write-Utf8File $nextQuestionPath $candidate
+                $initialQuestion = [PSCustomObject]@{ Question = $candidate; Source = "project-transcript.md"; SeedSource = $transcriptPath }
+            }
         }
-        $hasInterruptedSeed = (-not [string]::IsNullOrWhiteSpace($pendingQuestion) -and ((Test-SameQuestionText $pendingQuestion $projectScan.seedQuestion) -or (Test-ProjectScanBootstrapQuestion $pendingQuestion)))
-        $hasStaleSeedFile = ($hadExistingProjectQuestionFile -and ((Test-SameQuestionText $existingProjectQuestion $projectScan.seedQuestion) -or (Test-ProjectScanBootstrapQuestion $existingProjectQuestion)))
-        if ($hasInterruptedSeed -or $hasStaleSeedFile) {
-            $candidate = New-InterruptedProjectSeedQuestion $projectScan $pendingQuestion
-            Write-Utf8File $nextQuestionPath $candidate
-            $sourceName = if ($hasInterruptedSeed) { "project-pending_question.txt" } else { "project-stale_scan_seed" }
-            $sourcePath = if ($hasInterruptedSeed) { $pendingQuestionPath } else { $nextQuestionPath }
-            $initialQuestion = [PSCustomObject]@{ Question = $candidate; Source = $sourceName; SeedSource = $sourcePath }
+
+        if ($null -eq $initialQuestion) {
+            $candidate = Get-RecoveryQuestionFromLastTurn $lastTurnPath
+            if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+                Write-Utf8File $nextQuestionPath $candidate
+                $initialQuestion = [PSCustomObject]@{ Question = $candidate; Source = "project-last_turn.txt"; SeedSource = $lastTurnPath }
+            }
+        }
+
+        if ($null -eq $initialQuestion) {
+            $pendingQuestion = ""
+            if (Test-Path -LiteralPath $pendingQuestionPath -PathType Leaf) {
+                $pendingQuestion = (Read-Utf8File $pendingQuestionPath).Trim()
+            }
+            $hasInterruptedSeed = (-not [string]::IsNullOrWhiteSpace($pendingQuestion) -and ((Test-SameQuestionText $pendingQuestion $projectScan.seedQuestion) -or (Test-ProjectScanBootstrapQuestion $pendingQuestion)))
+            $hasStaleSeedFile = ($hadExistingProjectQuestionFile -and ((Test-SameQuestionText $existingProjectQuestion $projectScan.seedQuestion) -or (Test-ProjectScanBootstrapQuestion $existingProjectQuestion)))
+            if ($hasInterruptedSeed -or $hasStaleSeedFile) {
+                $candidate = New-InterruptedProjectSeedQuestion $projectScan $pendingQuestion
+                Write-Utf8File $nextQuestionPath $candidate
+                $sourceName = if ($hasInterruptedSeed) { "project-pending_question.txt" } else { "project-stale_scan_seed" }
+                $sourcePath = if ($hasInterruptedSeed) { $pendingQuestionPath } else { $nextQuestionPath }
+                $initialQuestion = [PSCustomObject]@{ Question = $candidate; Source = $sourceName; SeedSource = $sourcePath }
+            }
         }
     }
 
@@ -3489,13 +4645,26 @@ if (-not [string]::IsNullOrWhiteSpace($ProjectRoot)) {
             SeedSource = (Join-Path $WorkDir "project_scan_summary.md")
         }
     }
-} else {
-    $initialQuestion = Initialize-NextQuestion $nextQuestionPath $jsonlPath $transcriptPath $lastTurnPath $SeedFile $QuestionBankFile $QuestionTrack
+    if ($NewProjectSession -and -not $DryRun) {
+        Add-ProjectExplorationHistory $projectExplorationHistoryPath $projectScan $projectSessionLayout.SessionId "new-session"
+        $projectExplorationAvoidance = Get-ProjectExplorationAvoidance $projectExplorationHistoryPath
+    }
+    } else {
+        $initialQuestion = Initialize-NextQuestion $nextQuestionPath $jsonlPath $transcriptPath $lastTurnPath $SeedFile $QuestionBankFile $QuestionTrack
+    }
+} finally {
+    if ($projectExplorationLockStream) { $projectExplorationLockStream.Dispose(); $projectExplorationLockStream = $null }
+}
+if ($projectScan -and $FreshProjectQuestion) {
+    Write-Utf8File $projectCycleEvidencePath "# Compact business evidence memory`n"
 }
 $seedQuestion = $initialQuestion.Question
+$projectQuestionSource = $initialQuestion.Source
 $startupCleanup = Invoke-WorkDirCleanup $WorkDir $transcriptPath $jsonlPath $errorLogPath
 
 $systemPrompt = Build-SettingsAwareSystemPrompt $settings $providerInfo
+$runtimeRequestShape = Build-RequestBody $settings $providerInfo $systemPrompt "runtime-shape-preview" $networkIdentity
+$effectiveRequestStreaming = ConvertTo-BooleanValue (Get-JsonProperty $runtimeRequestShape "stream") (-not [bool]$NonStreaming)
 
 Write-StartupBanner
 Write-Host "=== Runtime Summary: SETTINGS-FIRST ===" -ForegroundColor Green
@@ -3520,15 +4689,26 @@ if ($LoopDiagnosticHeaders) {
 }
 Write-Host "CompatBody   : $CompatBody"
 Write-Host "WireMode     : Qwen Code OpenAI SDK-like headers/body"
-Write-Host "Stream       : $(-not [bool]$NonStreaming)"
+Write-Host "Stream       : $effectiveRequestStreaming (effective after settings overrides; switch requested=$(-not [bool]$NonStreaming))"
 Write-Host "Retry        : max $MaxRetries, backoff $RetryInitialDelaySeconds-$RetryMaxDelaySeconds sec"
-Write-Host "TokenUse     : light < $TokenLowThreshold, rich >= $TokenRichThreshold output tokens"
+Write-Host "TokenUse     : short < $TokenLowThreshold, extended >= $TokenRichThreshold output tokens (diagnostic only)"
 Write-Host "HeaderLog    : $(if ($MaskSensitiveLogs -and -not $LogSensitive) { 'masked' } else { 'unmasked' })"
 Write-Host "QuestionSrc  : $($initialQuestion.Source)"
 if ($projectScan) {
     Write-Host "ProjectRoot  : $($projectScan.root)"
     Write-Host "ProjectScan  : $($projectScan.scannedFileCount) files scanned, $($projectScan.selectedFileCount) key files selected"
-    Write-Host "ProjectStart : $(if ($FreshProjectQuestion) { 'fresh random scan question; saved next_question is ignored on startup' } else { 'continue saved next_question when available' })"
+    Write-Host "ProjectStart : $(if ($NewProjectSession) { 'isolated timestamp session; project exploration ledger avoids recent business families' } elseif ($FreshProjectQuestion) { 'fresh scan question; saved continuation is ignored on startup' } else { 'legacy continuation from saved next_question when available' })"
+    Write-Host "ProjectCycle : $ProjectTurnsPerCycle successful turns; then fresh scan / new business slice"
+    Write-Host "OutputTarget : $ProjectTargetOutputTokens tokens or $ProjectTargetAnswerChars chars as separate diagnostics"
+}
+if ($projectSessionLayout) {
+    Write-Host "SessionId    : $($projectSessionLayout.SessionId)"
+    Write-Host "ProjectIdent : $($projectSessionLayout.Identity)"
+    $retentionActionCount = if ($projectSessionRetention) { @($projectSessionRetention.actions).Count } else { 0 }
+    Write-Host "SessionKeep  : count=$ProjectSessionKeepCount, days=$ProjectSessionKeepDays, total=${ProjectSessionMaxTotalMB}MB; removed=$retentionActionCount"
+    if ($projectSessionRetention -and -not [string]::IsNullOrWhiteSpace([string]$projectSessionRetention.warning)) {
+        Write-Host "SessionWarn  : $($projectSessionRetention.warning)" -ForegroundColor Yellow
+    }
 }
 $answerPreviewText = if ($NoAnswerPreview) { "disabled" } else { "$AnswerPreviewLines lines / $AnswerPreviewChars chars" }
 Write-Host "AnswerPreview: $answerPreviewText"
@@ -3563,7 +4743,9 @@ $settingsSummary = [ordered]@{
     clientNetworkIdentity = if ($LoopDiagnosticHeaders) { ConvertTo-PlainObject $networkIdentity } else { $null }
     clientNetworkIdentityPolicy = if ($LoopDiagnosticHeaders) { "collected-and-sent-as-X-Qwen-Loop-diagnostic-headers" } else { "not-collected-or-sent-by-default" }
     compatBody = [bool]$CompatBody
-    stream = (-not [bool]$NonStreaming)
+    stream = $effectiveRequestStreaming
+    streamRequestedBySwitch = (-not [bool]$NonStreaming)
+    streamPolicy = "effective value after generationConfig.samplingParams and extra_body settings-first overrides"
     timeoutSec = $EffectiveTimeoutSec
     retry = [ordered]@{
         maxRetries = $MaxRetries
@@ -3574,12 +4756,15 @@ $settingsSummary = [ordered]@{
     }
     tokenUsage = [ordered]@{
         source = "OpenAI-compatible usage object when returned by the server"
-        displayBasis = "output_tokens, fallback total_tokens"
+        displayBasis = "neutral input/output diagnostics; max_tokens is a ceiling, not an output target"
         lowThreshold = $TokenLowThreshold
         richThreshold = $TokenRichThreshold
-        light = "green"
-        balanced = "yellow"
-        rich = "magenta"
+        short = "below lowThreshold"
+        developed = "between thresholds"
+        extended = "at or above richThreshold"
+        projectTargetOutputTokens = $ProjectTargetOutputTokens
+        projectTargetAnswerChars = $ProjectTargetAnswerChars
+        note = "finish_reason and AnswerDepth distinguish model stop, length truncation, visible output, reasoning tokens, and target progress."
     }
     bannerEnabled = (-not [bool]$NoBanner)
     answerPreview = [ordered]@{
@@ -3588,7 +4773,8 @@ $settingsSummary = [ordered]@{
         chars = $AnswerPreviewChars
     }
     autoCleanup = [ordered]@{
-        enabled = (-not [bool]$NoAutoCleanup)
+        enabled = [bool]$startupCleanup.enabled
+        workDirOwnershipVerified = [bool]$workDirCleanupOwned
         maxWorkDirMB = $MaxWorkDirMB
         maxTranscriptMB = $MaxTranscriptMB
         maxErrorLogMB = $MaxErrorLogMB
@@ -3622,6 +4808,20 @@ $settingsSummary = [ordered]@{
     initialQuestionSeedSource = $initialQuestion.SeedSource
     questionTrack = $QuestionTrack
     freshProjectQuestion = [bool]$FreshProjectQuestion
+    newProjectSession = [bool]$NewProjectSession
+    projectSession = if ($projectSessionLayout) {
+        [ordered]@{
+            identity = $projectSessionLayout.Identity
+            sessionId = $projectSessionLayout.SessionId
+            sessionDir = $projectSessionLayout.SessionDir
+            projectBase = $projectSessionLayout.ProjectBase
+            explorationHistory = $projectSessionLayout.ExplorationHistoryPath
+            retention = ConvertTo-PlainObject $projectSessionRetention
+            keepCount = $ProjectSessionKeepCount
+            keepDays = $ProjectSessionKeepDays
+            maxTotalMB = $ProjectSessionMaxTotalMB
+        }
+    } else { $null }
     projectScan = if ($projectScan) {
         [ordered]@{
             root = $projectScan.root
@@ -3630,6 +4830,9 @@ $settingsSummary = [ordered]@{
             selectedFileCount = $projectScan.selectedFileCount
             primaryQuestionCandidateFile = $projectScan.primaryQuestionCandidateFile
             primaryQuestionCandidateGroup = $projectScan.primaryQuestionCandidateGroup
+            primaryQuestionCandidateGroupKey = $projectScan.primaryQuestionCandidateGroupKey
+            primaryBusinessFamily = $projectScan.primaryBusinessFamily
+            explorationCycle = $projectScan.explorationCycle
             questionGroupCount = $projectScan.questionGroupCount
             detectedStack = $projectScan.detectedStack
             maxFiles = $ProjectScanMaxFiles
@@ -3661,10 +4864,12 @@ if ($DryRun) {
     $dryRunPromptParts = New-Object System.Collections.Generic.List[string]
     $dryRunPromptParts.Add("현재 루프 질문:`n$seedQuestion") | Out-Null
     if ($projectScan) {
-        $dryRunQuestionHistory = Get-RecentQuestionHistoryFromTree (Get-LoopDataHistoryRoot $WorkDir) $jsonlPath 12
-        if ([string]::IsNullOrWhiteSpace($dryRunQuestionHistory)) { $dryRunQuestionHistory = "(none)" }
-        $dryRunPromptParts.Add("기존 qwen-loop-data 최근 질문(중복 회피용):`n$dryRunQuestionHistory") | Out-Null
-        $dryRunDynamicProjectContext = Build-DynamicProjectContext $projectScan.root $seedQuestion ""
+        if (-not $NewProjectSession) {
+            $dryRunQuestionHistory = Get-RecentQuestionHistoryFromTree (Get-LoopDataHistoryRoot $WorkDir) $jsonlPath 12
+            if ([string]::IsNullOrWhiteSpace($dryRunQuestionHistory)) { $dryRunQuestionHistory = "(none)" }
+            $dryRunPromptParts.Add("기존 qwen-loop-data 최근 질문(중복 회피용):`n$dryRunQuestionHistory") | Out-Null
+        }
+        $dryRunDynamicProjectContext = Build-DynamicProjectContext $projectScan.root $seedQuestion "" ([string]$projectScan.primaryBusinessFamily)
         Write-Utf8File $dynamicProjectContextPath ($dryRunDynamicProjectContext | ConvertTo-Json -Depth 50)
         if (-not [string]::IsNullOrWhiteSpace([string]$dryRunDynamicProjectContext.text)) {
             $dryRunPromptParts.Add("현재 질문 관련 동적 프로젝트 컨텍스트:`n$($dryRunDynamicProjectContext.text)") | Out-Null
@@ -3707,25 +4912,78 @@ while ($true) {
     $answer = ""
     $tokenUsage = $null
     $tokenUse = $null
+    $answerDepth = $null
     $chatResult = $null
+    $nextQuestionMarkerFound = $false
+    $nextQuestionMarkerPresent = $false
+    $partialReason = ""
+    $questionSource = $projectQuestionSource
+    $projectCycleForRun = if ($projectScan) { $projectCycleNumber } else { $null }
+    $projectTurnInCycle = if ($projectScan) { $projectSuccessfulTurnsInCycle + 1 } else { $null }
+    $projectPhase = if ($projectScan) { Get-ProjectExplorationPhase $projectTurnInCycle $ProjectTurnsPerCycle } else { $null }
     try {
+        if ($NewProjectSession -and $projectScan -and $projectSuccessfulTurnsInCycle -ge $ProjectTurnsPerCycle) {
+            $previousFamily = [string]$projectScan.primaryBusinessFamily
+            $nextCycle = $projectCycleNumber + 1
+            $cycleExplorationLock = Open-ExclusiveFileLock $projectExplorationLockPath 30000
+            if ($null -eq $cycleExplorationLock) {
+                throw "다른 실행이 이 프로젝트의 다음 업무 영역을 선택하고 있습니다. 중복 family 예약을 피하기 위해 이번 cycle 전환을 보류합니다: $projectExplorationLockPath"
+            }
+            try {
+                $projectExplorationAvoidance = Get-ProjectExplorationAvoidance $projectExplorationHistoryPath
+                $nextScan = New-ProjectScanContext $ProjectRoot $projectExplorationAvoidance $nextCycle
+                Write-ProjectScanFiles $nextScan $WorkDir
+                $projectScan = $nextScan
+                $projectContext = $projectScan.promptContext
+                $seedQuestion = $projectScan.seedQuestion
+                Write-Utf8File $nextQuestionPath $seedQuestion
+                Write-Utf8File $lastTurnPath ""
+                Write-Utf8File $projectCycleEvidencePath "# Compact business evidence memory`n"
+                $projectCycleNumber = $nextCycle
+                $projectSuccessfulTurnsInCycle = 0
+                $projectQuestionSource = "cycle-rescan"
+                $questionSource = $projectQuestionSource
+                Add-ProjectExplorationHistory $projectExplorationHistoryPath $projectScan $projectSessionLayout.SessionId "successful-turn-limit"
+            } finally {
+                if ($cycleExplorationLock) { $cycleExplorationLock.Dispose() }
+            }
+            $cycleRecord = [ordered]@{
+                transitionedAt = (Get-Date).ToString("o")
+                reason = "successful-turn-limit"
+                turnsPerCycle = $ProjectTurnsPerCycle
+                previousCycle = ($nextCycle - 1)
+                nextCycle = $nextCycle
+                previousBusinessFamily = $previousFamily
+                nextBusinessFamily = $projectScan.primaryBusinessFamily
+                nextPrimaryPath = $projectScan.primaryQuestionCandidateFile
+            }
+            Append-Utf8File $projectCycleHistoryPath (($cycleRecord | ConvertTo-Json -Compress -Depth 20) + "`n")
+            Write-Host "`nProjectCycle : $($nextCycle - 1) completed; fresh scan selected cycle $nextCycle / $($projectScan.primaryBusinessFamily)" -ForegroundColor Magenta
+        }
+
+        $projectCycleForRun = if ($projectScan) { $projectCycleNumber } else { $null }
+        $projectTurnInCycle = if ($projectScan) { $projectSuccessfulTurnsInCycle + 1 } else { $null }
+        $projectPhase = if ($projectScan) { Get-ProjectExplorationPhase $projectTurnInCycle $ProjectTurnsPerCycle } else { $null }
         $question = (Read-Utf8File $nextQuestionPath).Trim()
         if ([string]::IsNullOrWhiteSpace($question)) { $question = $seedQuestion }
         Write-Utf8File $pendingQuestionPath $question
 
         $contextBundle = Read-ContextBundle $ContextListFile $MaxContextChars
         $lastTurn = ""
-        $skipStoredProjectTurn = $projectScan -and $FreshProjectQuestion -and $runCount -eq 1
+        $skipStoredProjectTurn = $projectScan -and (($NewProjectSession -and $projectTurnInCycle -eq 1) -or ($FreshProjectQuestion -and $runCount -eq 1))
         if ((-not $skipStoredProjectTurn) -and (Test-Path -LiteralPath $lastTurnPath)) { $lastTurn = Get-TextPrefix ((Read-Utf8File $lastTurnPath).Trim()) $LastTurnChars }
         $dynamicProjectContext = $null
-        $questionHistory = Get-RecentQuestionHistory $jsonlPath 8
+        $questionHistory = if ($NewProjectSession -and $projectScan) { Get-RecentQuestionHistory $jsonlPath ([Math]::Min(8, $projectSuccessfulTurnsInCycle)) } else { Get-RecentQuestionHistory $jsonlPath 8 }
         if ($projectScan) {
-            $globalQuestionHistory = Get-RecentQuestionHistoryFromTree (Get-LoopDataHistoryRoot $WorkDir) $jsonlPath 12
-            if (-not [string]::IsNullOrWhiteSpace($globalQuestionHistory)) {
-                if (-not [string]::IsNullOrWhiteSpace($questionHistory)) { $questionHistory += "`n" }
-                $questionHistory += "기존 qwen-loop-data 최근 질문(중복 회피용):`n$globalQuestionHistory"
+            if (-not $NewProjectSession) {
+                $globalQuestionHistory = Get-RecentQuestionHistoryFromTree (Get-LoopDataHistoryRoot $WorkDir) $jsonlPath 12
+                if (-not [string]::IsNullOrWhiteSpace($globalQuestionHistory)) {
+                    if (-not [string]::IsNullOrWhiteSpace($questionHistory)) { $questionHistory += "`n" }
+                    $questionHistory += "기존 qwen-loop-data 최근 질문(중복 회피용):`n$globalQuestionHistory"
+                }
             }
-            $dynamicProjectContext = Build-DynamicProjectContext $projectScan.root $question $lastTurn
+            $questionHistory = Get-TextSuffix $questionHistory 6000
+            $dynamicProjectContext = Build-DynamicProjectContext $projectScan.root $question $lastTurn ([string]$projectScan.primaryBusinessFamily)
             Write-Utf8File $dynamicProjectContextPath ($dynamicProjectContext | ConvertTo-Json -Depth 50)
         }
         $projectPromptSection = ""
@@ -3735,6 +4993,21 @@ while ($true) {
                 $dynamicContextText = "현재 질문 관련 동적 프로젝트 컨텍스트:`n$($dynamicProjectContext.text)`n"
             }
             $projectPromptSection = "$dynamicContextText`n기본 프로젝트 스캔 컨텍스트:`n$projectContext`n"
+        }
+        $projectPhaseSection = ""
+        if ($projectPhase) {
+            $projectPhaseSection = @"
+현재 업무 탐색 상태:
+- cycle: $projectCycleForRun
+- successful turn in cycle: $projectTurnInCycle / $ProjectTurnsPerCycle
+- phase: $($projectPhase.label) [$($projectPhase.key)]
+- 이번 단계의 목적: $($projectPhase.instruction)
+- 가시 본문 목표: $ProjectTargetAnswerChars 자 이상, 약 $ProjectTargetOutputTokens output tokens 이상(근거가 부족하면 일반론 대신 미확인으로 표시)
+"@
+        }
+        $cycleEvidenceMemory = ""
+        if ($projectScan -and (Test-Path -LiteralPath $projectCycleEvidencePath -PathType Leaf)) {
+            $cycleEvidenceMemory = Get-TextSuffix (Read-Utf8File $projectCycleEvidencePath) 9000
         }
 
         $userPrompt = @"
@@ -3747,15 +5020,20 @@ $lastTurn
 최근 질문 히스토리:
 $questionHistory
 
+현재 cycle의 압축 업무 근거 메모리(앞선 turn의 결론을 5번째 보고서까지 유지):
+$cycleEvidenceMemory
+
 공통 컨텍스트:
 $contextBundle
 
 $projectPromptSection
 
+$projectPhaseSection
+
 요청:
 위 질문에 답변해줘.
-반드시 첫 번째 줄에는 NEXT_QUESTION: 으로 시작하는 다음 후속 질문을 한 줄로 작성하고, 그 뒤에 현재 질문에 대한 상세 답변을 작성해줘.
-다음 질문은 최근 질문 히스토리를 반복하지 말고, 현재 질문의 주 기술 트랙과 업무 도메인 흐름을 유지하면서 더 좁고 검증 가능한 연결 파일, 데이터 계약, 상태 흐름, 설계 쟁점으로 이어가줘. 동적 컨텍스트에 연결 확장 파일이나 다음 질문 확장 힌트가 있으면 같은 파일/메서드를 반복하지 말고 그 연결 파일 중 하나로 파생해줘. 예외/장애 가능성은 필요할 때만 다루고 그것만 반복하지 마.
+현재 업무 질문을 충분히 분석한 뒤, 마지막 비어 있지 않은 한 줄에만 NEXT_QUESTION: 으로 후속 질문을 작성해줘.
+파일의 Java 기술 구조를 주제로 삼지 말고 업무 목적, actor/trigger/result, 업무 용어·상태, Mapper table/column과 VO field 의미, 정상 데이터 lineage와 downstream을 근거로 복원해줘. 연결 파일은 미확인 업무 가설을 검증하는 증거로 사용하고, 트랜잭션·패턴·성능·보안은 업무 영향이 있는 경우 마지막 15~20%에만 다뤄줘.
 "@
 
         Write-Host "`n[$($started.ToString('yyyy-MM-dd HH:mm:ss'))] RUN #$runCount QUESTION:" -ForegroundColor Green
@@ -3767,10 +5045,22 @@ $projectPromptSection
         $answer = [string]$chatResult.Text
         $tokenUsage = $chatResult.Usage
         $tokenUse = $chatResult.TokenUse
-        $nextQuestion = Extract-NextQuestion $answer
+        $answerDepth = $chatResult.AnswerDepth
+        $nextQuestionExtraction = Get-NextQuestionExtraction $answer
+        $nextQuestionMarkerFound = [bool]$nextQuestionExtraction.explicitMarkerFound
+        $nextQuestionMarkerPresent = ([int]$nextQuestionExtraction.markerLineIndex -ge 0)
+        $finishReason = ([string]$chatResult.FinishReason).ToLowerInvariant()
+        $isIncompleteResponse = ($finishReason -in @("length", "content_filter")) -or (-not $nextQuestionMarkerFound)
+        if ($isIncompleteResponse) {
+            $nextQuestion = New-PartialResponseContinuationQuestion $question $finishReason $nextQuestionMarkerFound
+            $partialReason = if ($finishReason -in @("length", "content_filter")) { "finish_reason=$finishReason" } elseif ($nextQuestionMarkerPresent) { "next-question-marker-not-final" } else { "missing-next-question-marker" }
+            $runStatus = "partial"
+        } else {
+            $nextQuestion = [string]$nextQuestionExtraction.question
+            $runStatus = "ok"
+        }
         $ended = Get-Date
         $completedAt = $ended
-        $runStatus = "ok"
 
         Write-Utf8File $nextQuestionPath $nextQuestion
 
@@ -3801,6 +5091,14 @@ $nextQuestion
 
 $(Format-TokenUsageForMarkdown $tokenUsage $tokenUse)
 
+## Exploration Phase
+
+cycle=$projectCycleForRun, turn=$projectTurnInCycle/$ProjectTurnsPerCycle, phase=$(if ($projectPhase) { $projectPhase.label } else { "n/a" }), source=$questionSource
+
+## Answer Depth
+
+$(if ($answerDepth) { $answerDepth | ConvertTo-Json -Compress -Depth 10 } else { "not available" })
+
 ## Answer
 
 $answer
@@ -3821,11 +5119,43 @@ $answer
             clientIp = $networkIdentity.localAddress
             question = $question
             nextQuestion = $nextQuestion
+            nextQuestionMarkerFound = $nextQuestionMarkerFound
+            nextQuestionMarkerPresent = $nextQuestionMarkerPresent
+            completionStatus = $runStatus
+            partialReason = $partialReason
+            cycleIndex = $projectCycleForRun
+            turnInCycle = $projectTurnInCycle
+            phase = if ($projectPhase) { $projectPhase.key } else { $null }
+            questionSource = $questionSource
+            primaryBusinessFamily = if ($projectScan) { $projectScan.primaryBusinessFamily } else { $null }
             usage = ConvertTo-PlainObject $tokenUsage
             tokenUse = ConvertTo-PlainObject $tokenUse
+            answerDepth = ConvertTo-PlainObject $answerDepth
             answer = $answer
         }
         Append-Utf8File $jsonlPath (($record | ConvertTo-Json -Compress -Depth 50) + "`n")
+        if ($projectScan -and $runStatus -eq "ok") {
+            Add-CycleEvidenceMemory $projectCycleEvidencePath $projectCycleForRun $projectTurnInCycle $runStatus $question $answer
+        }
+
+        if ($projectScan -and $runStatus -eq "ok") {
+            $projectSuccessfulTurnsInCycle++
+            $projectQuestionSource = "model-next-question"
+            $explorationState = [ordered]@{
+                schema = "qwen-loop-project-exploration-state/v1"
+                updatedAt = (Get-Date).ToString("o")
+                cycleIndex = $projectCycleNumber
+                successfulTurnsInCycle = $projectSuccessfulTurnsInCycle
+                turnsPerCycle = $ProjectTurnsPerCycle
+                primaryBusinessFamily = $projectScan.primaryBusinessFamily
+                primaryPath = $projectScan.primaryQuestionCandidateFile
+                nextQuestion = $nextQuestion
+            }
+            Write-Utf8File $projectExplorationStatePath ($explorationState | ConvertTo-Json -Depth 20)
+        } elseif ($projectScan -and $runStatus -eq "partial") {
+            $projectQuestionSource = "partial-response-continuation"
+            Write-Host "Partial turn : successful cycle count was not advanced ($partialReason)." -ForegroundColor Yellow
+        }
 
         if (-not $NoAnswerPreview) {
             $answerPreview = Get-AnswerPreview $answer $AnswerPreviewLines $AnswerPreviewChars
@@ -3848,7 +5178,11 @@ $answer
         Write-Host "- $(Join-Path $WorkDir 'last_request_body.json')"
         Write-Host "- $(Join-Path $WorkDir 'last_response_status.json')"
         if ($projectScan) { Write-Host "- $dynamicProjectContextPath" }
-        Write-Host "`nRUN #$runCount complete. Full answer saved to transcript.md." -ForegroundColor Green
+        if ($runStatus -eq "partial") {
+            Write-Host "`nRUN #$runCount partial. Answer saved; continuation queued without advancing the successful-turn cycle." -ForegroundColor Yellow
+        } else {
+            Write-Host "`nRUN #$runCount complete. Full answer saved to transcript.md." -ForegroundColor Green
+        }
     } catch {
         $completedAt = Get-Date
         $msg = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ERROR: $($_.Exception.Message)`n$($_.ScriptStackTrace)`n"
@@ -3902,6 +5236,22 @@ $answer
         outputTokens = $historyOutputTokens
         totalTokens = $historyTotalTokens
         tokenUse = ConvertTo-PlainObject $tokenUse
+        answerDepth = ConvertTo-PlainObject $answerDepth
+        finishReason = if ($chatResult) { $chatResult.FinishReason } else { $null }
+        nextQuestionMarkerFound = $nextQuestionMarkerFound
+        nextQuestionMarkerPresent = $nextQuestionMarkerPresent
+        partialReason = $partialReason
+        effectiveMaxTokens = if ($chatResult) { $chatResult.EffectiveMaxTokens } else { $null }
+        requestStreaming = if ($chatResult) { $chatResult.RequestStreaming } else { $null }
+        responseParseMode = if ($chatResult) { $chatResult.ResponseParseMode } else { $null }
+        requestBodyChars = if ($chatResult) { $chatResult.RequestBodyChars } else { $null }
+        systemPromptChars = if ($chatResult) { $chatResult.SystemPromptChars } else { $null }
+        userPromptChars = if ($chatResult) { $chatResult.UserPromptChars } else { $null }
+        cycleIndex = $projectCycleForRun
+        turnInCycle = $projectTurnInCycle
+        phase = if ($projectPhase) { $projectPhase.key } else { $null }
+        questionSource = $questionSource
+        primaryBusinessFamily = if ($projectScan) { $projectScan.primaryBusinessFamily } else { $null }
         question = $question
         nextQuestion = $nextQuestion
         answerChars = if ($answer) { $answer.Length } else { 0 }
@@ -3916,4 +5266,8 @@ $answer
     }
 
     Wait-WithCountdown $nextWaitSeconds $intervalPlan
+}
+
+} finally {
+    if ($projectSessionLockStream) { $projectSessionLockStream.Dispose(); $projectSessionLockStream = $null }
 }

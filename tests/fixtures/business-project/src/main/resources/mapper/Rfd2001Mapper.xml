@@ -1,0 +1,10 @@
+<mapper namespace="example.rfd.Rfd2001Mapper">
+  <!-- 승인된 환불 접수를 지급 대기 건으로 생성한다. -->
+  <insert id="insertRefundPayment" parameterType="string">
+    INSERT INTO TB_REFUND_PAYMENT (REFUND_NO, PAYMENT_AMOUNT, PAYMENT_STATUS)
+    SELECT REFUND_NO, REFUND_AMOUNT, 'WAITING'
+      FROM TB_REFUND_REQUEST
+     WHERE REFUND_DATE = #{refundDate}
+       AND APPROVAL_STATUS = 'APPROVED'
+  </insert>
+</mapper>
