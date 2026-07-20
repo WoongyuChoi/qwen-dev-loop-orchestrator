@@ -4,6 +4,7 @@ setlocal EnableExtensions DisableDelayedExpansion
 
 set "SCRIPT_DIR=%~dp0"
 set "SETTINGS_PATH=%USERPROFILE%\.qwen\settings.json"
+set "RUN_EXIT_CODE=0"
 
 pushd "%SCRIPT_DIR%" >nul
 if errorlevel 1 (
@@ -52,6 +53,7 @@ powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%qwe
   -WorkDir "%SCRIPT_DIR%qwen-loop-data" ^
   -SeedFile "%SCRIPT_DIR%seed_prompt.txt" ^
   -ContextListFile "%SCRIPT_DIR%context_files.txt"
+set "RUN_EXIT_CODE=%ERRORLEVEL%"
 goto END
 
 :PROJECT_MODE
@@ -101,6 +103,7 @@ powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%qwe
   -WorkDir "%PROJECT_WORKDIR%" ^
   -SeedFile "%SCRIPT_DIR%seed_prompt.txt" ^
   -ContextListFile "%SCRIPT_DIR%context_files.txt"
+set "RUN_EXIT_CODE=%ERRORLEVEL%"
 goto END
 
 :ASK_INTERVAL
@@ -149,4 +152,6 @@ exit /b 0
 
 :END
 popd >nul
+if not "%RUN_EXIT_CODE%"=="0" echo [ERROR] qwen-loop.ps1 exited with code %RUN_EXIT_CODE%.
 pause
+exit /b %RUN_EXIT_CODE%

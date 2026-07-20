@@ -19,6 +19,10 @@
     [int]$ProjectScanMaxFiles = 60,
     [int]$ProjectScanMaxFileChars = 5000,
     [int]$ProjectScanMaxTotalChars = 14000,
+    [int]$ProjectCandidateMaxFiles = 10000,
+    [int]$ProjectCandidateMaxDirectories = 10000,
+    [int]$ProjectContentScanMaxFiles = 2500,
+    [int]$ProjectMaxSourceFileMB = 4,
     [int]$DynamicProjectContextMaxFiles = 10,
     [int]$DynamicProjectContextMaxFileChars = 6000,
     [int]$DynamicProjectContextMaxTotalChars = 42000,
@@ -29,6 +33,8 @@
     [int]$ProjectSessionMaxTotalMB = 750,
     [int]$ProjectTargetOutputTokens = 3500,
     [int]$ProjectTargetAnswerChars = 8000,
+    [int]$ProjectQualityMinEvidenceSignals = 3,
+    [int]$ProjectMaxContinuationAttempts = 2,
     [int]$LastTurnChars = 6000,
     [int]$CountdownRefreshSeconds = 1,
     [int]$AnswerPreviewLines = 10,
@@ -53,6 +59,7 @@
     [switch]$NonStreaming,
     [switch]$EndpointFallbacks,
     [switch]$UseSchedulerSamplingDefaults,
+    [switch]$NoProjectQualityGate,
     [switch]$LoopDiagnosticHeaders,
     [switch]$NoClientIdentityHeaders,
     [switch]$NoBanner,
@@ -69,21 +76,83 @@ foreach ($key in $PSBoundParameters.Keys) { $ScriptBoundParameterNames[$key] = $
 
 # Windows PowerShell 5.1 + Korean Windows: make console and files consistently UTF-8.
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+$Utf8Strict = New-Object System.Text.UTF8Encoding($false, $true)
 [Console]::OutputEncoding = $Utf8NoBom
 [Console]::InputEncoding = $Utf8NoBom
 $OutputEncoding = $Utf8NoBom
 try { [System.Net.ServicePointManager]::Expect100Continue = $false } catch { }
 
 function Write-Utf8File($Path, $Text) {
-    $dir = Split-Path -Parent $Path
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $dir = Split-Path -Parent $fullPath
     if ($dir -and !(Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
-    [System.IO.File]::WriteAllText($Path, [string]$Text, $Utf8NoBom)
+    $leaf = [System.IO.Path]::GetFileName($fullPath)
+    $tempPath = Join-Path $dir (".{0}.{1}.{2}.tmp" -f $leaf, $PID, [Guid]::NewGuid().ToString("N"))
+    $backupPath = Join-Path $dir (".{0}.{1}.{2}.replace-backup" -f $leaf, $PID, [Guid]::NewGuid().ToString("N"))
+    $fileStream = $null
+    $writer = $null
+    try {
+        $fileStream = New-Object System.IO.FileStream($tempPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        $writer = New-Object System.IO.StreamWriter($fileStream, $Utf8NoBom)
+        $writer.Write([string]$Text)
+        $writer.Flush()
+        $fileStream.Flush($true)
+        $writer.Dispose()
+        $writer = $null
+        $fileStream = $null
+        if ([System.IO.File]::Exists($fullPath)) {
+            # Same-directory File.Replace is atomic on the Windows/NTFS target
+            # environment. If replacement fails, preserve the old state file
+            # instead of deleting it and exposing a partially written file.
+            [System.IO.File]::Replace($tempPath, $fullPath, $backupPath, $true)
+        } else {
+            [System.IO.File]::Move($tempPath, $fullPath)
+        }
+    } finally {
+        if ($writer) { $writer.Dispose() }
+        elseif ($fileStream) { $fileStream.Dispose() }
+        if ([System.IO.File]::Exists($tempPath)) {
+            try { [System.IO.File]::Delete($tempPath) } catch { }
+        }
+        if ([System.IO.File]::Exists($backupPath)) {
+            try { [System.IO.File]::Delete($backupPath) } catch { }
+        }
+    }
 }
 
 function Append-Utf8File($Path, $Text) {
     $dir = Split-Path -Parent $Path
     if ($dir -and !(Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
     [System.IO.File]::AppendAllText($Path, [string]$Text, $Utf8NoBom)
+}
+
+function Append-JsonlRecord([string]$Path, $Record, [int]$Depth = 30) {
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $dir = Split-Path -Parent $fullPath
+    if ($dir -and !(Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    $jsonBytes = [System.Text.Encoding]::UTF8.GetBytes((($Record | ConvertTo-Json -Compress -Depth $Depth) + "`n"))
+    $separatorBytes = [System.Text.Encoding]::UTF8.GetBytes("`n")
+    $stream = $null
+    try {
+        $stream = New-Object System.IO.FileStream($fullPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::Read)
+        if ($stream.Length -gt 0) {
+            [void]$stream.Seek(-1, [System.IO.SeekOrigin]::End)
+            $lastByte = $stream.ReadByte()
+            [void]$stream.Seek(0, [System.IO.SeekOrigin]::End)
+            if ($lastByte -ne 10 -and $lastByte -ne 13) {
+                # Preserve a torn final record for forensics, but terminate its
+                # physical line so every later record remains independently
+                # parseable and recoverable.
+                $stream.Write($separatorBytes, 0, $separatorBytes.Length)
+            }
+        } else {
+            [void]$stream.Seek(0, [System.IO.SeekOrigin]::End)
+        }
+        $stream.Write($jsonBytes, 0, $jsonBytes.Length)
+        $stream.Flush($true)
+    } finally {
+        if ($stream) { $stream.Dispose() }
+    }
 }
 
 function Read-Utf8File($Path) {
@@ -99,20 +168,38 @@ function Format-ByteSize([long]$Bytes) {
 
 function Get-DirectorySizeBytes([string]$Path) {
     if (!(Test-Path -LiteralPath $Path -PathType Container)) { return 0 }
-
     $total = [int64]0
-    Get-ChildItem -LiteralPath $Path -Recurse -File -Force -ErrorAction SilentlyContinue | ForEach-Object {
-        $total += [int64]$_.Length
+    $root = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if ($null -eq $root -or (($root.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) { return 0 }
+    $queue = New-Object System.Collections.Generic.Queue[System.IO.DirectoryInfo]
+    $queue.Enqueue([System.IO.DirectoryInfo]$root)
+    while ($queue.Count -gt 0) {
+        $dir = $queue.Dequeue()
+        foreach ($child in @(Get-ChildItem -LiteralPath $dir.FullName -Force -ErrorAction SilentlyContinue)) {
+            if (($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+            if ($child.PSIsContainer) { $queue.Enqueue([System.IO.DirectoryInfo]$child) }
+            else { $total += [int64]$child.Length }
+        }
     }
     return $total
 }
 
+$script:ManagedDefaultRootPhysical = ""
+$script:ManagedRootDefaultCache = @{}
 function Test-ManagedProjectSubtreePath([string]$Root, [string]$Path) {
     try {
-        $defaultRoot = Get-NormalizedFullPath (Join-Path $PSScriptRoot "qwen-loop-data")
-        $actualRoot = Get-NormalizedFullPath $Root
-        if (-not $actualRoot.Equals($defaultRoot, [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
-        $relative = Get-RelativeWorkPath $actualRoot $Path
+        $rootKey = (Get-NormalizedFullPath $Root).ToLowerInvariant()
+        if (-not $script:ManagedRootDefaultCache.ContainsKey($rootKey)) {
+            if ([string]::IsNullOrWhiteSpace($script:ManagedDefaultRootPhysical)) {
+                $script:ManagedDefaultRootPhysical = Get-PhysicalNormalizedPath (Join-Path $PSScriptRoot "qwen-loop-data")
+            }
+            $actualPhysical = Get-PhysicalNormalizedPath $Root
+            $script:ManagedRootDefaultCache[$rootKey] = $actualPhysical.Equals($script:ManagedDefaultRootPhysical, [System.StringComparison]::OrdinalIgnoreCase)
+        }
+        if (-not [bool]$script:ManagedRootDefaultCache[$rootKey]) { return $false }
+        # Path is obtained by enumerating Root and reparse points are skipped,
+        # so the lexical relative path is stable after the physical root check.
+        $relative = Get-RelativeWorkPath $Root $Path
         return ($relative -match '^project([\\/]|$)')
     } catch {
         return $true
@@ -122,12 +209,18 @@ function Test-ManagedProjectSubtreePath([string]$Root, [string]$Path) {
 function Get-ManagedWorkDirFiles([string]$Root) {
     if (!(Test-Path -LiteralPath $Root -PathType Container)) { return @() }
     $files = New-Object System.Collections.Generic.List[System.IO.FileInfo]
-    $topItems = @(Get-ChildItem -LiteralPath $Root -Force -ErrorAction SilentlyContinue)
-    foreach ($item in $topItems) {
-        if (-not $item.PSIsContainer) { $files.Add([System.IO.FileInfo]$item) | Out-Null; continue }
-        if (Test-ManagedProjectSubtreePath $Root $item.FullName) { continue }
-        foreach ($file in @(Get-ChildItem -LiteralPath $item.FullName -Recurse -File -Force -ErrorAction SilentlyContinue)) {
-            $files.Add($file) | Out-Null
+    $queue = New-Object System.Collections.Generic.Queue[System.IO.DirectoryInfo]
+    $queue.Enqueue([System.IO.DirectoryInfo](Get-Item -LiteralPath $Root -Force))
+    while ($queue.Count -gt 0) {
+        $dir = $queue.Dequeue()
+        foreach ($item in @(Get-ChildItem -LiteralPath $dir.FullName -Force -ErrorAction SilentlyContinue)) {
+            if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+            if ($item.PSIsContainer) {
+                if (Test-ManagedProjectSubtreePath $Root $item.FullName) { continue }
+                $queue.Enqueue([System.IO.DirectoryInfo]$item)
+            } else {
+                $files.Add([System.IO.FileInfo]$item) | Out-Null
+            }
         }
     }
     return @($files.ToArray())
@@ -136,11 +229,15 @@ function Get-ManagedWorkDirFiles([string]$Root) {
 function Get-ManagedWorkDirDirectories([string]$Root) {
     if (!(Test-Path -LiteralPath $Root -PathType Container)) { return @() }
     $dirs = New-Object System.Collections.Generic.List[System.IO.DirectoryInfo]
-    foreach ($dir in @(Get-ChildItem -LiteralPath $Root -Directory -Force -ErrorAction SilentlyContinue)) {
-        if (Test-ManagedProjectSubtreePath $Root $dir.FullName) { continue }
-        $dirs.Add($dir) | Out-Null
-        foreach ($nested in @(Get-ChildItem -LiteralPath $dir.FullName -Recurse -Directory -Force -ErrorAction SilentlyContinue)) {
-            $dirs.Add($nested) | Out-Null
+    $queue = New-Object System.Collections.Generic.Queue[System.IO.DirectoryInfo]
+    $queue.Enqueue([System.IO.DirectoryInfo](Get-Item -LiteralPath $Root -Force))
+    while ($queue.Count -gt 0) {
+        $parent = $queue.Dequeue()
+        foreach ($dir in @(Get-ChildItem -LiteralPath $parent.FullName -Directory -Force -ErrorAction SilentlyContinue)) {
+            if (($dir.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+            if (Test-ManagedProjectSubtreePath $Root $dir.FullName) { continue }
+            $dirs.Add([System.IO.DirectoryInfo]$dir) | Out-Null
+            $queue.Enqueue([System.IO.DirectoryInfo]$dir)
         }
     }
     return @($dirs.ToArray())
@@ -202,6 +299,27 @@ function Assert-CleanupConfig() {
     if ($CleanupKeepTurns -lt 1) { throw "CleanupKeepTurns는 1 이상이어야 합니다." }
 }
 
+function Assert-ProjectSessionRetentionConfig() {
+    if ($ProjectSessionKeepCount -lt 1) { throw "ProjectSessionKeepCount는 1 이상이어야 합니다." }
+    if ($ProjectSessionKeepDays -lt 0) { throw "ProjectSessionKeepDays는 0 이상이어야 합니다." }
+    if ($ProjectSessionMaxTotalMB -lt 0) { throw "ProjectSessionMaxTotalMB는 0 이상이어야 합니다." }
+}
+
+function Assert-RuntimeConfig([int]$EffectiveTimeoutSeconds) {
+    if ($EffectiveTimeoutSeconds -le 0 -or $EffectiveTimeoutSeconds -gt 2147483) {
+        throw "effective TimeoutSec는 1..2147483초 범위여야 합니다: $EffectiveTimeoutSeconds"
+    }
+    if ($MaxRuns -lt 0) { throw "MaxRuns는 0 이상이어야 합니다. 0은 무제한 루프입니다." }
+    if ($MaxContextChars -lt 0) { throw "MaxContextChars는 0 이상이어야 합니다." }
+    if ($LastTurnChars -lt 0) { throw "LastTurnChars는 0 이상이어야 합니다." }
+    if ($CountdownRefreshSeconds -le 0) { throw "CountdownRefreshSeconds는 1 이상이어야 합니다." }
+    if ($AnswerPreviewLines -lt 0 -or $AnswerPreviewChars -lt 0) { throw "AnswerPreviewLines/AnswerPreviewChars는 0 이상이어야 합니다." }
+    if ($UseSchedulerSamplingDefaults -and $MaxTokens -le 0) { throw "UseSchedulerSamplingDefaults 사용 시 MaxTokens는 1 이상이어야 합니다." }
+    foreach ($headerValue in @($QwenCodeVersion, $OpenAISdkVersion, $NodeRuntimeVersion)) {
+        if ([string]$headerValue -match "`r|`n") { throw "SDK/User-Agent version 값에는 CR/LF를 넣을 수 없습니다." }
+    }
+}
+
 function Test-ProtectedWorkFile([string]$Root, [string]$FileFullName) {
     if (Test-ManagedProjectSubtreePath $Root $FileFullName) { return $true }
     $relative = Get-RelativeWorkPath $Root $FileFullName
@@ -216,6 +334,9 @@ function Test-ProtectedWorkFile([string]$Root, [string]$FileFullName) {
         "project_scan_summary.md",
         "project_scan_summary.json",
         "pending_question.txt",
+        "pending_turn.json",
+        "partial_state.json",
+        "pending_cycle_transition.json",
         "error.log",
         "settings_effective_summary.json",
         "last_request_headers.json",
@@ -242,7 +363,7 @@ function Test-StaleCleanupCandidate([string]$Root, $File) {
     $relative = Get-RelativeWorkPath $Root $File.FullName
     if ($relative -match '(^|[\\/])check([\\/]|$)') { return $true }
     if ($File.Name -match '^(dry_run_request_|settings_effective_summary).*\.json$') { return $true }
-    if ($File.Name -match '\.(old|bak|tmp)$') { return $true }
+    if ($File.Name -match '\.(old|bak|tmp)$|\.replace-backup$') { return $true }
     return $false
 }
 
@@ -300,7 +421,17 @@ function Convert-JsonlLineForCleanup([string]$Line, [int]$AnswerChars) {
         }
         return ($plain | ConvertTo-Json -Compress -Depth 50)
     } catch {
-        return (Get-TextPrefix $Line $AnswerChars)
+        # Keep forensic evidence without carrying a malformed physical line
+        # into the compacted canonical journal.  Recovery ignores this record
+        # because it has no seq/stateAfter, while every JSONL line remains
+        # independently parseable after cleanup.
+        $invalidRecord = [ordered]@{
+            schema = "qwen-loop-invalid-jsonl-line/v1"
+            valid = $false
+            note = "malformed or torn line preserved by transcript cleanup"
+            preservedPrefix = Get-TextPrefix $Line $AnswerChars
+        }
+        return ($invalidRecord | ConvertTo-Json -Compress -Depth 10)
     }
 }
 
@@ -517,6 +648,106 @@ function Get-NormalizedFullPath([string]$Path) {
     return $trimmed
 }
 
+function Initialize-QwenLoopNativePathApi() {
+    if ("QwenLoop.NativePathApi" -as [type]) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+
+namespace QwenLoop {
+    public static class NativePathApi {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern SafeFileHandle CreateFile(
+            string fileName,
+            uint desiredAccess,
+            uint shareMode,
+            IntPtr securityAttributes,
+            uint creationDisposition,
+            uint flagsAndAttributes,
+            IntPtr templateFile);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern uint GetFinalPathNameByHandle(
+            SafeFileHandle handle,
+            StringBuilder path,
+            uint pathLength,
+            uint flags);
+    }
+}
+'@
+}
+
+function Get-FinalPathForExistingItem([string]$Path) {
+    Initialize-QwenLoopNativePathApi
+    $handle = [QwenLoop.NativePathApi]::CreateFile(
+        $Path,
+        [uint32]0,
+        [uint32]7,
+        [IntPtr]::Zero,
+        [uint32]3,
+        [uint32]0x02000000,
+        [IntPtr]::Zero
+    )
+    if ($null -eq $handle -or $handle.IsInvalid) {
+        $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        if ($handle) { $handle.Dispose() }
+        throw "물리 경로 handle을 열 수 없습니다: $Path / $([ComponentModel.Win32Exception]::new($errorCode).Message)"
+    }
+    try {
+        $capacity = 512
+        while ($true) {
+            $buffer = [System.Text.StringBuilder]::new($capacity)
+            $length = [QwenLoop.NativePathApi]::GetFinalPathNameByHandle($handle, $buffer, [uint32]$buffer.Capacity, [uint32]0)
+            if ($length -eq 0) {
+                $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                throw "물리 경로를 조회할 수 없습니다: $Path / $([ComponentModel.Win32Exception]::new($errorCode).Message)"
+            }
+            if ($length -lt $buffer.Capacity) {
+                $finalPath = $buffer.ToString()
+                if ($finalPath.StartsWith('\\?\UNC\', [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $finalPath = '\\' + $finalPath.Substring(8)
+                } elseif ($finalPath.StartsWith('\\?\', [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $finalPath = $finalPath.Substring(4)
+                }
+                return Get-NormalizedFullPath $finalPath
+            }
+            $capacity = [int]$length + 1
+        }
+    } finally {
+        $handle.Dispose()
+    }
+}
+
+function Get-PhysicalNormalizedPath([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path)) { throw "빈 경로는 물리 경로로 정규화할 수 없습니다." }
+    $normalized = Get-NormalizedFullPath $Path
+    $existing = $normalized
+    $tail = New-Object System.Collections.Generic.List[string]
+    while (-not (Test-Path -LiteralPath $existing)) {
+        $leaf = [System.IO.Path]::GetFileName($existing.TrimEnd([char[]]@('\', '/')))
+        $parent = [System.IO.Path]::GetDirectoryName($existing.TrimEnd([char[]]@('\', '/')))
+        if ([string]::IsNullOrWhiteSpace($leaf) -or [string]::IsNullOrWhiteSpace($parent) -or $parent -eq $existing) {
+            throw "물리 경로 정규화를 위한 기존 상위 디렉터리를 찾지 못했습니다: $Path"
+        }
+        $tail.Insert(0, $leaf)
+        $existing = $parent
+    }
+
+    $physical = Get-FinalPathForExistingItem $existing
+    foreach ($leaf in $tail) { $physical = Join-Path $physical $leaf }
+    return Get-NormalizedFullPath $physical
+}
+
+function Test-PhysicalPathInsideRoot([string]$Root, [string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Root) -or [string]::IsNullOrWhiteSpace($Path)) { return $false }
+    $rootPhysical = (Get-PhysicalNormalizedPath $Root).TrimEnd([char[]]@('\', '/'))
+    $pathPhysical = (Get-PhysicalNormalizedPath $Path).TrimEnd([char[]]@('\', '/'))
+    if ($pathPhysical.Equals($rootPhysical, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    return $pathPhysical.StartsWith(($rootPhysical + [System.IO.Path]::DirectorySeparatorChar), [System.StringComparison]::OrdinalIgnoreCase)
+}
+
 function Test-PathInsideRoot([string]$Root, [string]$Path) {
     if ([string]::IsNullOrWhiteSpace($Root) -or [string]::IsNullOrWhiteSpace($Path)) { return $false }
     $rootFull = (Get-NormalizedFullPath $Root).TrimEnd([char[]]@('\', '/'))
@@ -554,9 +785,25 @@ function Test-QwenLoopWorkDirOwnership([string]$Root) {
     try {
         $marker = (Read-Utf8File $markerPath) | ConvertFrom-Json
         if ([string]$marker.schema -ne "qwen-loop-workdir/v1") { return $false }
-        $markerRoot = Get-NormalizedFullPath ([string]$marker.normalizedWorkDir)
-        $actualRoot = Get-NormalizedFullPath $Root
-        return $markerRoot.Equals($actualRoot, [System.StringComparison]::OrdinalIgnoreCase)
+        $markerRootText = [string]$marker.normalizedWorkDir
+        if ([string]::IsNullOrWhiteSpace($markerRootText)) { return $false }
+        $markerRoot = Get-PhysicalNormalizedPath $markerRootText
+        $markerOrchestratorRootText = [string]$marker.orchestratorRoot
+        if ([string]::IsNullOrWhiteSpace($markerOrchestratorRootText)) { return $false }
+        $markerOrchestratorRoot = Get-PhysicalNormalizedPath $markerOrchestratorRootText
+        $actualRoot = Get-PhysicalNormalizedPath $Root
+        $actualOrchestratorRoot = Get-PhysicalNormalizedPath $PSScriptRoot
+        if (-not $markerRoot.Equals($actualRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
+            -not $markerOrchestratorRoot.Equals($actualOrchestratorRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $false
+        }
+        $recordedPhysicalRoot = [string](Get-JsonProperty $marker "physicalWorkDir")
+        $recordedPhysicalOrchestrator = [string](Get-JsonProperty $marker "physicalOrchestratorRoot")
+        if (-not [string]::IsNullOrWhiteSpace($recordedPhysicalRoot) -and
+            -not (Get-NormalizedFullPath $recordedPhysicalRoot).Equals($actualRoot, [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
+        if (-not [string]::IsNullOrWhiteSpace($recordedPhysicalOrchestrator) -and
+            -not (Get-NormalizedFullPath $recordedPhysicalOrchestrator).Equals($actualOrchestratorRoot, [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
+        return $true
     } catch {
         return $false
     }
@@ -570,6 +817,8 @@ function Initialize-QwenLoopWorkDirOwnership([string]$Root, [bool]$CanClaim) {
         schema = "qwen-loop-workdir/v1"
         normalizedWorkDir = Get-NormalizedFullPath $Root
         orchestratorRoot = Get-NormalizedFullPath $PSScriptRoot
+        physicalWorkDir = Get-PhysicalNormalizedPath $Root
+        physicalOrchestratorRoot = Get-PhysicalNormalizedPath $PSScriptRoot
         createdAt = (Get-Date).ToString("o")
     }
     Write-Utf8File (Join-Path $Root ".qwen-loop-workdir.json") ($marker | ConvertTo-Json -Depth 10)
@@ -578,38 +827,44 @@ function Initialize-QwenLoopWorkDirOwnership([string]$Root, [bool]$CanClaim) {
 
 function Assert-SafeWorkDir([string]$Path, [string]$ActiveProjectRoot) {
     $full = (Get-NormalizedFullPath $Path).TrimEnd([char[]]@('\', '/'))
-    $driveRoot = [System.IO.Path]::GetPathRoot($full).TrimEnd([char[]]@('\', '/'))
+    $driveRootPath = [System.IO.Path]::GetPathRoot($full)
+    $driveRoot = $driveRootPath.TrimEnd([char[]]@('\', '/'))
     $scriptRoot = (Get-NormalizedFullPath $PSScriptRoot).TrimEnd([char[]]@('\', '/'))
     $profileRoot = ""
     if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
         $profileRoot = (Get-NormalizedFullPath $env:USERPROFILE).TrimEnd([char[]]@('\', '/'))
     }
 
-    if ($full.Equals($driveRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+    if (Test-PathHasReparsePointInExistingAncestry $full) {
+        throw "WorkDir 또는 그 상위 경로에 junction/symlink/reparse point가 있어 실제 정리 경계를 안전하게 확정할 수 없습니다: $Path"
+    }
+    $physicalFull = (Get-PhysicalNormalizedPath $full).TrimEnd([char[]]@('\', '/'))
+    $physicalDriveRoot = (Get-PhysicalNormalizedPath $driveRootPath).TrimEnd([char[]]@('\', '/'))
+    $physicalScriptRoot = (Get-PhysicalNormalizedPath $scriptRoot).TrimEnd([char[]]@('\', '/'))
+    $physicalProfileRoot = if (-not [string]::IsNullOrWhiteSpace($profileRoot)) { (Get-PhysicalNormalizedPath $profileRoot).TrimEnd([char[]]@('\', '/')) } else { "" }
+
+    if ($physicalFull.Equals($physicalDriveRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
         throw "WorkDir로 드라이브 루트를 사용할 수 없습니다: $Path"
     }
-    if ($full.Equals($scriptRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+    if ($physicalFull.Equals($physicalScriptRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
         throw "WorkDir로 오케스트레이터 소스 루트를 사용할 수 없습니다: $Path"
     }
-    if (-not [string]::IsNullOrWhiteSpace($profileRoot) -and $full.Equals($profileRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+    if (-not [string]::IsNullOrWhiteSpace($physicalProfileRoot) -and $physicalFull.Equals($physicalProfileRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
         throw "WorkDir로 사용자 프로필 루트를 사용할 수 없습니다: $Path"
     }
     if (-not [string]::IsNullOrWhiteSpace($ActiveProjectRoot)) {
-        $projectFull = (Get-NormalizedFullPath $ActiveProjectRoot).TrimEnd([char[]]@('\', '/'))
-        if (Test-PathInsideRoot $projectFull $full) {
+        $projectFull = (Get-PhysicalNormalizedPath $ActiveProjectRoot).TrimEnd([char[]]@('\', '/'))
+        if (Test-PhysicalPathInsideRoot $projectFull $physicalFull) {
             throw "WorkDir는 ProjectRoot와 같거나 그 하위일 수 없습니다. 자동 정리가 프로젝트 소스를 건드리지 않도록 오케스트레이터의 별도 qwen-loop-data 폴더를 사용하세요."
         }
-        if (Test-PathInsideRoot $full $projectFull) {
+        if (Test-PhysicalPathInsideRoot $physicalFull $projectFull) {
             throw "WorkDir는 ProjectRoot의 상위 폴더일 수 없습니다. 자동 정리 범위가 프로젝트 소스나 형제 폴더를 포함하지 않도록 별도 qwen-loop-data 폴더를 사용하세요."
         }
-    }
-    if (Test-PathHasReparsePointInExistingAncestry $full) {
-        throw "WorkDir 또는 그 상위 경로에 junction/symlink/reparse point가 있어 실제 정리 경계를 안전하게 확정할 수 없습니다: $Path"
     }
 }
 
 function Get-StablePathHash([string]$Path, [int]$Length = 10) {
-    $normalized = (Get-NormalizedFullPath $Path).ToLowerInvariant()
+    $normalized = (Get-PhysicalNormalizedPath $Path).ToLowerInvariant()
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try {
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($normalized)
@@ -640,7 +895,7 @@ function New-ProjectSessionLayout([string]$Root, [string]$SessionRoot) {
     $resolvedRoot = Resolve-ProjectRoot $Root
     $baseInput = Expand-PathInput $SessionRoot
     if (-not [System.IO.Path]::IsPathRooted($baseInput)) { $baseInput = Join-Path $PSScriptRoot $baseInput }
-    $baseRoot = Get-NormalizedFullPath $baseInput
+    $baseRoot = Get-PhysicalNormalizedPath $baseInput
     $identity = "$(Get-SafeProjectSlug $resolvedRoot)-$(Get-StablePathHash $resolvedRoot 10)"
     $projectBase = Join-Path $baseRoot $identity
     $sessionsRoot = Join-Path $projectBase "sessions"
@@ -650,6 +905,7 @@ function New-ProjectSessionLayout([string]$Root, [string]$SessionRoot) {
     } while (Test-Path -LiteralPath $sessionDir)
 
     return [PSCustomObject]@{
+        BaseRoot = $baseRoot
         ProjectRoot = $resolvedRoot
         Identity = $identity
         ProjectBase = $projectBase
@@ -660,10 +916,10 @@ function New-ProjectSessionLayout([string]$Root, [string]$SessionRoot) {
     }
 }
 
-function Get-ValidatedProjectSessionDirectories($Layout) {
+function Get-ValidatedProjectSessionDirectories($Layout, [switch]$IncludeAbandoned) {
     if ($null -eq $Layout -or !(Test-Path -LiteralPath $Layout.SessionsRoot -PathType Container)) { return @() }
     $sessionsRoot = (Get-NormalizedFullPath ([string]$Layout.SessionsRoot)).TrimEnd([char[]]@('\', '/'))
-    $projectRoot = Get-NormalizedFullPath ([string]$Layout.ProjectRoot)
+    $projectRoot = Get-PhysicalNormalizedPath ([string]$Layout.ProjectRoot)
     $valid = New-Object System.Collections.Generic.List[object]
 
     foreach ($dir in @(Get-ChildItem -LiteralPath $sessionsRoot -Directory -Force -ErrorAction SilentlyContinue)) {
@@ -676,29 +932,53 @@ function Get-ValidatedProjectSessionDirectories($Layout) {
         try {
             $marker = (Read-Utf8File $markerPath) | ConvertFrom-Json
             if ([string]$marker.schema -ne "qwen-loop-project-session/v1") { continue }
+            $markerState = [string](Get-JsonProperty $marker "state")
+            $sessionState = if ([string]::IsNullOrWhiteSpace($markerState)) { "legacy-ready" } else { $markerState.ToLowerInvariant() }
+            if ($sessionState -notin @("ready", "legacy-ready") -and
+                (-not $IncludeAbandoned -or $sessionState -notin @("initializing", "failed"))) { continue }
             if ([string]$marker.identity -ne [string]$Layout.Identity) { continue }
-            $markerProjectRoot = Get-NormalizedFullPath ([string]$marker.canonicalProjectRoot)
+            $markerProjectRoot = Get-PhysicalNormalizedPath ([string]$marker.canonicalProjectRoot)
             if (-not $markerProjectRoot.Equals($projectRoot, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+            $recordedPhysicalProject = [string](Get-JsonProperty $marker "physicalProjectRoot")
+            if (-not [string]::IsNullOrWhiteSpace($recordedPhysicalProject) -and
+                -not (Get-NormalizedFullPath $recordedPhysicalProject).Equals($projectRoot, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
             if ([string]$marker.sessionId -ne $dir.Name) { continue }
-            $valid.Add([PSCustomObject]@{ Directory = $dir; Marker = $marker; LockPath = (Join-Path $dir.FullName ".active.lock") }) | Out-Null
+            $recordedPhysicalSession = [string](Get-JsonProperty $marker "physicalSessionDir")
+            if (-not [string]::IsNullOrWhiteSpace($recordedPhysicalSession)) {
+                $actualPhysicalSession = Get-PhysicalNormalizedPath $dir.FullName
+                if (-not (Get-NormalizedFullPath $recordedPhysicalSession).Equals($actualPhysicalSession, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+            }
+            $valid.Add([PSCustomObject]@{
+                Directory = $dir
+                Marker = $marker
+                State = $sessionState
+                IsAbandoned = ($sessionState -in @("initializing", "failed"))
+                LockPath = (Join-Path $dir.FullName ".active.lock")
+            }) | Out-Null
         } catch { }
     }
     return @($valid.ToArray())
 }
 
-function Test-ProjectSessionInactive($SessionInfo) {
-    if ($null -eq $SessionInfo) { return $false }
+function Open-ProjectSessionRetentionGuard($SessionInfo) {
+    if ($null -eq $SessionInfo) { return $null }
     $lockPath = [string]$SessionInfo.LockPath
-    if (!(Test-Path -LiteralPath $lockPath -PathType Leaf)) { return $true }
-    $probe = $null
     try {
-        $probe = [System.IO.File]::Open($lockPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
-        return $true
+        # ReadWrite/Delete sharing lets retention remove the guarded session,
+        # but its own ReadWrite access prevents a new FileShare.None lifetime
+        # owner from opening .active.lock until deletion has finished.
+        $share = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
+        return [System.IO.File]::Open($lockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, $share)
     } catch {
-        return $false
-    } finally {
-        if ($probe) { $probe.Dispose() }
+        return $null
     }
+}
+
+function Test-ProjectSessionInactive($SessionInfo) {
+    $guard = Open-ProjectSessionRetentionGuard $SessionInfo
+    if ($null -eq $guard) { return $false }
+    $guard.Dispose()
+    return $true
 }
 
 function Open-ExclusiveFileLock([string]$Path, [int]$TimeoutMilliseconds = 3000) {
@@ -736,43 +1016,158 @@ function Test-DirectoryTreeSafeForRemoval([string]$RootPath) {
     }
 }
 
+function Remove-DirectoryTreeWithoutFollowingReparsePoints([string]$RootPath) {
+    # Never delegate recursive traversal to Remove-Item.  Each directory is
+    # opened/enumerated only after a fresh reparse check, files are removed by
+    # exact path, and Directory.Delete(false) fails safely if a concurrent
+    # writer inserts an unvisited child.
+    $rootNormalized = Get-NormalizedFullPath $RootPath
+    $frames = New-Object System.Collections.Generic.Stack[object]
+    $frames.Push([PSCustomObject]@{ Path = $rootNormalized; Expanded = $false })
+    while ($frames.Count -gt 0) {
+        $frame = $frames.Pop()
+        $item = Get-Item -LiteralPath ([string]$frame.Path) -Force -ErrorAction Stop
+        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "reparse point appeared during safe session removal: $($item.FullName)"
+        }
+        if (-not $item.PSIsContainer) {
+            [System.IO.File]::Delete($item.FullName)
+            continue
+        }
+        if (-not [bool]$frame.Expanded) {
+            $children = @(Get-ChildItem -LiteralPath $item.FullName -Force -ErrorAction Stop)
+            $deferredLifetimeLock = $null
+            foreach ($child in $children) {
+                if (($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    throw "reparse point appeared during safe session removal: $($child.FullName)"
+                }
+                if ($item.FullName.Equals($rootNormalized, [System.StringComparison]::OrdinalIgnoreCase) -and
+                    $child.Name.Equals(".active.lock", [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $deferredLifetimeLock = $child
+                }
+            }
+            $frames.Push([PSCustomObject]@{ Path = $item.FullName; Expanded = $true })
+            # Keep the guard's directory entry until every other descendant is
+            # gone. Once it is unlinked, only the non-recursive root delete is
+            # allowed; a newly created lifetime lock then makes that delete
+            # fail instead of racing with further state-file deletion.
+            if ($deferredLifetimeLock) {
+                $frames.Push([PSCustomObject]@{ Path = $deferredLifetimeLock.FullName; Expanded = $false })
+            }
+            foreach ($child in @($children | Where-Object { $null -eq $deferredLifetimeLock -or -not $_.FullName.Equals($deferredLifetimeLock.FullName, [System.StringComparison]::OrdinalIgnoreCase) } | Sort-Object FullName -Descending)) {
+                $frames.Push([PSCustomObject]@{ Path = $child.FullName; Expanded = $false })
+            }
+        } else {
+            [System.IO.Directory]::Delete($item.FullName, $false)
+        }
+    }
+}
+
 function Remove-ValidatedProjectSession($SessionInfo, $Layout) {
     if ($null -eq $SessionInfo) { return $false }
+    $retentionGuard = $null
     try {
         $sessionsRoot = (Get-NormalizedFullPath ([string]$Layout.SessionsRoot)).TrimEnd([char[]]@('\', '/'))
         $full = Get-NormalizedFullPath ([string]$SessionInfo.Directory.FullName)
         $current = Get-NormalizedFullPath ([string]$Layout.SessionDir)
         if ($full.Equals($current, [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
 
-        # Refresh every safety decision immediately before recursive removal.  A
-        # stale DirectoryInfo or marker must never authorize deletion.
-        $fresh = @(Get-ValidatedProjectSessionDirectories $Layout | Where-Object {
+        $retentionGuard = Open-ProjectSessionRetentionGuard $SessionInfo
+        if ($null -eq $retentionGuard) { return $false }
+
+        # Refresh every safety decision while the guard prevents a new session
+        # lifetime owner from acquiring .active.lock. A stale DirectoryInfo or
+        # marker must never authorize deletion.
+        $fresh = @(Get-ValidatedProjectSessionDirectories $Layout -IncludeAbandoned | Where-Object {
             (Get-NormalizedFullPath ([string]$_.Directory.FullName)).Equals($full, [System.StringComparison]::OrdinalIgnoreCase)
         } | Select-Object -First 1)[0]
         if ($null -eq $fresh) { return $false }
+        if ([string]$fresh.State -ne [string]$SessionInfo.State) { return $false }
         $dir = Get-Item -LiteralPath $full -Force -ErrorAction Stop
         if (($dir.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
         $parent = (Get-NormalizedFullPath $dir.Parent.FullName).TrimEnd([char[]]@('\', '/'))
         if (-not $parent.Equals($sessionsRoot, [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
-        if (-not (Test-ProjectSessionInactive $fresh)) { return $false }
         if (-not (Test-DirectoryTreeSafeForRemoval $full)) { return $false }
 
-        Remove-Item -LiteralPath $full -Recurse -Force -ErrorAction Stop
+        Remove-DirectoryTreeWithoutFollowingReparsePoints $full
         return $true
     } catch {
         return $false
+    } finally {
+        if ($retentionGuard) { $retentionGuard.Dispose() }
     }
 }
 
-function Invoke-ProjectSessionRetention($Layout) {
+function Get-ProjectSessionStorageMetrics($Layout) {
+    $result = [ordered]@{
+        managedSessionCount = 0
+        managedSessionBytes = [int64]0
+        activeSessionCount = 0
+        abandonedSessionCount = 0
+        abandonedSessionBytes = [int64]0
+        activeAbandonedSessionCount = 0
+        unrecognizedSessionCount = 0
+        unrecognizedSessionBytes = [int64]0
+        reparseSessionDirectoryCount = 0
+        otherProjectIdentityCount = 0
+        otherProjectIdentityBytes = [int64]0
+        totalVisibleBytes = [int64]0
+    }
+    if ($null -eq $Layout) { return [PSCustomObject]$result }
+
+    $valid = @(Get-ValidatedProjectSessionDirectories $Layout -IncludeAbandoned)
+    $validPaths = @{}
+    foreach ($info in $valid) {
+        $full = Get-NormalizedFullPath ([string]$info.Directory.FullName)
+        $validPaths[$full.ToLowerInvariant()] = $true
+        $size = Get-DirectorySizeBytes $full
+        if ([bool]$info.IsAbandoned) {
+            $result.abandonedSessionCount++
+            $result.abandonedSessionBytes += [int64]$size
+            if (-not (Test-ProjectSessionInactive $info)) { $result.activeAbandonedSessionCount++ }
+        } else {
+            $result.managedSessionCount++
+            $result.managedSessionBytes += [int64]$size
+            if (-not (Test-ProjectSessionInactive $info)) { $result.activeSessionCount++ }
+        }
+    }
+
+    if (Test-Path -LiteralPath $Layout.SessionsRoot -PathType Container) {
+        foreach ($dir in @(Get-ChildItem -LiteralPath $Layout.SessionsRoot -Directory -Force -ErrorAction SilentlyContinue)) {
+            $full = Get-NormalizedFullPath $dir.FullName
+            if ($validPaths.ContainsKey($full.ToLowerInvariant())) { continue }
+            if (($dir.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                $result.reparseSessionDirectoryCount++
+                continue
+            }
+            $result.unrecognizedSessionCount++
+            $result.unrecognizedSessionBytes += [int64](Get-DirectorySizeBytes $full)
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$Layout.BaseRoot) -and (Test-Path -LiteralPath $Layout.BaseRoot -PathType Container)) {
+        $currentProjectBase = (Get-NormalizedFullPath ([string]$Layout.ProjectBase)).TrimEnd([char[]]@('\', '/'))
+        foreach ($dir in @(Get-ChildItem -LiteralPath $Layout.BaseRoot -Directory -Force -ErrorAction SilentlyContinue)) {
+            $full = (Get-NormalizedFullPath $dir.FullName).TrimEnd([char[]]@('\', '/'))
+            if ($full.Equals($currentProjectBase, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+            if (($dir.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+            $result.otherProjectIdentityCount++
+            $result.otherProjectIdentityBytes += [int64](Get-DirectorySizeBytes $full)
+        }
+    }
+    $result.totalVisibleBytes = [int64]$result.managedSessionBytes + [int64]$result.unrecognizedSessionBytes + [int64]$result.otherProjectIdentityBytes
+    $result.totalVisibleBytes += [int64]$result.abandonedSessionBytes
+    return [PSCustomObject]$result
+}
+
+function Invoke-ProjectSessionRetention($Layout, [switch]$AbandonedOnly) {
     $actions = New-Object System.Collections.Generic.List[object]
     $warnings = New-Object System.Collections.Generic.List[string]
     if ($null -eq $Layout -or $NoAutoCleanup -or $DryRun) {
-        return [PSCustomObject]@{ enabled = $false; actions = @(); remainingSessions = 0; remainingBytes = 0 }
+        $metrics = Get-ProjectSessionStorageMetrics $Layout
+        return [PSCustomObject]@{ enabled = $false; mode = if ($AbandonedOnly) { "abandoned-only" } else { "full" }; actions = @(); remainingSessions = $metrics.managedSessionCount; remainingBytes = $metrics.managedSessionBytes; storage = $metrics }
     }
-    if ($ProjectSessionKeepCount -lt 1) { throw "ProjectSessionKeepCount는 1 이상이어야 합니다." }
-    if ($ProjectSessionKeepDays -lt 0) { throw "ProjectSessionKeepDays는 0 이상이어야 합니다." }
-    if ($ProjectSessionMaxTotalMB -lt 0) { throw "ProjectSessionMaxTotalMB는 0 이상이어야 합니다." }
+    Assert-ProjectSessionRetentionConfig
 
     $sessionsRoot = Get-NormalizedFullPath ([string]$Layout.SessionsRoot)
     $projectBase = Get-NormalizedFullPath ([string]$Layout.ProjectBase)
@@ -780,16 +1175,20 @@ function Invoke-ProjectSessionRetention($Layout) {
         throw "세션 정리 경로가 프로젝트 세션 루트 밖입니다: $sessionsRoot"
     }
     if (!(Test-Path -LiteralPath $sessionsRoot -PathType Container)) {
-        return [PSCustomObject]@{ enabled = $true; actions = @(); remainingSessions = 0; remainingBytes = 0 }
+        $metrics = Get-ProjectSessionStorageMetrics $Layout
+        return [PSCustomObject]@{ enabled = $true; mode = if ($AbandonedOnly) { "abandoned-only" } else { "full" }; actions = @(); remainingSessions = $metrics.managedSessionCount; remainingBytes = $metrics.managedSessionBytes; storage = $metrics }
     }
 
     $retentionLock = Open-ExclusiveFileLock (Join-Path $projectBase ".retention.lock") 3000
     if ($null -eq $retentionLock) {
+        $metrics = Get-ProjectSessionStorageMetrics $Layout
         return [PSCustomObject]@{
             enabled = $true
+            mode = if ($AbandonedOnly) { "abandoned-only" } else { "full" }
             actions = @()
-            remainingSessions = @(Get-ValidatedProjectSessionDirectories $Layout).Count
-            remainingBytes = (Get-DirectorySizeBytes $sessionsRoot)
+            remainingSessions = $metrics.managedSessionCount
+            remainingBytes = $metrics.managedSessionBytes
+            storage = $metrics
             warning = "another process owns project-session retention; cleanup was skipped"
         }
     }
@@ -797,6 +1196,41 @@ function Invoke-ProjectSessionRetention($Layout) {
     try {
         $current = Get-NormalizedFullPath ([string]$Layout.SessionDir)
         $cutoff = if ($ProjectSessionKeepDays -gt 0) { (Get-Date).AddDays(-$ProjectSessionKeepDays) } else { $null }
+
+        # A process can stop after it has claimed a timestamp session but
+        # before the initial scan/question makes that session ready.  Those
+        # strict-identity initializing/failed directories must not accumulate
+        # outside every count/day/size cap.  The current session is skipped and
+        # the retention guard preserves any other process that is still live.
+        $abandoned = @(Get-ValidatedProjectSessionDirectories $Layout -IncludeAbandoned | Where-Object { [bool]$_.IsAbandoned })
+        foreach ($info in $abandoned) {
+            $dir = $info.Directory
+            if ((Get-NormalizedFullPath $dir.FullName).Equals($current, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+            $before = Get-DirectorySizeBytes $dir.FullName
+            if (Remove-ValidatedProjectSession $info $Layout) {
+                $actions.Add([PSCustomObject]@{ kind = "deleted-abandoned-session"; path = $dir.FullName; beforeBytes = $before; note = "validated-$($info.State)" }) | Out-Null
+            } else {
+                $warnings.Add("active or changed abandoned session was preserved: $($dir.Name)") | Out-Null
+            }
+        }
+
+        # Run this narrow pass immediately after a new session has claimed its
+        # lifetime lock.  Repeated deterministic scan failures can then leave
+        # at most the current failed session, while a failed startup never
+        # evicts useful ready evidence through count/day/size policies.
+        if ($AbandonedOnly) {
+            $metrics = Get-ProjectSessionStorageMetrics $Layout
+            return [PSCustomObject]@{
+                enabled = $true
+                mode = "abandoned-only"
+                actions = @($actions.ToArray())
+                remainingSessions = $metrics.managedSessionCount
+                remainingBytes = $metrics.managedSessionBytes
+                storage = $metrics
+                warning = ($warnings -join "; ")
+            }
+        }
+
         $sessions = @(Get-ValidatedProjectSessionDirectories $Layout | Sort-Object { $_.Directory.LastWriteTimeUtc } -Descending)
 
     for ($i = 0; $i -lt $sessions.Count; $i++) {
@@ -841,21 +1275,29 @@ function Invoke-ProjectSessionRetention($Layout) {
         if ($total -gt $limit) { $warnings.Add("aggregate size remains above cap because active sessions are preserved") | Out-Null }
     }
 
-        $finalSessions = @(Get-ValidatedProjectSessionDirectories $Layout)
+        $metrics = Get-ProjectSessionStorageMetrics $Layout
+        if ($metrics.unrecognizedSessionCount -gt 0 -or $metrics.reparseSessionDirectoryCount -gt 0) {
+            $warnings.Add("unrecognized/reparse session directories were preserved and excluded from retention: unrecognized=$($metrics.unrecognizedSessionCount), reparse=$($metrics.reparseSessionDirectoryCount)") | Out-Null
+        }
         return [PSCustomObject]@{
             enabled = $true
+            mode = "full"
             actions = @($actions.ToArray())
-            remainingSessions = $finalSessions.Count
-            remainingBytes = (Get-DirectorySizeBytes $sessionsRoot)
+            remainingSessions = $metrics.managedSessionCount
+            remainingBytes = $metrics.managedSessionBytes
+            storage = $metrics
             warning = ($warnings -join "; ")
         }
     } catch {
         $warnings.Add("session retention failed safely: $($_.Exception.Message)") | Out-Null
+        $metrics = Get-ProjectSessionStorageMetrics $Layout
         return [PSCustomObject]@{
             enabled = $true
+            mode = if ($AbandonedOnly) { "abandoned-only" } else { "full" }
             actions = @($actions.ToArray())
-            remainingSessions = @(Get-ValidatedProjectSessionDirectories $Layout).Count
-            remainingBytes = (Get-DirectorySizeBytes $sessionsRoot)
+            remainingSessions = $metrics.managedSessionCount
+            remainingBytes = $metrics.managedSessionBytes
+            storage = $metrics
             warning = ($warnings -join "; ")
         }
     } finally {
@@ -911,7 +1353,10 @@ function ConvertTo-PlainObject($obj) {
     if ($obj -is [System.Collections.IEnumerable] -and -not ($obj -is [string]) -and -not ($obj -is [System.Management.Automation.PSCustomObject])) {
         $arr = @()
         foreach ($i in $obj) { $arr += ,(ConvertTo-PlainObject $i) }
-        return $arr
+        # Unary comma prevents PowerShell's success-pipeline enumeration from
+        # collapsing empty/singleton arrays into $null/a scalar. Provider body
+        # fields such as stop must keep their exact JSON array shape.
+        return ,$arr
     }
     if ($obj -is [System.Management.Automation.PSCustomObject]) {
         $h = [ordered]@{}
@@ -935,7 +1380,6 @@ function Test-QuotedEmptySecret([string]$value) {
 
 function Is-SensitiveHeaderName([string]$name) {
     if ([string]::IsNullOrWhiteSpace($name)) { return $false }
-    if ($name -match '(?i)(source|envkey)$') { return $false }
     return ($name -match '(?i)(authorization|api[-_]?key|token|secret|credential|cookie)')
 }
 
@@ -944,6 +1388,65 @@ function Mask-HeaderValue([string]$name, [string]$value) {
         return ($Matches[1] + (Mask-Secret $Matches[2]))
     }
     return Mask-Secret $value
+}
+
+function Test-SensitiveLogPropertyName([string]$Name) {
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
+    return ($Name -match '(?i)(password|passwd|pwd|passphrase|authorization|(?:^|[-_.])auth(?:$|[-_.])|auth$|bearer$|api[-_.]?key|apikey|access[-_.]?key|accesskey|subscription[-_.]?key|subscriptionkey|master[-_.]?key|masterkey|functions?[-_.]?key|functions?key|secret[-_.]?key|secretkey|client[-_.]?secret|clientsecret|secret[-_.]?access[-_.]?key|secretaccesskey|access[-_.]?token|accesstoken|refresh[-_.]?token|refreshtoken|id[-_.]?token|idtoken|auth[-_.]?token|authtoken|session[-_.]?token|sessiontoken|token[-_.]?source|tokensource|(?:^|[-_.])token$|secret(?:$|[-_.])|credential|cookie|private[-_.]?key|privatekey|signing[-_.]?key|signingkey|encryption[-_.]?key|encryptionkey|ssh[-_.]?key|sshkey|signature|hmac|connection[-_.]?string|connectionstring)')
+}
+
+function Protect-LoggedString([string]$Value, [string[]]$KnownSecrets) {
+    if ($null -eq $Value) { return $null }
+    foreach ($secret in @($KnownSecrets)) {
+        if ([string]::IsNullOrWhiteSpace($secret) -or (Test-QuotedEmptySecret $secret)) { continue }
+        if ($Value.Equals($secret, [System.StringComparison]::Ordinal)) { return "[REDACTED KNOWN SECRET]" }
+    }
+    $protected = Protect-ProjectSnippetSecrets $Value
+    foreach ($secret in @($KnownSecrets)) {
+        # Avoid replacing common short substrings inside otherwise harmless
+        # diagnostic text. Exact values above are redacted regardless of
+        # length; embedded replacement is reserved for distinctive secrets.
+        if ([string]::IsNullOrWhiteSpace($secret) -or $secret.Length -lt 6 -or (Test-QuotedEmptySecret $secret)) { continue }
+        $protected = $protected.Replace($secret, "[REDACTED KNOWN SECRET]")
+    }
+    return $protected
+}
+
+function ConvertTo-LoggedObject($Object, [string[]]$KnownSecrets = @(), [string]$PropertyName = "") {
+    if ($null -eq $Object) { return $null }
+    if (-not [string]::IsNullOrWhiteSpace($PropertyName) -and (Test-SensitiveLogPropertyName $PropertyName)) {
+        return "[REDACTED SENSITIVE VALUE]"
+    }
+    if ($Object -is [string]) { return Protect-LoggedString ([string]$Object) $KnownSecrets }
+    if ($Object.GetType().IsPrimitive -or $Object -is [decimal]) { return $Object }
+    if ($Object -is [System.Collections.IDictionary]) {
+        $logged = [ordered]@{}
+        foreach ($key in $Object.Keys) {
+            $logged[[string]$key] = ConvertTo-LoggedObject $Object[$key] $KnownSecrets ([string]$key)
+        }
+        return $logged
+    }
+    if ($Object -is [System.Collections.IEnumerable] -and -not ($Object -is [System.Management.Automation.PSCustomObject])) {
+        $loggedItems = @()
+        foreach ($item in $Object) { $loggedItems += ,(ConvertTo-LoggedObject $item $KnownSecrets "") }
+        return ,$loggedItems
+    }
+    if ($Object -is [System.Management.Automation.PSCustomObject]) {
+        $logged = [ordered]@{}
+        foreach ($property in $Object.PSObject.Properties) {
+            $logged[$property.Name] = ConvertTo-LoggedObject $property.Value $KnownSecrets $property.Name
+        }
+        return $logged
+    }
+    return $Object
+}
+
+function Get-LoggedObject($Object, $providerInfo) {
+    $shouldMask = [bool]$MaskSensitiveLogs -and -not [bool]$LogSensitive
+    if (-not $shouldMask) { return ConvertTo-PlainObject $Object }
+    $knownSecrets = @()
+    if ($providerInfo -and $null -ne $providerInfo.ApiKey) { $knownSecrets += ,[string]$providerInfo.ApiKey }
+    return ConvertTo-LoggedObject $Object $knownSecrets
 }
 
 function Remove-HeaderKey($headers, [string]$name) {
@@ -955,6 +1458,23 @@ function Remove-HeaderKey($headers, [string]$name) {
 function Set-HeaderLikeSdk($headers, [string]$name, $value) {
     Remove-HeaderKey $headers $name
     if ($null -ne $value) { $headers[$name] = [string]$value }
+}
+
+function Assert-CustomHeaderForTransport([string]$Name, $Value) {
+    if ([string]::IsNullOrWhiteSpace($Name) -or $Name -notmatch '^[A-Za-z0-9!#$%&''*+.^_`|~-]+$') {
+        throw "settings.json generationConfig.customHeaders에 유효하지 않은 header 이름이 있습니다: '$Name'"
+    }
+    $text = [string]$Value
+    if ($text.Contains("`r") -or $text.Contains("`n")) {
+        throw "settings.json generationConfig.customHeaders.$Name 값에는 CR/LF를 넣을 수 없습니다."
+    }
+    if ($Name -iin @("Content-Length", "Transfer-Encoding", "Range", "Connection", "Proxy-Connection", "Date", "If-Modified-Since")) {
+        throw "settings.json generationConfig.customHeaders.$Name 은 HTTP body/transport가 관리하므로 직접 지정할 수 없습니다."
+    }
+    $mappedRestricted = @("Accept", "Content-Type", "User-Agent", "Host", "Referer", "Expect")
+    if ([System.Net.WebHeaderCollection]::IsRestricted($Name) -and $Name -inotmatch ('^(' + (($mappedRestricted | ForEach-Object { [regex]::Escape($_) }) -join '|') + ')$')) {
+        throw "settings.json generationConfig.customHeaders.$Name 은 HttpWebRequest 제한 header이며 이 실행기에서 안전하게 매핑할 수 없습니다."
+    }
 }
 
 function Write-StartupBanner() {
@@ -987,6 +1507,12 @@ function Get-PlatformUserAgent() {
     }
     if ([string]::IsNullOrWhiteSpace($version)) { $version = "unknown" }
     return "QwenCode/$version (win32; $arch)"
+}
+
+function Get-QwenCodeVersionSource() {
+    if (-not [string]::IsNullOrWhiteSpace($QwenCodeVersion)) { return "-QwenCodeVersion" }
+    if (-not [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable("QWEN_CODE_VERSION"))) { return "QWEN_CODE_VERSION" }
+    return "unknown-fallback"
 }
 
 function Get-NodeLikeRuntimeVersion() {
@@ -1116,6 +1642,10 @@ function Get-SettingsProvider($settings, [string]$providerName, [string]$modelNa
     $provider = $null
     if (-not [string]::IsNullOrWhiteSpace($target)) {
         $provider = $providers | Where-Object { $_.name -eq $target -or $_.id -eq $target } | Select-Object -First 1
+        if ($null -eq $provider) {
+            $availableProviders = @($providers | ForEach-Object { "name=$([string]$_.name), id=$([string]$_.id)" }) -join "; "
+            throw "선택한 provider/model 이름 '$target'을 modelProviders.$selectedType 에서 찾지 못했습니다. 잘못된 서버로 fallback하지 않습니다. available: $availableProviders"
+        }
     }
     if ($null -eq $provider) { $provider = $providers | Select-Object -First 1 }
 
@@ -1147,7 +1677,22 @@ function Get-SettingsProvider($settings, [string]$providerName, [string]$modelNa
 }
 
 function Get-EndpointCandidates([string]$baseUrl) {
-    $b = $baseUrl.TrimEnd('/')
+    $parsedBase = $null
+    if (-not [System.Uri]::TryCreate(([string]$baseUrl).Trim(), [System.UriKind]::Absolute, [ref]$parsedBase)) {
+        throw "provider.baseUrl은 유효한 절대 URL이어야 합니다."
+    }
+    if ($parsedBase.Scheme -notin @("http", "https")) {
+        throw "provider.baseUrl scheme은 http 또는 https여야 합니다: $($parsedBase.Scheme)"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($parsedBase.Query) -or -not [string]::IsNullOrWhiteSpace($parsedBase.Fragment)) {
+        throw "provider.baseUrl에는 query/fragment를 넣을 수 없습니다. 서버 기본 경로까지만 지정하세요."
+    }
+    if (-not [string]::IsNullOrWhiteSpace($parsedBase.UserInfo)) {
+        throw "provider.baseUrl에는 userinfo 자격증명을 넣을 수 없습니다. envKey/custom Authorization header를 사용하세요."
+    }
+
+    $b = $baseUrl.Trim().TrimEnd('/')
+    if ($b -match '(?i)/chat/completions$') { return @($b) }
     if (-not $EndpointFallbacks) {
         return @("$b/chat/completions")
     }
@@ -1210,10 +1755,16 @@ function Get-EffectiveTimeoutSeconds($providerInfo) {
     if ($null -ne $timeoutMs) {
         try {
             $numericTimeoutMs = [double]$timeoutMs
-            if ($numericTimeoutMs -gt 0) {
-                return [int][Math]::Ceiling($numericTimeoutMs / 1000)
-            }
-        } catch { }
+        } catch {
+            throw "settings.json generationConfig.timeout은 양의 밀리초 숫자여야 합니다: $timeoutMs"
+        }
+        if ([double]::IsNaN($numericTimeoutMs) -or [double]::IsInfinity($numericTimeoutMs) -or $numericTimeoutMs -le 0) {
+            throw "settings.json generationConfig.timeout은 양의 유한 밀리초 숫자여야 합니다: $timeoutMs"
+        }
+        if ($numericTimeoutMs -gt 2147483000) {
+            throw "settings.json generationConfig.timeout이 HttpWebRequest 지원 범위를 초과합니다: $timeoutMs ms"
+        }
+        return [int][Math]::Ceiling($numericTimeoutMs / 1000)
     }
     return $TimeoutSec
 }
@@ -1370,18 +1921,49 @@ function Ensure-RunHistoryMarkdown([string]$Path) {
     Write-Utf8File $Path ($header + "`n")
 }
 
-function Get-NextRunHistorySequence([string]$JsonlPath) {
-    if (!(Test-Path -LiteralPath $JsonlPath -PathType Leaf)) { return 1 }
+function Get-MaxValidJsonlSequence([string]$JsonlPath) {
+    if (!(Test-Path -LiteralPath $JsonlPath -PathType Leaf)) { return [int64]0 }
 
-    $lines = @(Get-Content -LiteralPath $JsonlPath -Encoding UTF8 | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-    for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+    $maxSequence = [int64]0
+    foreach ($line in @(Get-Content -LiteralPath $JsonlPath -Encoding UTF8 | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
         try {
-            $record = $lines[$i] | ConvertFrom-Json
-            $seq = Get-JsonProperty $record "seq"
-            if ($null -ne $seq) { return ([int]$seq + 1) }
-        } catch { }
+            $record = $line | ConvertFrom-Json
+            $seqValue = Get-JsonProperty $record "seq"
+            if ($null -eq $seqValue) { continue }
+            $seq = [int64]$seqValue
+            if ($seq -gt $maxSequence) { $maxSequence = $seq }
+        } catch {
+            # A process may have stopped while appending the final JSONL line.
+            # Invalid/torn lines are audit debris, not a reason to reuse a seq.
+        }
     }
-    return ($lines.Count + 1)
+    return $maxSequence
+}
+
+function Get-PendingTurnSequence([string]$PendingTurnPath) {
+    if (!(Test-Path -LiteralPath $PendingTurnPath -PathType Leaf)) { return [int64]0 }
+    try {
+        $pending = (Read-Utf8File $PendingTurnPath) | ConvertFrom-Json
+        if ([string](Get-JsonProperty $pending "schema") -ne "qwen-loop-pending-turn/v1") { return [int64]0 }
+        $seqValue = Get-JsonProperty $pending "seq"
+        if ($null -eq $seqValue) { return [int64]0 }
+        return [int64]$seqValue
+    } catch {
+        return [int64]0
+    }
+}
+
+function Get-NextRunHistorySequence([string]$JsonlPath) {
+    return ((Get-MaxValidJsonlSequence $JsonlPath) + 1)
+}
+
+function Get-NextDurableSequence([string]$RunHistoryJsonlPath, [string]$TranscriptJsonlPath, [string]$PendingTurnPath) {
+    $maxSequence = [Math]::Max(
+        (Get-MaxValidJsonlSequence $RunHistoryJsonlPath),
+        (Get-MaxValidJsonlSequence $TranscriptJsonlPath)
+    )
+    $maxSequence = [Math]::Max($maxSequence, (Get-PendingTurnSequence $PendingTurnPath))
+    return ([int64]$maxSequence + 1)
 }
 
 function Append-RunHistory($Record, [string]$MarkdownPath, [string]$JsonlPath) {
@@ -1425,7 +2007,7 @@ function Append-RunHistory($Record, [string]$MarkdownPath, [string]$JsonlPath) {
     ) | ForEach-Object { Escape-MarkdownTableCell ([string]$_) }
 
     Append-Utf8File $MarkdownPath (("| " + ($cells -join " | ") + " |") + "`n")
-    Append-Utf8File $JsonlPath (($Record | ConvertTo-Json -Compress -Depth 30) + "`n")
+    Append-JsonlRecord $JsonlPath $Record 30
 }
 
 function Expand-PathInput([string]$PathText) {
@@ -1489,12 +2071,18 @@ function Assert-ProjectScanConfig() {
     if ($ProjectScanMaxFiles -lt 1) { throw "ProjectScanMaxFiles는 1 이상이어야 합니다." }
     if ($ProjectScanMaxFileChars -lt 200) { throw "ProjectScanMaxFileChars는 200 이상이어야 합니다." }
     if ($ProjectScanMaxTotalChars -lt 1000) { throw "ProjectScanMaxTotalChars는 1000 이상이어야 합니다." }
+    if ($ProjectCandidateMaxFiles -lt 100) { throw "ProjectCandidateMaxFiles는 100 이상이어야 합니다." }
+    if ($ProjectCandidateMaxDirectories -lt 100) { throw "ProjectCandidateMaxDirectories는 100 이상이어야 합니다." }
+    if ($ProjectContentScanMaxFiles -lt 100) { throw "ProjectContentScanMaxFiles는 100 이상이어야 합니다." }
+    if ($ProjectMaxSourceFileMB -lt 1) { throw "ProjectMaxSourceFileMB는 1 이상이어야 합니다." }
     if ($DynamicProjectContextMaxFiles -lt 0) { throw "DynamicProjectContextMaxFiles는 0 이상이어야 합니다." }
     if ($DynamicProjectContextMaxFileChars -lt 200) { throw "DynamicProjectContextMaxFileChars는 200 이상이어야 합니다." }
     if ($DynamicProjectContextMaxTotalChars -lt 1000) { throw "DynamicProjectContextMaxTotalChars는 1000 이상이어야 합니다." }
     if ($ProjectTurnsPerCycle -lt 1) { throw "ProjectTurnsPerCycle은 1 이상이어야 합니다." }
     if ($ProjectTargetOutputTokens -lt 1) { throw "ProjectTargetOutputTokens는 1 이상이어야 합니다." }
     if ($ProjectTargetAnswerChars -lt 500) { throw "ProjectTargetAnswerChars는 500 이상이어야 합니다." }
+    if ($ProjectQualityMinEvidenceSignals -lt 0 -or $ProjectQualityMinEvidenceSignals -gt 6) { throw "ProjectQualityMinEvidenceSignals는 0..6 범위여야 합니다." }
+    if ($ProjectMaxContinuationAttempts -lt 0) { throw "ProjectMaxContinuationAttempts는 0 이상이어야 합니다." }
 }
 
 function Resolve-ProjectRoot([string]$PathText) {
@@ -1502,7 +2090,14 @@ function Resolve-ProjectRoot([string]$PathText) {
     if ([string]::IsNullOrWhiteSpace($p)) { return "" }
     if (-not [System.IO.Path]::IsPathRooted($p)) { $p = Join-Path $PSScriptRoot $p }
     if (!(Test-Path -LiteralPath $p -PathType Container)) { throw "ProjectRoot 디렉터리를 찾지 못했습니다: $PathText" }
-    return (Get-NormalizedFullPath $p)
+    $resolved = Get-NormalizedFullPath $p
+    if (Test-PathHasReparsePointInExistingAncestry $resolved) {
+        throw "ProjectRoot 또는 그 상위 경로에 junction/symlink/reparse point가 있어 WorkDir와의 실제 경계를 안전하게 확정할 수 없습니다: $PathText"
+    }
+    # Resolve 8.3 short-name and mapped-drive aliases as well as lexical '..'.
+    # Project identity and WorkDir containment must refer to the same physical
+    # directory even when callers spell that directory differently.
+    return Get-PhysicalNormalizedPath $resolved
 }
 
 function Test-ProjectExcludedDirectoryName([string]$Name) {
@@ -1517,15 +2112,17 @@ function Test-ProjectExcludedDirectoryName([string]$Name) {
 }
 
 function Test-ProjectIncludedFile([System.IO.FileInfo]$File) {
+    if ($null -eq $File -or (($File.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) { return $false }
     $ext = $File.Extension.ToLowerInvariant()
     $allowed = @(
         ".java", ".kt", ".kts", ".xml", ".properties", ".yml", ".yaml",
         ".gradle", ".json", ".ts", ".tsx", ".js", ".jsx",
-        ".vue", ".sql", ".md", ".graphql", ".gql",
+        ".vue", ".html", ".htm", ".jsp", ".jspx", ".ftl", ".mustache",
+        ".sql", ".md", ".graphql", ".gql",
         ".ps1", ".psm1", ".bat", ".cmd", ".sh"
     )
     if ($allowed -notcontains $ext) { return $false }
-    if ($File.Length -gt 1MB) { return $false }
+    if ($File.Length -gt ([int64]$ProjectMaxSourceFileMB * 1MB)) { return $false }
     if ($File.Name -match '(?i)^\.env($|\.)|^\.npmrc$|^\.pypirc$') { return $false }
     if ($File.Name -match '(?i)(secret|credential|private[-_.]?key|service[-_.]?account|keystore|truststore|vault)') { return $false }
     if ($ext -in @(".pem", ".key", ".p12", ".pfx", ".jks", ".keystore")) { return $false }
@@ -1536,15 +2133,137 @@ function Test-ProjectIncludedFile([System.IO.FileInfo]$File) {
 
 function Protect-ProjectSnippetSecrets([string]$Text) {
     if ([string]::IsNullOrEmpty($Text)) { return "" }
+    # A Kubernetes Secret may be pretty-printed YAML/JSON or a single-line
+    # minified JSON object whose data keys are arbitrary.  Once the document
+    # identifies itself as kind=Secret, redact the whole document rather than
+    # trying to guess which payload keys contain credentials.
+    if ($Text -match '(?im)(?:^\s*(?:-\s*)?|[{,]\s*)["'']?kind["'']?\s*:\s*["'']?Secret["'']?(?:\s*[,}#]|\s*$)') {
+        return "[REDACTED KUBERNETES SECRET DOCUMENT]"
+    }
+
+    $sensitiveNameCore = 'password|passwd|pwd|client[-_.]?secret|secret[-_.]?access[-_.]?key|access[-_.]?key(?:[-_.]?id)?|secret|api[-_.]?key|access[-_.]?token|refresh[-_.]?token|token|authorization|credential|connection[-_.]?string|private[-_.]?key'
+    # XML element names and attributes are frequently split across physical
+    # lines.  Normalize every sensitive opening tag to an internal marker
+    # before the line pass.  The marker lets the state machine discard the
+    # complete element body instead of leaking a child <value> node.
+    $sensitiveXmlElementName = '(?:[A-Za-z_][A-Za-z0-9_.-]*:)?(?:' + $sensitiveNameCore + ')'
+    $multilineDirectSensitiveXmlSelfClosingPattern = '(?is)<(?<qwenSensitiveTag>' + $sensitiveXmlElementName + ')\b[^>]{0,8192}/\s*>'
+    $multilineDirectSensitiveXmlOpeningPattern = '(?is)<(?<qwenSensitiveTag>' + $sensitiveXmlElementName + ')\b(?![^>]{0,8192}/\s*>)[^>]{0,8192}>'
+    $multilineSensitiveXmlSelfClosingPattern = '(?is)<(?<qwenSensitiveTag>[A-Za-z_][A-Za-z0-9_.:-]*)\b(?=[^>]{0,8192}\b(?:name|key)\s*=\s*["''][^"'']*(?:' + $sensitiveNameCore + ')[^"'']*["''])[^>]{0,8192}/\s*>'
+    $multilineSensitiveXmlOpeningPattern = '(?is)<(?<qwenSensitiveTag>[A-Za-z_][A-Za-z0-9_.:-]*)\b(?=[^>]{0,8192}\b(?:name|key)\s*=\s*["''][^"'']*(?:' + $sensitiveNameCore + ')[^"'']*["''])[^>]{0,8192}>'
+    $Text = [regex]::Replace($Text, $multilineDirectSensitiveXmlSelfClosingPattern, '[REDACTED SENSITIVE XML TAG]')
+    $Text = [regex]::Replace($Text, $multilineSensitiveXmlSelfClosingPattern, '[REDACTED SENSITIVE XML TAG]')
+    $Text = [regex]::Replace($Text, $multilineDirectSensitiveXmlOpeningPattern, '[QWEN-REDACTED-SENSITIVE-XML-START:${qwenSensitiveTag}]')
+    $Text = [regex]::Replace($Text, $multilineSensitiveXmlOpeningPattern, '[QWEN-REDACTED-SENSITIVE-XML-START:${qwenSensitiveTag}]')
+
     $protected = New-Object System.Collections.Generic.List[string]
+    $insidePrivateKeyBlock = $false
+    $insideSensitiveXmlElement = ""
+    $insideSensitiveXmlDepth = 0
+    $insideSensitiveContinuation = $false
+    $sensitiveBlockIndent = -1
+    $sensitiveBlockMustConsumeValue = $false
+    $sensitiveJsonContainerDepth = 0
+    $sensitiveKeyPattern = '(?i)(' + $sensitiveNameCore + ')\s*["'']?\s*[:=]'
+    $xmlSensitiveElementPattern = '(?i)<\s*((?:[A-Za-z_][A-Za-z0-9_.-]*:)?(?:' + $sensitiveNameCore + '))\b[^>]*>'
+    $xmlSensitiveAttributePattern = '(?i)<[^>]+\b(?:name|key)\s*=\s*["''][^"'']*(?:' + $sensitiveNameCore + ')[^"'']*["''][^>]*>'
+    $literalSecretPattern = '(?i)\b(?:AKIA|ASIA)[A-Z0-9]{16}\b|\bgh[pousr]_[A-Za-z0-9_]{20,}\b|\bsk-[A-Za-z0-9_-]{16,}\b|\bBearer\s+[A-Za-z0-9._~+/=-]{16,}|://[^/\s:@]+:[^@\s/]+@'
     foreach ($line in ($Text -split "`r?`n")) {
-        if ($line -match '(?i)-----BEGIN\s+(?:RSA\s+|EC\s+|OPENSSH\s+)?PRIVATE\s+KEY-----') {
-            $protected.Add("[REDACTED PRIVATE KEY]") | Out-Null
+        if ($line -match '(?i)-----BEGIN\s+(?:RSA\s+|EC\s+|DSA\s+|OPENSSH\s+|PGP\s+|ENCRYPTED\s+)?PRIVATE\s+KEY(?:\s+BLOCK)?-----') {
+            $protected.Add("[REDACTED PRIVATE KEY BLOCK]") | Out-Null
+            $insidePrivateKeyBlock = $true
             continue
         }
-        if ($line -match '(?i)(password|passwd|pwd|secret|api[-_.]?key|access[-_.]?token|refresh[-_.]?token|authorization|private[-_.]?key)\s*["'']?\s*[:=]') {
+        if ($insidePrivateKeyBlock) {
+            if ($line -match '(?i)-----END\s+(?:RSA\s+|EC\s+|DSA\s+|OPENSSH\s+|PGP\s+|ENCRYPTED\s+)?PRIVATE\s+KEY(?:\s+BLOCK)?-----') {
+                $insidePrivateKeyBlock = $false
+            }
+            continue
+        }
+        if ($insideSensitiveContinuation) {
+            # Java .properties continuation lines are allowed to begin in
+            # column zero, so indentation alone is not a safe boundary.
+            $insideSensitiveContinuation = ($line -match '\\\s*$')
+            continue
+        }
+        if (-not [string]::IsNullOrWhiteSpace($insideSensitiveXmlElement)) {
+            $escapedSensitiveXmlElement = [regex]::Escape($insideSensitiveXmlElement)
+            $nestedSensitiveOpenCount = [regex]::Matches($line, ('(?i)\[QWEN-REDACTED-SENSITIVE-XML-START:' + $escapedSensitiveXmlElement + '\]')).Count
+            $sensitiveCloseCount = [regex]::Matches($line, ('(?i)</\s*' + $escapedSensitiveXmlElement + '\s*>')).Count
+            $insideSensitiveXmlDepth += ($nestedSensitiveOpenCount - $sensitiveCloseCount)
+            if ($insideSensitiveXmlDepth -le 0) {
+                $insideSensitiveXmlElement = ""
+                $insideSensitiveXmlDepth = 0
+            }
+            continue
+        }
+        if ($line -match '\[QWEN-REDACTED-SENSITIVE-XML-START:([^\]]+)\]') {
+            $xmlTagName = [string]$Matches[1]
+            $protected.Add("[REDACTED SENSITIVE XML ELEMENT]") | Out-Null
+            $escapedXmlTagName = [regex]::Escape($xmlTagName)
+            $sensitiveOpenCount = [regex]::Matches($line, ('(?i)\[QWEN-REDACTED-SENSITIVE-XML-START:' + $escapedXmlTagName + '\]')).Count
+            $sensitiveCloseCount = [regex]::Matches($line, ('(?i)</\s*' + $escapedXmlTagName + '\s*>')).Count
+            if ($sensitiveOpenCount -gt $sensitiveCloseCount) {
+                $insideSensitiveXmlElement = $xmlTagName
+                $insideSensitiveXmlDepth = $sensitiveOpenCount - $sensitiveCloseCount
+            }
+            continue
+        }
+
+        $indentLength = ([regex]::Match($line, '^\s*')).Value.Length
+        if ($sensitiveBlockIndent -ge 0) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+
+            # Valid JSON permits a property value on the next physical line at
+            # the same indentation as the key.  Consume at least that one
+            # value, and if it begins an object/array, discard the complete
+            # balanced container independent of indentation.
+            $jsonStructureOnly = [regex]::Replace($line, '"(?:\\.|[^"\\])*"', '""')
+            $jsonBalance = [regex]::Matches($jsonStructureOnly, '[\{\[]').Count - [regex]::Matches($jsonStructureOnly, '[\}\]]').Count
+            if ($sensitiveBlockMustConsumeValue) {
+                $sensitiveBlockMustConsumeValue = $false
+                if ($line.TrimStart() -match '^[\{\[]' -and $jsonBalance -gt 0) {
+                    $sensitiveJsonContainerDepth = $jsonBalance
+                } else {
+                    $sensitiveBlockIndent = -1
+                    $sensitiveJsonContainerDepth = 0
+                }
+                continue
+            }
+            if ($sensitiveJsonContainerDepth -gt 0) {
+                $sensitiveJsonContainerDepth += $jsonBalance
+                if ($sensitiveJsonContainerDepth -le 0) {
+                    $sensitiveBlockIndent = -1
+                    $sensitiveJsonContainerDepth = 0
+                }
+                continue
+            }
+            if ($indentLength -gt $sensitiveBlockIndent) { continue }
+            $sensitiveBlockIndent = -1
+        }
+
+        $xmlSensitiveElement = [regex]::Match($line, $xmlSensitiveElementPattern)
+        if ($xmlSensitiveElement.Success -or $line -match $xmlSensitiveAttributePattern -or $line -match $sensitiveKeyPattern -or $line -match $literalSecretPattern) {
             $indent = ([regex]::Match($line, '^\s*')).Value
             $protected.Add("${indent}[REDACTED SENSITIVE CONFIG LINE]") | Out-Null
+            if ($xmlSensitiveElement.Success) {
+                $xmlTagName = [string]$xmlSensitiveElement.Groups[1].Value
+                $hasInlineClose = $line -match ('(?i)</\s*' + [regex]::Escape($xmlTagName) + '\s*>')
+                if (-not $hasInlineClose -and $xmlSensitiveElement.Value -notmatch '/\s*>$') {
+                    $insideSensitiveXmlElement = $xmlTagName
+                }
+            }
+            if ($line -match '[:=]\s*(?:[>|][-+]?|\{|\[)?\s*(?:#.*)?$' -or $line -match '\\\s*$') {
+                $sensitiveBlockIndent = $indentLength
+            }
+            if ($line -match '[:=]\s*(?:#.*)?$') {
+                $sensitiveBlockMustConsumeValue = $true
+            } elseif ($line -match '[:=]\s*[\{\[]\s*(?:#.*)?$') {
+                $jsonStructureOnly = [regex]::Replace($line, '"(?:\\.|[^"\\])*"', '""')
+                $sensitiveJsonContainerDepth = [regex]::Matches($jsonStructureOnly, '[\{\[]').Count - [regex]::Matches($jsonStructureOnly, '[\}\]]').Count
+                if ($sensitiveJsonContainerDepth -lt 0) { $sensitiveJsonContainerDepth = 0 }
+            }
+            if ($line -match '\\\s*$') { $insideSensitiveContinuation = $true }
             continue
         }
         $protected.Add([string]$line) | Out-Null
@@ -1561,29 +2280,93 @@ function Get-ProjectRelativePath([string]$Root, [string]$Path) {
     return $Path
 }
 
+$script:ProjectFileEncodingByPath = @{}
+$script:ProjectFileDecodeFailures = @{}
+
+function Read-ProjectTextWithEncoding([string]$Path, $Encoding, [int]$MaxChars) {
+    $reader = New-Object System.IO.StreamReader($Path, $Encoding, $true, 4096)
+    try {
+        if ($MaxChars -gt 0) {
+            $buffer = New-Object char[] $MaxChars
+            $read = $reader.ReadBlock($buffer, 0, $MaxChars)
+            $text = if ($read -gt 0) { -join $buffer[0..($read - 1)] } else { "" }
+        } else {
+            $text = $reader.ReadToEnd()
+        }
+        return [PSCustomObject]@{ Text = $text; Encoding = $reader.CurrentEncoding.WebName }
+    } finally {
+        $reader.Dispose()
+    }
+}
+
+function Get-ProjectFileDecodedText([string]$Path, [int]$MaxChars = 0) {
+    $declaredEncoding = ""
+    $prefix = New-Object byte[] 512
+    $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    try {
+        $prefixLength = $stream.Read($prefix, 0, $prefix.Length)
+    } finally {
+        $stream.Dispose()
+    }
+    if ($prefixLength -gt 0) {
+        $asciiPrefix = [System.Text.Encoding]::ASCII.GetString($prefix, 0, $prefixLength)
+        if ($asciiPrefix -match '(?i)<\?xml[^>]+encoding\s*=\s*["'']([^"'']+)["'']') {
+            $declaredEncoding = [string]$Matches[1]
+        }
+    }
+
+    $primaryEncoding = $Utf8Strict
+    if (-not [string]::IsNullOrWhiteSpace($declaredEncoding)) {
+        try {
+            $primaryEncoding = [System.Text.Encoding]::GetEncoding(
+                $declaredEncoding,
+                [System.Text.EncoderFallback]::ExceptionFallback,
+                [System.Text.DecoderFallback]::ExceptionFallback
+            )
+        } catch {
+            $primaryEncoding = $Utf8Strict
+        }
+    }
+
+    try {
+        $decoded = Read-ProjectTextWithEncoding $Path $primaryEncoding $MaxChars
+    } catch [System.Text.DecoderFallbackException] {
+        try {
+            $cp949 = [System.Text.Encoding]::GetEncoding(
+                949,
+                [System.Text.EncoderFallback]::ExceptionFallback,
+                [System.Text.DecoderFallback]::ExceptionFallback
+            )
+            $decoded = Read-ProjectTextWithEncoding $Path $cp949 $MaxChars
+            $decoded.Encoding = "cp949"
+        } catch {
+            $normalizedFailurePath = [System.IO.Path]::GetFullPath($Path)
+            $script:ProjectFileDecodeFailures[$normalizedFailurePath] = [string]$_.Exception.Message
+            throw "프로젝트 텍스트를 strict UTF-8/선언 인코딩 또는 CP949로 해석할 수 없어 제외합니다: $Path"
+        }
+    }
+
+    $normalizedPath = [System.IO.Path]::GetFullPath($Path)
+    $script:ProjectFileEncodingByPath[$normalizedPath] = [string]$decoded.Encoding
+    return [PSCustomObject]@{ Text = ([string]$decoded.Text).TrimStart([char]0xFEFF); Encoding = [string]$decoded.Encoding }
+}
+
 function Read-ProjectFilePrefix([string]$Path, [int]$MaxChars) {
     try {
-        $raw = Protect-ProjectSnippetSecrets (Read-Utf8File $Path)
+        $decoded = Get-ProjectFileDecodedText $Path $MaxChars
+        $raw = Protect-ProjectSnippetSecrets ([string]$decoded.Text)
         return Get-TextPrefix $raw $MaxChars
     } catch {
-        try {
-            $raw = Protect-ProjectSnippetSecrets ([System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::Default))
-            return Get-TextPrefix $raw $MaxChars
-        } catch {
-            return ""
-        }
+        return ""
     }
 }
 
 function Read-ProjectFileText([string]$Path) {
     try {
-        return (Protect-ProjectSnippetSecrets (Read-Utf8File $Path))
+        $decoded = Get-ProjectFileDecodedText $Path
+        return (Protect-ProjectSnippetSecrets ([string]$decoded.Text))
     } catch {
-        try {
-            return (Protect-ProjectSnippetSecrets ([System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::Default)))
-        } catch {
-            return ""
-        }
+        return ""
     }
 }
 
@@ -1596,20 +2379,54 @@ function Get-BusinessFamilyKeyFromPath([string]$Path) {
     $base = [System.IO.Path]::GetFileNameWithoutExtension($Path)
     if ([string]::IsNullOrWhiteSpace($base)) { return "" }
 
+    $technicalFamilyPattern = '(?i)^(common|base|abstract|default|global|shared|core|main|application|app|config|configuration|security|util|utils|helper|constant|constants|http\d*|oauth\d*|jwt|auth)$'
+
     if ($base -match '^([A-Za-z]{2,}(?:[_-]?[A-Za-z]+)*[_-]?\d{3,})') {
-        return $Matches[1].ToLowerInvariant()
+        $numericFamily = $Matches[1].ToLowerInvariant()
+        if ($numericFamily -notmatch $technicalFamilyPattern) { return $numericFamily }
+        return ""
     }
 
-    $familySuffixPattern = '(?i)(Mapper|MapperImpl|ServiceImpl|Service|Controller|Repository|Dao|DAO|Tasklet|Job|Step|Decider|Listener|VO|Vo|DTO|Dto|Entity|Model|Request|Response|Query|Command|Store|Provider)$'
-    if ($base -notmatch $familySuffixPattern) { return "" }
-    $stem = $base -replace $familySuffixPattern, ''
+    $familySuffixPattern = '(?i)(MapperImpl|Mapper|ServiceImpl|Service|Controller|RepositoryImpl|Repository|DaoImpl|DAOImpl|Dao|DAO|Tasklet|Job|Step|Decider|Listener|VO|Vo|DTO|Dto|Entity|Model|Request|Response|Query|Command|Store|Provider|Page|View|Api|Client|Hook|Policy|Rule|Rules|Validator|Validation|Handler|Facade)$'
+    $hasRoleSuffix = ($base -match $familySuffixPattern)
+    $stem = if ($hasRoleSuffix) { $base -replace $familySuffixPattern, '' } else { $base }
+    if (-not $hasRoleSuffix -and $stem -match '^use([A-Z].+)$') { $stem = $Matches[1] }
     $stem = $stem.Trim('_-')
-    $variantSuffixPattern = '(?i)(History|Detail|Details|Item|Items|List|Info|Data|Result|Payload|Param|Params|Parameter|Parameters|Form|Summary|Search|Filter|Create|Update|Delete|Save|Job|Batch)$'
-    $normalizedStem = ($stem -replace $variantSuffixPattern, '').Trim('_-')
-    if ($stem -match $variantSuffixPattern -and $normalizedStem.Length -lt 3) { return "" }
-    if ($normalizedStem.Length -ge 3) { $stem = $normalizedStem }
+    $variantSuffixPattern = '(?i)(History|Detail|Details|Item|Items|List|Info|Data|Result|Payload|Param|Params|Parameter|Parameters|Form|Summary|Search|Filter|Create|Update|Delete|Save|Job|Batch|Status|State|Type|Code|Policy|Rule|Rules|Validation|Validator)$'
+    for ($i = 0; $i -lt 2; $i++) {
+        $normalizedStem = ($stem -replace $variantSuffixPattern, '').Trim('_-')
+        if ($normalizedStem -eq $stem -or $normalizedStem.Length -lt 3) { break }
+        $stem = $normalizedStem
+    }
+
+    $pathKey = (($Path -replace '\\', '/') -replace '/+', '/').ToLowerInvariant()
+    if (-not $hasRoleSuffix) {
+        $segments = @($pathKey.Split('/') | Where-Object { $_ -ne '' })
+        $parentFamily = ""
+        if ($segments.Count -ge 2) {
+            for ($i = $segments.Count - 2; $i -ge 0; $i--) {
+                $segment = $segments[$i]
+                if ($segment -match '^(src|main|java|kotlin|resources|webapp|components?|pages?|routes?|hooks?|api|services?|stores?|models?|entities|entity|domain|feature|features|mapper|mappers|repository|repositories|dao|dto|vo)$') { continue }
+                if ($segment.Length -ge 3) { $parentFamily = $segment; break }
+            }
+        }
+        if (-not [string]::IsNullOrWhiteSpace($parentFamily)) {
+            $baseLower = $stem.ToLowerInvariant()
+            $parentLower = $parentFamily.ToLowerInvariant()
+            if ($baseLower -eq $parentLower -or $baseLower -eq ($parentLower + 's') -or $pathKey -match '/(domain|entity|entities|model|models|feature|features)/') {
+                $stem = $parentFamily
+            } elseif ($base -notmatch '^use[A-Z]') {
+                return ""
+            }
+        } elseif ($base -notmatch '^use[A-Z]') {
+            return ""
+        }
+    }
+
+    if ($stem -match '(?i)^(.+)ies$' -and $Matches[1].Length -ge 2) { $stem = $Matches[1] + 'y' }
+    elseif ($stem -notmatch '(?i)(ss|us|is|status|news)$' -and $stem -match '(?i)^(.+[^s])s$' -and $Matches[1].Length -ge 3) { $stem = $Matches[1] }
     if ($stem.Length -lt 3) { return "" }
-    if ($stem -match '(?i)^(common|base|abstract|default|global|shared|core|main|application|app|config|configuration|security|util|utils|helper|constant|constants)$') { return "" }
+    if ($stem -match $technicalFamilyPattern) { return "" }
     return $stem.ToLowerInvariant()
 }
 
@@ -1989,31 +2806,78 @@ function Select-ProjectScanContextFiles($Files, [int]$Count) {
     return @($selected.ToArray())
 }
 
+$script:ProjectCandidateIndexCache = @{}
+$script:ProjectCandidateIndexStats = @{}
+
+function Reset-ProjectCandidateIndex([string]$Root) {
+    if ([string]::IsNullOrWhiteSpace($Root)) { return }
+    $key = (Get-NormalizedFullPath $Root).ToLowerInvariant()
+    if ($script:ProjectCandidateIndexCache.ContainsKey($key)) { $script:ProjectCandidateIndexCache.Remove($key) }
+    if ($script:ProjectCandidateIndexStats.ContainsKey($key)) { $script:ProjectCandidateIndexStats.Remove($key) }
+}
+
+function Get-ProjectCandidateIndexStats([string]$Root) {
+    if ([string]::IsNullOrWhiteSpace($Root)) { return $null }
+    $key = (Get-NormalizedFullPath $Root).ToLowerInvariant()
+    if ($script:ProjectCandidateIndexStats.ContainsKey($key)) { return $script:ProjectCandidateIndexStats[$key] }
+    return $null
+}
+
 function Get-ProjectCandidateFiles([string]$Root) {
+    $normalizedRoot = Get-NormalizedFullPath $Root
+    $cacheKey = $normalizedRoot.ToLowerInvariant()
+    if ($script:ProjectCandidateIndexCache.ContainsKey($cacheKey)) {
+        return @($script:ProjectCandidateIndexCache[$cacheKey])
+    }
+
     $result = New-Object System.Collections.Generic.List[System.IO.FileInfo]
     $queue = New-Object System.Collections.Generic.Queue[System.IO.DirectoryInfo]
-    $queue.Enqueue((Get-Item -LiteralPath $Root))
+    $queue.Enqueue((Get-Item -LiteralPath $normalizedRoot))
     $visitedDirs = 0
 
-    while ($queue.Count -gt 0 -and $visitedDirs -lt 3000 -and $result.Count -lt 2000) {
+    while ($queue.Count -gt 0 -and $visitedDirs -lt $ProjectCandidateMaxDirectories -and $result.Count -lt $ProjectCandidateMaxFiles) {
         $dir = $queue.Dequeue()
         $visitedDirs++
 
         try {
-            foreach ($childDir in @(Get-ChildItem -LiteralPath $dir.FullName -Directory -Force -ErrorAction SilentlyContinue)) {
+            foreach ($childDir in @(Get-ChildItem -LiteralPath $dir.FullName -Directory -Force -ErrorAction SilentlyContinue | Sort-Object FullName)) {
                 if (($childDir.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
                 if (-not (Test-ProjectExcludedDirectoryName $childDir.Name)) { $queue.Enqueue($childDir) }
             }
-            $includedFiles = @(Get-ChildItem -LiteralPath $dir.FullName -File -Force -ErrorAction SilentlyContinue | Where-Object { Test-ProjectIncludedFile $_ })
-            if ($includedFiles.Count -gt 120) { $includedFiles = @($includedFiles | Get-Random -Count 120) }
+            $includedFiles = @(Get-ChildItem -LiteralPath $dir.FullName -File -Force -ErrorAction SilentlyContinue |
+                Where-Object { Test-ProjectIncludedFile $_ } |
+                Sort-Object FullName)
             foreach ($file in $includedFiles) {
-                if ($result.Count -ge 2000) { break }
+                if ($result.Count -ge $ProjectCandidateMaxFiles) { break }
                 $result.Add($file) | Out-Null
             }
         } catch { }
     }
 
-    return @($result)
+    $items = @($result.ToArray())
+    $truncated = ($queue.Count -gt 0 -or $result.Count -ge $ProjectCandidateMaxFiles -or $visitedDirs -ge $ProjectCandidateMaxDirectories)
+    $fingerprintSha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $fingerprintText = ($items | ForEach-Object { (Get-ProjectRelativePath $normalizedRoot $_.FullName) -replace '\\', '/' }) -join "`n"
+        $fingerprintBytes = $fingerprintSha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($fingerprintText))
+        $orderedPathFingerprint = (($fingerprintBytes | ForEach-Object { $_.ToString("x2") }) -join "")
+    } finally {
+        $fingerprintSha.Dispose()
+    }
+    $stats = [PSCustomObject]@{
+        root = $normalizedRoot
+        files = $items.Count
+        visitedDirectories = $visitedDirs
+        pendingDirectories = $queue.Count
+        maxFiles = $ProjectCandidateMaxFiles
+        maxDirectories = $ProjectCandidateMaxDirectories
+        truncated = $truncated
+        orderedPathFingerprint = $orderedPathFingerprint
+        builtAt = (Get-Date).ToString("o")
+    }
+    $script:ProjectCandidateIndexCache[$cacheKey] = $items
+    $script:ProjectCandidateIndexStats[$cacheKey] = $stats
+    return @($items)
 }
 
 function Get-DetectedProjectStack($Files) {
@@ -2048,7 +2912,7 @@ function Test-DynamicProjectNoiseTerm([string]$Value) {
     return ($noise -contains $v.ToUpperInvariant())
 }
 
-function Add-DynamicProjectSearchTerm($Terms, [string]$Value, [string]$Kind, [int]$Weight) {
+function Add-DynamicProjectSearchTerm($Terms, [string]$Value, [string]$Kind, [int]$Weight, [string]$OriginPath = "") {
     if (Test-DynamicProjectNoiseTerm $Value) { return }
 
     $clean = [regex]::Replace([string]$Value, '^[`"''“”‘’\(\)\[\]<>,.;:]+|[`"''“”‘’\(\)\[\]<>,.;:]+$', '')
@@ -2063,6 +2927,7 @@ function Add-DynamicProjectSearchTerm($Terms, [string]$Value, [string]$Kind, [in
             value = $clean
             kind = $Kind
             weight = $Weight
+            originPath = $OriginPath
         }
     }
 }
@@ -2189,6 +3054,21 @@ function Merge-LineRanges($Ranges) {
     return @($merged.ToArray())
 }
 
+function Select-StratifiedLineIndices($Indices, [int]$Quota) {
+    $values = @($Indices | Sort-Object -Unique)
+    if ($Quota -le 0 -or $values.Count -eq 0) { return @() }
+    if ($values.Count -le $Quota) { return $values }
+    if ($Quota -eq 1) { return @($values[[int][Math]::Floor(($values.Count - 1) / 2.0)]) }
+    $selected = New-Object System.Collections.Generic.List[int]
+    $seen = @{}
+    for ($i = 0; $i -lt $Quota; $i++) {
+        $position = [int][Math]::Round(($i * ($values.Count - 1.0)) / ($Quota - 1.0))
+        $value = [int]$values[$position]
+        if (-not $seen.ContainsKey($value)) { $seen[$value] = $true; $selected.Add($value) | Out-Null }
+    }
+    return @($selected.ToArray())
+}
+
 function Get-FocusedProjectSnippet([string]$Path, $Candidate, $Terms, [int]$MaxChars) {
     $raw = Read-ProjectFileText $Path
     if ([string]::IsNullOrWhiteSpace($raw)) {
@@ -2206,12 +3086,31 @@ function Get-FocusedProjectSnippet([string]$Path, $Candidate, $Terms, [int]$MaxC
         return [PSCustomObject]@{ Text = (Get-TextPrefix $raw $MaxChars); Mode = "prefix"; FocusTerms = $focusTerms }
     }
 
-    $businessEvidence = New-Object System.Collections.Generic.List[string]
-    for ($lineIndex = 0; $lineIndex -lt $lines.Count -and $businessEvidence.Count -lt 36; $lineIndex++) {
-        $line = [string]$lines[$lineIndex]
-        if ($line -match '[가-힣]{2,}|(?i)<(?:select|insert|update|delete|resultMap)\b|\b(property|column|parameterType|resultType|jobParameter)\b|\b(?:TB|TBL|VW|V)_[A-Z0-9_]{3,}\b|\b(?:SELECT|INSERT|UPDATE|DELETE|MERGE|FROM|INTO|JOIN)\b|@(?:Schema|Column|ApiModelProperty)|#\{[^}]+\}|^\s*(?:private|protected|public)\s+(?:final\s+)?[A-Za-z0-9_<>,.?\[\]]+\s+[A-Za-z_][A-Za-z0-9_]*\s*(?:[;=])') {
-            $businessEvidence.Add(("{0,5}: {1}" -f ($lineIndex + 1), $line)) | Out-Null
+    $evidenceCategories = [ordered]@{
+        "business-comment" = '[가-힣]{2,}'
+        "mapper-statement" = '(?i)<(?:select|insert|update|delete|resultMap|sql)\b[^>]*(?:\bid\s*=|\btype\s*=)?'
+        "table-sql" = '(?i)\b(?:TB|TBL|VW|V)_[A-Z0-9_]{3,}\b|\b(?:SELECT|INSERT|UPDATE|DELETE|MERGE|FROM|INTO|JOIN)\b'
+        "property-column-field" = '(?i)\b(property|column|parameterType|resultType|resultMap)\b|@(?:Schema|Column|ApiModelProperty)|^\s*(?:private|protected|public)\s+(?:final\s+)?[A-Za-z0-9_<>,.?\[\]]+\s+[A-Za-z_][A-Za-z0-9_]*\s*(?:[;=])'
+        "parameter-status" = '(?i)#\{[^}]+\}|\b(jobParameter|status|state|approval|confirm|resultCode|errorCode)\b|승인|확정|상태|기준일'
+    }
+    $evidenceRecords = New-Object System.Collections.Generic.List[object]
+    $evidenceSeen = @{}
+    foreach ($category in $evidenceCategories.Keys) {
+        $categoryIndices = New-Object System.Collections.Generic.List[int]
+        $pattern = [string]$evidenceCategories[$category]
+        for ($lineIndex = 0; $lineIndex -lt $lines.Count; $lineIndex++) {
+            if ([string]$lines[$lineIndex] -match $pattern) { $categoryIndices.Add($lineIndex) | Out-Null }
         }
+        foreach ($lineIndex in @(Select-StratifiedLineIndices $categoryIndices 7)) {
+            if (-not $evidenceSeen.ContainsKey([int]$lineIndex)) {
+                $evidenceSeen[[int]$lineIndex] = $true
+                $evidenceRecords.Add([PSCustomObject]@{ Index = [int]$lineIndex; Category = [string]$category }) | Out-Null
+            }
+        }
+    }
+    $businessEvidence = New-Object System.Collections.Generic.List[string]
+    foreach ($record in @($evidenceRecords | Sort-Object Index | Select-Object -First 36)) {
+        $businessEvidence.Add(("{0,5} [{1}]: {2}" -f ([int]$record.Index + 1), [string]$record.Category, [string]$lines[[int]$record.Index])) | Out-Null
     }
     $evidenceBlock = ""
     if ($businessEvidence.Count -gt 0) {
@@ -2282,9 +3181,9 @@ function Get-FocusedProjectSnippet([string]$Path, $Candidate, $Terms, [int]$MaxC
     }
 }
 
-function Add-DynamicExpansionTerm($Terms, [string]$Value, [string]$Kind, [int]$Weight) {
+function Add-DynamicExpansionTerm($Terms, [string]$Value, [string]$Kind, [int]$Weight, [string]$OriginPath = "") {
     if ([string]$Value -match '(?i)^(Controller|Service|ServiceImpl|Mapper|Repository|Dao|Request|Response|Provider|Store|Util|Utils|GetResponse|HttpWebRequest|Tasklet|Job|Step|Decider|Listener|DTO|VO|Entity|Model|execute|run|process|handle|start|finish|before|after|main)$') { return }
-    Add-DynamicProjectSearchTerm $Terms $Value $Kind $Weight
+    Add-DynamicProjectSearchTerm $Terms $Value $Kind $Weight $OriginPath
 }
 
 function Get-DynamicProjectExpansionTerms($Selected, [string]$Root, $ExistingTerms) {
@@ -2307,53 +3206,54 @@ function Get-DynamicProjectExpansionTerms($Selected, [string]$Root, $ExistingTer
             $full = $match.Groups[1].Value
             if ($full -match '^(java|javax|jakarta|kotlin|org\.springframework|org\.slf4j|lombok)\.') { continue }
             $simple = ($full -split '\.')[-1]
-            Add-DynamicExpansionTerm $terms $simple "import" 72
-            Add-DynamicExpansionTerm $terms "$simple.java" "import-file" 78
+            Add-DynamicExpansionTerm $terms $simple "import" 72 ([string]$item.path)
+            Add-DynamicExpansionTerm $terms "$simple.java" "import-file" 78 ([string]$item.path)
         }
 
         foreach ($match in [regex]::Matches($raw, '(?m)\b(?:from|require)\s*\(?\s*[''"]([^''"]+)[''"]')) {
             $importPath = $match.Groups[1].Value
             $leaf = (($importPath -replace '\\', '/') -split '/')[-1]
             if (-not [string]::IsNullOrWhiteSpace($leaf) -and -not $leaf.StartsWith(".")) {
-                Add-DynamicExpansionTerm $terms $leaf "import" 65
+                Add-DynamicExpansionTerm $terms $leaf "import-file" 65 ([string]$item.path)
             }
         }
 
         foreach ($match in [regex]::Matches($raw, '(?i)\b(?:id|refid)\s*=\s*["'']([^"'']{2,100})["'']')) {
-            Add-DynamicExpansionTerm $terms $match.Groups[1].Value "xml-id" 82
+            Add-DynamicExpansionTerm $terms $match.Groups[1].Value "xml-id" 82 ([string]$item.path)
         }
 
         foreach ($match in [regex]::Matches($raw, '(?i)\b(?:parameterType|resultType|resultMap|type)\s*=\s*["'']([^"'']{3,140})["'']')) {
             $typeValue = $match.Groups[1].Value
-            Add-DynamicExpansionTerm $terms (($typeValue -split '\.')[-1]) "data-contract-type" 96
+            if ($typeValue -match '^(?i:java|javax|jakarta|kotlin|org\.springframework)\.' -or $typeValue -match '^(?i:string|map|list|integer|long|boolean|int|double|float)$') { continue }
+            Add-DynamicExpansionTerm $terms (($typeValue -split '\.')[-1]) "data-contract-type" 96 ([string]$item.path)
         }
 
         foreach ($match in [regex]::Matches($raw, '(?i)\b(?:property|column)\s*=\s*["'']([^"'']{2,100})["'']')) {
-            Add-DynamicExpansionTerm $terms $match.Groups[1].Value "property-column" 92
+            Add-DynamicExpansionTerm $terms $match.Groups[1].Value "property-column" 92 ([string]$item.path)
         }
 
         foreach ($match in [regex]::Matches($raw, '\b(?:TB|TBL|VW|V)_[A-Z0-9_]{3,}\b')) {
-            Add-DynamicExpansionTerm $terms $match.Value "business-table" 104
+            Add-DynamicExpansionTerm $terms $match.Value "business-table" 104 ([string]$item.path)
         }
 
         foreach ($match in [regex]::Matches($raw, '[$#]\{([^}]{1,80})\}')) {
-            Add-DynamicExpansionTerm $terms $match.Groups[1].Value "business-parameter" 98
+            Add-DynamicExpansionTerm $terms $match.Groups[1].Value "business-parameter" 98 ([string]$item.path)
         }
 
         $family = Get-BusinessFamilyKeyFromPath ([string]$item.path)
-        if (-not [string]::IsNullOrWhiteSpace($family)) { Add-DynamicExpansionTerm $terms $family "business-family" 115 }
+        if (-not [string]::IsNullOrWhiteSpace($family)) { Add-DynamicExpansionTerm $terms $family "business-family" 115 ([string]$item.path) }
 
         foreach ($match in [regex]::Matches($raw, '\b[A-Z][A-Za-z0-9_]{3,90}\b')) {
             $value = $match.Value
             if ($value -match '(Service|ServiceImpl|Mapper|Repository|Dao|DAO|Controller|Util|Utils|Vo|VO|Dto|DTO|Request|Response|Provider|Store)$') {
-                Add-DynamicExpansionTerm $terms $value "symbol-ref" 58
+                Add-DynamicExpansionTerm $terms $value "symbol-ref" 58 ([string]$item.path)
             }
         }
 
         foreach ($match in [regex]::Matches($raw, '\b([a-z][A-Za-z0-9_]{2,80})\s*\(')) {
             $value = $match.Groups[1].Value
             if ($value -match '(?i)^(get|set|is|toString|equals|hashCode|size|add|put|trim|substring|if|for|while|switch|catch|return|throw|this|super|execute|run|process|handle|start|finish|before|after|main)$') { continue }
-            Add-DynamicExpansionTerm $terms $value "call-ref" 38
+            Add-DynamicExpansionTerm $terms $value "call-ref" 38 ([string]$item.path)
         }
     }
 
@@ -2370,7 +3270,7 @@ function Add-DynamicProjectReason($Reasons, [string]$Reason) {
     if (-not [string]::IsNullOrWhiteSpace($Reason) -and -not $Reasons.Contains($Reason)) { $Reasons.Add($Reason) | Out-Null }
 }
 
-function Get-DynamicProjectCandidateScore($File, [string]$Root, $Terms, [string]$QuestionLower) {
+function Get-DynamicProjectCandidateScore($File, [string]$Root, $Terms, [string]$QuestionLower, [bool]$AllowContentScan = $true) {
     $relative = Get-ProjectRelativePath $Root $File.FullName
     $relLower = $relative.ToLowerInvariant()
     $nameLower = $File.Name.ToLowerInvariant()
@@ -2378,6 +3278,10 @@ function Get-DynamicProjectCandidateScore($File, [string]$Root, $Terms, [string]
     $score = 0
     $reasons = New-Object System.Collections.Generic.List[string]
     $matchedTerms = New-Object System.Collections.Generic.List[string]
+    $matchedTermKinds = New-Object System.Collections.Generic.List[string]
+    $matchedReferenceTerms = New-Object System.Collections.Generic.List[string]
+    $linkedFrom = New-Object System.Collections.Generic.List[string]
+    $explicitReferenceMatch = $false
     $content = $null
     $contentLower = $null
 
@@ -2386,19 +3290,22 @@ function Get-DynamicProjectCandidateScore($File, [string]$Root, $Terms, [string]
         $termLower = $termValue.ToLowerInvariant()
         $termBaseLower = [System.IO.Path]::GetFileNameWithoutExtension($termValue).ToLowerInvariant()
         $termWeight = [Math]::Max(1, [int]$term.weight)
+        $termKind = [string]$term.kind
         $matched = $false
+        $matchedByName = $false
 
         if ($nameLower -eq $termLower -or $baseLower -eq $termLower -or $baseLower -eq $termBaseLower) {
             $score += [int]($termWeight * 2.4)
             Add-DynamicProjectReason $reasons "name:$termValue"
             $matched = $true
+            $matchedByName = $true
         } elseif ($relLower.Contains($termLower) -or $relLower.Contains($termBaseLower)) {
             $score += [int]($termWeight * 1.6)
             Add-DynamicProjectReason $reasons "path:$termValue"
             $matched = $true
         }
 
-        if (-not $matched) {
+        if (-not $matched -and $AllowContentScan) {
             if ($null -eq $contentLower) {
                 $content = Read-ProjectFilePrefix $File.FullName ([Math]::Max($DynamicProjectContextMaxFileChars, 6000))
                 $contentLower = ([string]$content).ToLowerInvariant()
@@ -2410,7 +3317,16 @@ function Get-DynamicProjectCandidateScore($File, [string]$Root, $Terms, [string]
             }
         }
 
-        if ($matched -and -not $matchedTerms.Contains($termValue)) { $matchedTerms.Add($termValue) | Out-Null }
+        if ($matched) {
+            if (-not $matchedTerms.Contains($termValue)) { $matchedTerms.Add($termValue) | Out-Null }
+            if (-not [string]::IsNullOrWhiteSpace($termKind) -and -not $matchedTermKinds.Contains($termKind)) { $matchedTermKinds.Add($termKind) | Out-Null }
+            if ($matchedByName -and $termKind -in @("import-file", "data-contract-type")) {
+                $explicitReferenceMatch = $true
+                if (-not $matchedReferenceTerms.Contains($termValue)) { $matchedReferenceTerms.Add($termValue) | Out-Null }
+                $originPath = [string](Get-JsonProperty $term "originPath")
+                if (-not [string]::IsNullOrWhiteSpace($originPath) -and -not $linkedFrom.Contains($originPath)) { $linkedFrom.Add($originPath) | Out-Null }
+            }
+        }
     }
 
     $hasTermMatch = $score -gt 0
@@ -2439,6 +3355,10 @@ function Get-DynamicProjectCandidateScore($File, [string]$Root, $Terms, [string]
         score = $score
         reasons = @($reasons)
         matchedTerms = @($matchedTerms)
+        matchedTermKinds = @($matchedTermKinds)
+        explicitReferenceMatch = $explicitReferenceMatch
+        matchedReferenceTerms = @($matchedReferenceTerms)
+        linkedFrom = @($linkedFrom)
         businessFamilyKey = Get-BusinessFamilyKeyFromPath $relative
         businessRole = if ($nameLower -match '(vo|dto|entity|model|request|response)\.(java|kt|ts|tsx)$') { "domain-model" } elseif ($nameLower -match '(mapper|repository|dao)\.(java|kt|xml)$' -or $File.Extension.ToLowerInvariant() -eq ".sql") { "db-sql" } elseif ($nameLower -match '(tasklet|job|step|decider)\.(java|kt)$') { "batch-process" } elseif ($nameLower -match 'service\.(java|kt)$') { "service-domain" } elseif ($nameLower -match '(controller|resource)\.(java|kt)$') { "api-boundary" } else { "code" }
     }
@@ -2520,12 +3440,16 @@ function Build-DynamicProjectContext([string]$Root, [string]$Question, [string]$
         $scored = New-Object System.Collections.Generic.List[object]
         $matchedTermSet = @{}
         $questionLower = ([string]$Question).ToLowerInvariant()
+        $directContentScans = 0
 
         foreach ($file in $files) {
             try {
-                $candidate = Get-DynamicProjectCandidateScore $file $Root $terms $questionLower
-                $sameBusinessFamily = [string]::IsNullOrWhiteSpace($preferredFamily) -or ([string]$candidate.businessFamilyKey -eq $preferredFamily)
-                if ($candidate.score -gt 0 -and $sameBusinessFamily) {
+                $fileFamily = Get-BusinessFamilyKeyFromPath (Get-ProjectRelativePath $Root $file.FullName)
+                if (-not [string]::IsNullOrWhiteSpace($preferredFamily) -and $fileFamily -ne $preferredFamily) { continue }
+                $allowContentScan = $directContentScans -lt $ProjectContentScanMaxFiles
+                if ($allowContentScan) { $directContentScans++ }
+                $candidate = Get-DynamicProjectCandidateScore $file $Root $terms $questionLower $allowContentScan
+                if ($candidate.score -gt 0) {
                     foreach ($term in $candidate.matchedTerms) { $matchedTermSet[[string]$term] = $true }
                     $scored.Add($candidate) | Out-Null
                 }
@@ -2538,25 +3462,48 @@ function Build-DynamicProjectContext([string]$Root, [string]$Question, [string]$
         foreach ($item in $selected) {
             $selectedPathSet[[string]$item.path] = $true
             $item | Add-Member -NotePropertyName contextSource -NotePropertyValue "direct-question-match" -Force
+            $item | Add-Member -NotePropertyName sliceRelation -NotePropertyValue "active-family" -Force
         }
 
         $expansionTerms = @(Get-DynamicProjectExpansionTerms $selected $Root $terms)
         $expanded = @()
         if ($expansionTerms.Count -gt 0 -and $selected.Count -lt $DynamicProjectContextMaxFiles) {
-            $expandedScored = New-Object System.Collections.Generic.List[object]
+            $sameFamilyExpandedScored = New-Object System.Collections.Generic.List[object]
+            $explicitCrossFamilyScored = New-Object System.Collections.Generic.List[object]
+            $expansionContentScans = 0
             foreach ($file in $files) {
                 try {
-                    $candidate = Get-DynamicProjectCandidateScore $file $Root $expansionTerms $questionLower
+                    $fileFamily = Get-BusinessFamilyKeyFromPath (Get-ProjectRelativePath $Root $file.FullName)
+                    $sameBusinessFamily = [string]::IsNullOrWhiteSpace($preferredFamily) -or ($fileFamily -eq $preferredFamily)
+                    $allowContentScan = $sameBusinessFamily -and $expansionContentScans -lt $ProjectContentScanMaxFiles
+                    if ($allowContentScan) { $expansionContentScans++ }
+                    $candidate = Get-DynamicProjectCandidateScore $file $Root $expansionTerms $questionLower $allowContentScan
                     $sameBusinessFamily = [string]::IsNullOrWhiteSpace($preferredFamily) -or ([string]$candidate.businessFamilyKey -eq $preferredFamily)
-                    if ($candidate.score -gt 0 -and $sameBusinessFamily -and -not $selectedPathSet.ContainsKey([string]$candidate.path)) {
-                        $candidate | Add-Member -NotePropertyName contextSource -NotePropertyValue "linked-reference-expansion" -Force
-                        $expandedScored.Add($candidate) | Out-Null
+                    if ($candidate.score -gt 0 -and -not $selectedPathSet.ContainsKey([string]$candidate.path)) {
+                        if ($sameBusinessFamily) {
+                            $candidate | Add-Member -NotePropertyName contextSource -NotePropertyValue "linked-reference-expansion" -Force
+                            $candidate | Add-Member -NotePropertyName sliceRelation -NotePropertyValue "same-family" -Force
+                            $sameFamilyExpandedScored.Add($candidate) | Out-Null
+                        } elseif ([bool]$candidate.explicitReferenceMatch) {
+                            $candidate | Add-Member -NotePropertyName contextSource -NotePropertyValue "linked-explicit-evidence" -Force
+                            $candidate | Add-Member -NotePropertyName sliceRelation -NotePropertyValue "explicit-reference" -Force
+                            $explicitCrossFamilyScored.Add($candidate) | Out-Null
+                        }
                     }
                 } catch { }
             }
 
             $remainingSlots = $DynamicProjectContextMaxFiles - $selected.Count
-            $expanded = @(Select-DynamicBusinessContextCandidates $expandedScored $remainingSlots)
+            $rankedExplicitCrossFamily = @($explicitCrossFamilyScored | Sort-Object @{ Expression = "score"; Descending = $true }, @{ Expression = "path"; Descending = $false })
+            # Exact import/resultType references are evidence for the active
+            # business slice, not a topic pivot. Reserve their bounded slots
+            # before same-family expansion consumes the entire capacity.
+            $crossSlots = [Math]::Min(3, [Math]::Min($remainingSlots, $rankedExplicitCrossFamily.Count))
+            $sameFamilySlots = [Math]::Max(0, $remainingSlots - $crossSlots)
+            $expanded = @(Select-DynamicBusinessContextCandidates $sameFamilyExpandedScored $sameFamilySlots)
+            if ($crossSlots -gt 0) {
+                $expanded += @($rankedExplicitCrossFamily | Select-Object -First $crossSlots)
+            }
             if ($expanded.Count -gt 0) {
                 $combined = New-Object System.Collections.Generic.List[object]
                 foreach ($item in $selected) { $combined.Add($item) | Out-Null }
@@ -2579,7 +3526,7 @@ function Build-DynamicProjectContext([string]$Root, [string]$Question, [string]$
         $parts = New-Object System.Collections.Generic.List[string]
         $parts.Add("동적 프로젝트 컨텍스트(현재 질문 기준 best-effort 관련 파일 검색 + 연결 파일 확장)") | Out-Null
         if (-not [string]::IsNullOrWhiteSpace($preferredFamily)) {
-            $parts.Add("- 현재 탐색 업무 패밀리 제한: $preferredFamily (다른 업무군/공통 기술 파일은 이번 컨텍스트에서 제외)") | Out-Null
+            $parts.Add("- 현재 탐색 업무 패밀리 제한: $preferredFamily (다른 업무군/공통 기술 파일은 제외하며, active 파일이 import/resultType으로 정확히 참조한 파일만 증거 전용으로 최대 3개 허용)") | Out-Null
         }
         $parts.Add("- 추출 검색어: $termText") | Out-Null
         $parts.Add("- 연결 확장 검색어(import/XML id/클래스 참조 기반): $expansionTermText") | Out-Null
@@ -2596,7 +3543,7 @@ function Build-DynamicProjectContext([string]$Root, [string]$Question, [string]$
                 $parts.Add("  - [$($item.score)] $($item.path) :: $sourceText$reasonText") | Out-Null
             }
             $pivotCandidates = @($selected |
-                Where-Object { [string]$_.contextSource -eq "linked-reference-expansion" } |
+                Where-Object { [string]$_.contextSource -in @("linked-reference-expansion", "linked-explicit-evidence") } |
                 Select-Object -First 5 |
                 ForEach-Object { $_.path })
             if ($pivotCandidates.Count -gt 0) {
@@ -2639,7 +3586,7 @@ $excerpt
         return [PSCustomObject]@{
             text = (($parts -join "`n") + "`n")
             terms = @($terms | ForEach-Object { [ordered]@{ value = $_.value; kind = $_.kind; weight = $_.weight } })
-            expansionTerms = @($expansionTerms | ForEach-Object { [ordered]@{ value = $_.value; kind = $_.kind; weight = $_.weight } })
+            expansionTerms = @($expansionTerms | ForEach-Object { [ordered]@{ value = $_.value; kind = $_.kind; weight = $_.weight; originPath = $_.originPath } })
             files = @($selected | ForEach-Object {
                 [ordered]@{
                     path = $_.path
@@ -2648,6 +3595,9 @@ $excerpt
                     reasons = $_.reasons
                     matchedTerms = $_.matchedTerms
                     businessFamilyKey = $_.businessFamilyKey
+                    sliceRelation = $_.sliceRelation
+                    linkedFrom = $_.linkedFrom
+                    matchedReference = $_.matchedReferenceTerms
                 }
             })
             missingTerms = $missing
@@ -2921,8 +3871,16 @@ function Get-ProjectExplorationAvoidance([string]$HistoryPath, [int]$MaxRecords 
     }
 }
 
-function Add-ProjectExplorationHistory([string]$HistoryPath, $Scan, [string]$SessionId, [string]$Reason) {
+function Add-ProjectExplorationHistory([string]$HistoryPath, $Scan, [string]$SessionId, [string]$Reason, [string]$TransitionId = "") {
     if ([string]::IsNullOrWhiteSpace($HistoryPath) -or $null -eq $Scan) { return }
+    if (-not [string]::IsNullOrWhiteSpace($TransitionId) -and (Test-Path -LiteralPath $HistoryPath -PathType Leaf)) {
+        foreach ($line in @(Get-Content -LiteralPath $HistoryPath -Encoding UTF8 -ErrorAction SilentlyContinue)) {
+            try {
+                $existing = $line | ConvertFrom-Json
+                if ([string](Get-JsonProperty $existing "transitionId") -eq $TransitionId) { return }
+            } catch { }
+        }
+    }
     $record = [ordered]@{
         schema = "qwen-loop-project-exploration/v1"
         selectedAt = (Get-Date).ToString("o")
@@ -2935,8 +3893,22 @@ function Add-ProjectExplorationHistory([string]$HistoryPath, $Scan, [string]$Ses
         primaryGroupLabel = $Scan.primaryQuestionCandidateGroup
         businessFamily = $Scan.primaryBusinessFamily
         candidatePaths = @($Scan.questionCandidateFiles)
+        transitionId = if ([string]::IsNullOrWhiteSpace($TransitionId)) { $null } else { $TransitionId }
     }
-    Append-Utf8File $HistoryPath (($record | ConvertTo-Json -Compress -Depth 20) + "`n")
+    Append-JsonlRecord $HistoryPath $record 20
+}
+
+function Add-ProjectCycleHistory([string]$HistoryPath, $Record) {
+    $transitionId = [string](Get-JsonProperty $Record "transitionId")
+    if (-not [string]::IsNullOrWhiteSpace($transitionId) -and (Test-Path -LiteralPath $HistoryPath -PathType Leaf)) {
+        foreach ($line in @(Get-Content -LiteralPath $HistoryPath -Encoding UTF8 -ErrorAction SilentlyContinue)) {
+            try {
+                $existing = $line | ConvertFrom-Json
+                if ([string](Get-JsonProperty $existing "transitionId") -eq $transitionId) { return }
+            } catch { }
+        }
+    }
+    Append-JsonlRecord $HistoryPath $Record 20
 }
 
 function Get-ProjectExplorationPhase([int]$Turn, [int]$TurnsPerCycle) {
@@ -2973,14 +3945,16 @@ function Get-CycleBusinessEvidenceExcerpt([string]$Answer, [int]$MaxChars = 1500
     return Get-TextPrefix $text $MaxChars
 }
 
-function Add-CycleEvidenceMemory([string]$Path, [int]$Cycle, [int]$Turn, [string]$Status, [string]$Question, [string]$Answer) {
+function Add-CycleEvidenceMemory([string]$Path, [int]$Cycle, [int]$Turn, [string]$Status, [string]$Question, [string]$Answer, [int64]$Sequence = 0) {
     if ([string]::IsNullOrWhiteSpace($Path)) { return }
     $excerpt = Get-CycleBusinessEvidenceExcerpt $Answer 1500
     if ([string]::IsNullOrWhiteSpace($excerpt)) { return }
-    $block = "## cycle $Cycle / turn $Turn / $Status`nQuestion: $(Get-TextPrefix (($Question -replace '\s+', ' ').Trim()) 350)`nEvidence:`n$excerpt`n"
+    $sequenceMarker = if ($Sequence -gt 0) { "<!-- turn-seq:$Sequence -->" } else { "" }
+    $block = "## cycle $Cycle / turn $Turn / $Status`n$sequenceMarker`nQuestion: $(Get-TextPrefix (($Question -replace '\s+', ' ').Trim()) 350)`nEvidence:`n$excerpt`n"
     $blocks = New-Object System.Collections.Generic.List[string]
     if (Test-Path -LiteralPath $Path -PathType Leaf) {
         $existing = Read-Utf8File $Path
+        if ($Sequence -gt 0 -and $existing.Contains("<!-- turn-seq:$Sequence -->")) { return }
         foreach ($existingBlock in @([regex]::Split($existing, '(?m)(?=^## cycle )') | Where-Object { $_ -match '^## cycle ' })) {
             $blocks.Add($existingBlock.Trim()) | Out-Null
         }
@@ -3120,16 +4094,42 @@ function New-ProjectScanContext([string]$Root, $Avoidance = $null, [int]$Explora
 
     Assert-ProjectScanConfig
     $resolvedRoot = Resolve-ProjectRoot $Root
+    # Build one deterministic candidate index per exploration cycle. Dynamic
+    # lookups reuse this exact index so a file selected for the question cannot
+    # disappear because of a second random directory sample.
+    Reset-ProjectCandidateIndex $resolvedRoot
+    $script:ProjectFileEncodingByPath = @{}
+    $script:ProjectFileDecodeFailures = @{}
     $files = @(Get-ProjectCandidateFiles $resolvedRoot)
+    $candidateIndexStats = Get-ProjectCandidateIndexStats $resolvedRoot
     $scored = New-Object System.Collections.Generic.List[object]
+    $contentScanPaths = @{}
+    if ($files.Count -le $ProjectContentScanMaxFiles) {
+        foreach ($file in $files) { $contentScanPaths[$file.FullName] = $true }
+    } elseif ($ProjectContentScanMaxFiles -gt 1) {
+        # Evenly sample the deterministic ordered index instead of taking only
+        # alphabetically early folders.  Every file still receives metadata and
+        # family scoring; selected evidence files are read fully later.
+        for ($sampleIndex = 0; $sampleIndex -lt $ProjectContentScanMaxFiles; $sampleIndex++) {
+            $fileIndex = [int][Math]::Round(($sampleIndex * ($files.Count - 1.0)) / ($ProjectContentScanMaxFiles - 1.0))
+            $contentScanPaths[$files[$fileIndex].FullName] = $true
+        }
+    }
 
     foreach ($file in $files) {
-        $content = Read-ProjectFilePrefix $file.FullName ([Math]::Max($ProjectScanMaxFileChars, 4000))
+        $content = if ($contentScanPaths.ContainsKey($file.FullName)) { Read-ProjectFilePrefix $file.FullName ([Math]::Max($ProjectScanMaxFileChars, 4000)) } else { "" }
         $scoreItem = Get-ProjectFileScore $file $resolvedRoot $content
         if ($scoreItem.score -gt 0) {
             Set-ProjectQuestionGroup $scoreItem | Out-Null
             $scored.Add($scoreItem) | Out-Null
         }
+    }
+    if ($candidateIndexStats) {
+        $candidateIndexStats | Add-Member -NotePropertyName contentScannedFiles -NotePropertyValue $contentScanPaths.Count -Force
+        $candidateIndexStats | Add-Member -NotePropertyName decodeFailureCount -NotePropertyValue $script:ProjectFileDecodeFailures.Count -Force
+    }
+    if ($candidateIndexStats -and [bool]$candidateIndexStats.truncated) {
+        Write-Host "ProjectScan warning: candidate index limit reached; files=$($candidateIndexStats.files), directories=$($candidateIndexStats.visitedDirectories), fingerprint=$($candidateIndexStats.orderedPathFingerprint)" -ForegroundColor Yellow
     }
 
     $ranked = @($scored | Sort-Object @{ Expression = "score"; Descending = $true }, @{ Expression = "sizeBytes"; Descending = $true }, @{ Expression = "path"; Descending = $false })
@@ -3153,16 +4153,32 @@ function New-ProjectScanContext([string]$Root, $Avoidance = $null, [int]$Explora
     $primaryQuestionCandidate = if ($questionCandidates.Count -gt 0) { $questionCandidates[0] } else { $null }
     $primaryBusinessFamily = if ($primaryQuestionCandidate) { ([string]$primaryQuestionCandidate.businessFamilyKey).Trim().ToLowerInvariant() } else { "" }
     $primaryQuestionGroupKey = if ($primaryQuestionCandidate) { [string]$primaryQuestionCandidate.questionGroupKey } else { "" }
+    $promptSliceItems = @()
+    if (-not [string]::IsNullOrWhiteSpace($primaryBusinessFamily)) {
+        $promptSliceItems = @($ranked | Where-Object { ([string]$_.businessFamilyKey).Trim().ToLowerInvariant() -eq $primaryBusinessFamily })
+    } elseif (-not [string]::IsNullOrWhiteSpace($primaryQuestionGroupKey)) {
+        $promptSliceItems = @($ranked | Where-Object { [string]$_.questionGroupKey -eq $primaryQuestionGroupKey })
+    } else {
+        $promptSliceItems = @($questionCandidates)
+    }
+    if ($promptSliceItems.Count -eq 0 -and $primaryQuestionCandidate) { $promptSliceItems = @($primaryQuestionCandidate) }
+    $promptGroupSummaries = @($questionGroupSummaries | Where-Object {
+        if (-not [string]::IsNullOrWhiteSpace($primaryBusinessFamily)) {
+            ([string]$_.businessFamily).Trim().ToLowerInvariant() -eq $primaryBusinessFamily
+        } elseif (-not [string]::IsNullOrWhiteSpace($primaryQuestionGroupKey)) {
+            [string]$_.key -eq $primaryQuestionGroupKey
+        } else { $false }
+    })
 
     $contextParts = New-Object System.Collections.Generic.List[string]
     $contextParts.Add("Project root: $resolvedRoot") | Out-Null
     $contextParts.Add("Detected stack: $($stack -join ', ')") | Out-Null
-    $contextParts.Add("Scanned text files: $($files.Count); selected key files: $($selected.Count)") | Out-Null
+    $contextParts.Add("Scanned text files: $($files.Count); selected key files: $($selected.Count); candidate index truncated: $(if ($candidateIndexStats) { $candidateIndexStats.truncated } else { $false })") | Out-Null
     $contextParts.Add("Exploration cycle: $ExplorationCycle; recent project-specific selections excluded first: $(if ($Avoidance) { $Avoidance.recordCount } else { 0 })") | Out-Null
     $contextParts.Add("") | Out-Null
-    $contextParts.Add("Diversity groups discovered from project structure:") | Out-Null
-    if ($questionGroupSummaries.Count -gt 0) {
-        foreach ($group in @($questionGroupSummaries | Select-Object -First 15)) {
+    $contextParts.Add("Active business slice group (other discovered groups stay only in project_scan_summary.* diagnostics):") | Out-Null
+    if ($promptGroupSummaries.Count -gt 0) {
+        foreach ($group in @($promptGroupSummaries | Select-Object -First 5)) {
             $contextParts.Add("- [$($group.maxScore), $($group.fileCount) files] $($group.label) :: representative $($group.representativeFile)") | Out-Null
         }
     } else {
@@ -3189,9 +4205,9 @@ function New-ProjectScanContext([string]$Root, $Avoidance = $null, [int]$Explora
         $contextParts.Add("- no question candidates selected") | Out-Null
     }
     $contextParts.Add("") | Out-Null
-    $contextParts.Add("Top key files:") | Out-Null
+    $contextParts.Add("Active-slice key files:") | Out-Null
 
-    foreach ($item in @($selected | Select-Object -First 25)) {
+    foreach ($item in @($promptSliceItems | Select-Object -First 25)) {
         $reasonText = if ($item.reasons.Count -gt 0) { $item.reasons -join ", " } else { "signal score" }
         $groupText = if (-not [string]::IsNullOrWhiteSpace([string]$item.questionGroupLabel)) { "group=$($item.questionGroupLabel); " } else { "" }
         $contextParts.Add("- [$($item.score)] $($item.path) :: $groupText$reasonText") | Out-Null
@@ -3227,12 +4243,13 @@ function New-ProjectScanContext([string]$Root, $Avoidance = $null, [int]$Explora
     }
     $usedChars = ($contextParts -join "`n").Length
     foreach ($item in $excerptItems) {
-        $excerpt = Get-TextPrefix ([string]$item.excerpt) $ProjectScanMaxFileChars
+        $initialSnippet = Get-FocusedProjectSnippet $item.fullName $item @() $ProjectScanMaxFileChars
+        $excerpt = Get-TextPrefix ([string]$initialSnippet.Text) $ProjectScanMaxFileChars
         if ([string]::IsNullOrWhiteSpace($excerpt)) { continue }
         $block = @"
 
 ### $($item.path)
-score=$($item.score); reasons=$($item.reasons -join ", ")
+        score=$($item.score); excerptMode=$($initialSnippet.Mode); reasons=$($item.reasons -join ", ")
 ~~~text
 $excerpt
 ~~~
@@ -3257,10 +4274,13 @@ $excerpt
     }
 
     return [PSCustomObject]@{
+        schema = "qwen-loop-project-scan/v2"
+        sanitizerVersion = 3
         root = $resolvedRoot
         generatedAt = (Get-Date).ToString("o")
         explorationCycle = $ExplorationCycle
         scannedFileCount = $files.Count
+        candidateIndex = ConvertTo-PlainObject $candidateIndexStats
         selectedFileCount = $selected.Count
         detectedStack = $stack
         primaryQuestionCandidateFile = if ($primaryQuestionCandidate) { $primaryQuestionCandidate.path } else { "" }
@@ -3340,6 +4360,10 @@ function Write-ProjectScanFiles($Scan, [string]$WorkDirPath) {
 - Exploration cycle: $($Scan.explorationCycle)
 - Detected stack: $($Scan.detectedStack -join ", ")
 - Scanned files: $($Scan.scannedFileCount)
+- Content-scanned files: $(if ($Scan.candidateIndex) { $Scan.candidateIndex.contentScannedFiles } else { "n/a" })
+- Candidate index truncated: $(if ($Scan.candidateIndex) { $Scan.candidateIndex.truncated } else { "n/a" })
+- Ordered path fingerprint: $(if ($Scan.candidateIndex) { $Scan.candidateIndex.orderedPathFingerprint } else { "n/a" })
+- Decode failures skipped: $(if ($Scan.candidateIndex) { $Scan.candidateIndex.decodeFailureCount } else { "n/a" })
 - Selected key files: $($Scan.selectedFileCount)
 - Primary question target: $($Scan.primaryQuestionCandidateFile)
 - Primary question group: $($Scan.primaryQuestionCandidateGroup)
@@ -3381,6 +4405,55 @@ $(Get-TextPrefix $Scan.promptContext 12000)
     }
 }
 
+function Read-ProjectScanCycleSnapshot([string]$WorkDirPath, [string]$ProjectRootPath, [int]$Cycle, [string]$ExpectedFamily = "", [string]$ExpectedPrimaryPath = "") {
+    if ($Cycle -lt 1) { return $null }
+    $snapshotPath = Join-Path $WorkDirPath ("project_scan_cycle_{0:D3}.json" -f $Cycle)
+    if (!(Test-Path -LiteralPath $snapshotPath -PathType Leaf)) { return $null }
+    try {
+        $scan = (Read-Utf8File $snapshotPath) | ConvertFrom-Json
+        # Older snapshots may predate reparse-point exclusion and the current
+        # whole-document/multiline secret sanitizer.  Never replay their raw
+        # promptContext after an upgrade; a fresh deterministic scan is safer.
+        if ([string](Get-JsonProperty $scan "schema") -ne "qwen-loop-project-scan/v2" -or
+            [int](Get-JsonProperty $scan "sanitizerVersion") -ne 3) { return $null }
+        $resolvedRoot = Resolve-ProjectRoot $ProjectRootPath
+        $snapshotRoot = Resolve-ProjectRoot ([string](Get-JsonProperty $scan "root"))
+        if (-not $resolvedRoot.Equals($snapshotRoot, [System.StringComparison]::OrdinalIgnoreCase)) { return $null }
+        if ([int](Get-JsonProperty $scan "explorationCycle") -ne $Cycle) { return $null }
+        if ([string]::IsNullOrWhiteSpace([string](Get-JsonProperty $scan "promptContext")) -or [string]::IsNullOrWhiteSpace([string](Get-JsonProperty $scan "seedQuestion"))) { return $null }
+        $scan.promptContext = Protect-ProjectSnippetSecrets ([string]$scan.promptContext)
+        $scan.seedQuestion = Protect-ProjectSnippetSecrets ([string]$scan.seedQuestion)
+
+        $snapshotFamily = [string](Get-JsonProperty $scan "primaryBusinessFamily")
+        $snapshotPrimary = [string](Get-JsonProperty $scan "primaryQuestionCandidateFile")
+        if (-not [string]::IsNullOrWhiteSpace($ExpectedFamily) -and -not $snapshotFamily.Equals($ExpectedFamily, [System.StringComparison]::OrdinalIgnoreCase)) { return $null }
+        if (-not [string]::IsNullOrWhiteSpace($ExpectedPrimaryPath) -and -not $snapshotPrimary.Equals($ExpectedPrimaryPath, [System.StringComparison]::OrdinalIgnoreCase)) { return $null }
+        if (-not [string]::IsNullOrWhiteSpace($snapshotPrimary)) {
+            $primaryFullPath = [System.IO.Path]::GetFullPath((Join-Path $resolvedRoot ($snapshotPrimary -replace '/', '\')))
+            if (-not (Test-PathInsideRoot $resolvedRoot $primaryFullPath) -or -not (Test-Path -LiteralPath $primaryFullPath -PathType Leaf)) { return $null }
+        }
+        return $scan
+    } catch {
+        return $null
+    }
+}
+
+function Read-PendingCycleTransition([string]$Path) {
+    if (!(Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    try {
+        $pending = (Read-Utf8File $Path) | ConvertFrom-Json
+    } catch {
+        throw "pending_cycle_transition.json JSON 파싱 실패. cycle을 임의로 건너뛰지 않도록 시작을 중단합니다: $($_.Exception.Message)"
+    }
+    if ([string](Get-JsonProperty $pending "schema") -ne "qwen-loop-cycle-transition/v1" -or
+        [string]::IsNullOrWhiteSpace([string](Get-JsonProperty $pending "transitionId")) -or
+        [int](Get-JsonProperty $pending "previousCycle") -lt 1 -or
+        [int](Get-JsonProperty $pending "nextCycle") -le [int](Get-JsonProperty $pending "previousCycle")) {
+        throw "pending_cycle_transition.json 필드가 올바르지 않습니다. cycle 상태 충돌을 피하기 위해 시작을 중단합니다."
+    }
+    return $pending
+}
+
 function Get-NextQuestionExtraction([string]$content, [int]$MaxQuestionChars = 1500) {
     $lines = @($content -split "`r?`n" | ForEach-Object { Remove-BomAndTrim $_ } | Where-Object { $_ -ne "" })
     for ($i = $lines.Count - 1; $i -ge 0; $i--) {
@@ -3406,11 +4479,155 @@ function Extract-NextQuestion([string]$content) {
     return [string](Get-NextQuestionExtraction $content).question
 }
 
-function New-PartialResponseContinuationQuestion([string]$OriginalQuestion, [string]$FinishReason, [bool]$MarkerFound) {
+function Get-ProjectAnswerEvidenceSignals([string]$Answer) {
+    $signals = New-Object System.Collections.Generic.List[string]
+    $body = [regex]::Replace([string]$Answer, '(?im)^\s*NEXT_QUESTION\s*[:：].*$', '')
+    if ($body -match '업무\s*(목적|의미|결과)|이\s*(프로그램|기능|배치).{0,40}(업무|처리)|(?i)business\s+(purpose|outcome)') {
+        $signals.Add("business-purpose") | Out-Null
+    }
+    if (($body -match '사용자|담당자|운영자|고객|actor|주체|배치|Job') -and ($body -match '실행|기동|호출|trigger|기준일|요청|입력') -and ($body -match '결과|산출|저장|반영|result|outcome')) {
+        $signals.Add("actor-trigger-result") | Out-Null
+    }
+    if ($body -match '(?i)\b(?:TB|TBL|VW|V)_[A-Z0-9_]{3,}\b|<\s*(?:select|insert|update|delete|resultMap)\b|\b(statement|table|column|property|resultMap|parameterType|resultType|Mapper|VO|DTO|field)\b|#\{[^}]+\}|테이블|컬럼|필드') {
+        $signals.Add("data-contract") | Out-Null
+    }
+    if (($body -match '정상\s*(업무\s*)?(흐름|프로세스|시나리오)|데이터\s*(흐름|lineage)|(?i)normal\s+(flow|process)|lineage') -or ([regex]::Matches($body, '(?m)^\s*(?:\d+|[①-⑳])[.)]\s+').Count -ge 4)) {
+        $signals.Add("normal-flow") | Out-Null
+    }
+    if (($body -match '상태|state|status|승인|확정|완료') -and ($body -match '후속|downstream|전달|소비|저장|갱신|변경')) {
+        $signals.Add("state-downstream") | Out-Null
+    }
+    if (($body -match '사실|확인된\s*(내용|근거)|fact') -and ($body -match '추론|가설|inference') -and ($body -match '미확인|확인\s*필요|unknown|gap') -and ($body -match '(?i)[A-Za-z0-9_./\\-]+\.(java|kt|xml|sql|ts|tsx|js|jsx)|\b(identifier|statement\s*id|method|class)\b')) {
+        $signals.Add("fact-inference-evidence") | Out-Null
+    }
+    return @($signals.ToArray())
+}
+
+function Get-ProjectAnswerQuality([string]$Answer, $AnswerDepth, $PriorState = $null) {
+    $priorChars = 0
+    $priorTokens = [int64]0
+    $tokenKnown = $false
+    $allSignals = @{}
+    if ($PriorState) {
+        try { $priorChars = [int](Get-JsonProperty $PriorState "cumulativeAnswerChars") } catch { $priorChars = 0 }
+        try { $priorTokens = [int64](Get-JsonProperty $PriorState "cumulativeVisibleTokens") } catch { $priorTokens = 0 }
+        $tokenKnown = ConvertTo-BooleanValue (Get-JsonProperty $PriorState "visibleTokensKnown") $false
+        foreach ($signal in @(Get-JsonProperty $PriorState "evidenceSignals")) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$signal)) { $allSignals[[string]$signal] = $true }
+        }
+    }
+
+    $currentTokens = $null
+    if ($AnswerDepth) { $currentTokens = Get-JsonProperty $AnswerDepth "visibleOutputTokens" }
+    if ($null -ne $currentTokens) {
+        $priorTokens += [int64]$currentTokens
+        $tokenKnown = $true
+    }
+    $currentSignals = @(Get-ProjectAnswerEvidenceSignals $Answer)
+    foreach ($signal in $currentSignals) { $allSignals[[string]$signal] = $true }
+
+    $cumulativeChars = $priorChars + ([string]$Answer).Length
+    $signals = @($allSignals.Keys | Sort-Object)
+    $requiredSignalNames = @("business-purpose", "actor-trigger-result", "data-contract", "normal-flow", "state-downstream", "fact-inference-evidence")
+    $missingSignals = @($requiredSignalNames | Where-Object { -not $allSignals.ContainsKey($_) })
+    $tokenTargetMet = $tokenKnown -and ($priorTokens -ge $ProjectTargetOutputTokens)
+    $charTargetMet = $cumulativeChars -ge $ProjectTargetAnswerChars
+    $targetMet = $tokenTargetMet -or $charTargetMet
+    $evidenceMet = $signals.Count -ge $ProjectQualityMinEvidenceSignals
+    $integrationMinSignals = [Math]::Min(2, $ProjectQualityMinEvidenceSignals)
+    $integrationMinChars = [Math]::Min(1500, [Math]::Max(500, [int]($ProjectTargetAnswerChars / 5)))
+    $integrationMet = ($null -eq $PriorState) -or (([string]$Answer).Length -ge $integrationMinChars -and $currentSignals.Count -ge $integrationMinSignals)
+    $adequate = [bool]$NoProjectQualityGate -or ($targetMet -and $evidenceMet -and $integrationMet)
+
+    return [PSCustomObject]@{
+        currentAnswerChars = ([string]$Answer).Length
+        cumulativeAnswerChars = $cumulativeChars
+        cumulativeVisibleTokens = $priorTokens
+        visibleTokensKnown = $tokenKnown
+        targetOutputTokens = $ProjectTargetOutputTokens
+        targetAnswerChars = $ProjectTargetAnswerChars
+        tokenTargetMet = $tokenTargetMet
+        charTargetMet = $charTargetMet
+        targetMet = $targetMet
+        evidenceSignals = $signals
+        evidenceSignalCount = $signals.Count
+        requiredEvidenceSignals = $ProjectQualityMinEvidenceSignals
+        missingSignals = $missingSignals
+        evidenceMet = $evidenceMet
+        currentEvidenceSignals = $currentSignals
+        continuationIntegrationMet = $integrationMet
+        continuationIntegrationMinChars = if ($PriorState) { $integrationMinChars } else { 0 }
+        continuationIntegrationMinSignals = if ($PriorState) { $integrationMinSignals } else { 0 }
+        adequate = $adequate
+        gateDisabled = [bool]$NoProjectQualityGate
+    }
+}
+
+function Get-CumulativePartialEvidence($PriorState, [string]$Answer, [int]$MaxChars = 6500) {
+    $items = New-Object System.Collections.Generic.List[string]
+    $seen = @{}
+    if ($PriorState) {
+        $priorItems = @(Get-JsonProperty $PriorState "evidenceExcerpts")
+        if ($priorItems.Count -eq 0) {
+            $legacyExcerpt = [string](Get-JsonProperty $PriorState "evidenceExcerpt")
+            if (-not [string]::IsNullOrWhiteSpace($legacyExcerpt)) { $priorItems = @($legacyExcerpt) }
+        }
+        foreach ($item in $priorItems) {
+            $text = ([string]$item).Trim()
+            if ([string]::IsNullOrWhiteSpace($text)) { continue }
+            $key = ($text -replace '\s+', ' ').ToLowerInvariant()
+            if (-not $seen.ContainsKey($key)) { $items.Add((Get-TextPrefix $text 2200)) | Out-Null; $seen[$key] = $true }
+        }
+    }
+    $current = (Get-TextPrefix (Get-CycleBusinessEvidenceExcerpt $Answer 2200) 2200).Trim()
+    if (-not [string]::IsNullOrWhiteSpace($current)) {
+        $key = ($current -replace '\s+', ' ').ToLowerInvariant()
+        if (-not $seen.ContainsKey($key)) { $items.Add($current) | Out-Null }
+    }
+    while ($items.Count -gt 1 -and (($items.ToArray() -join "`n`n--- previous partial ---`n").Length -gt $MaxChars)) {
+        $items.RemoveAt(0)
+    }
+    return @($items.ToArray())
+}
+
+function Read-ProjectPartialState([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path) -or !(Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    try {
+        $state = (Read-Utf8File $Path) | ConvertFrom-Json
+        if ([string](Get-JsonProperty $state "schema") -ne "qwen-loop-project-partial-state/v1") { throw "unsupported schema" }
+        if ([string]::IsNullOrWhiteSpace([string](Get-JsonProperty $state "originalQuestion"))) { throw "originalQuestion is empty" }
+        $forceRescan = ConvertTo-BooleanValue (Get-JsonProperty $state "forceRescan") $false
+        if (-not $forceRescan -and [string]::IsNullOrWhiteSpace([string](Get-JsonProperty $state "queuedQuestion"))) { throw "queuedQuestion is empty" }
+        $attempts = [int](Get-JsonProperty $state "continuationAttempts")
+        $savedMaxAttempts = [int](Get-JsonProperty $state "maxContinuationAttempts")
+        if ($attempts -lt 0 -or $savedMaxAttempts -lt 0 -or $attempts -gt $savedMaxAttempts) { throw "continuation attempt counters are invalid" }
+        return $state
+    } catch {
+        Write-Host "PartialState : 손상되었거나 호환되지 않아 무시합니다: $Path ($($_.Exception.Message))" -ForegroundColor Yellow
+        return $null
+    }
+}
+
+function Write-ProjectPartialState([string]$Path, $State) {
+    Write-Utf8File $Path ($State | ConvertTo-Json -Depth 30)
+}
+
+function Clear-ProjectPartialState([string]$Path) {
+    if (-not [string]::IsNullOrWhiteSpace($Path) -and (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        [System.IO.File]::Delete([System.IO.Path]::GetFullPath($Path))
+    }
+}
+
+function New-PartialResponseContinuationQuestion([string]$OriginalQuestion, [string]$FinishReason, [bool]$MarkerFound, [string]$QualityReason = "", [string[]]$MissingSignals = @(), [int]$Attempt = 1, [int]$MaxAttempts = 2) {
     $question = (($OriginalQuestion -replace '\s+', ' ').Trim())
     if ($question.Length -gt 900) { $question = $question.Substring(0, 900).TrimEnd() + "..." }
-    $reason = if ($FinishReason -in @("length", "content_filter")) { "finish_reason=$FinishReason 로 응답이 완결되지 않았습니다" } elseif (-not $MarkerFound) { "응답에 명시적인 NEXT_QUESTION 마지막 줄이 없었습니다" } else { "응답을 완결 상태로 확인하지 못했습니다" }
-    return "직전 업무 질문 '$question'의 분석을 이어서 완성해줘. $reason. 이미 확정한 내용은 짧게만 연결하고, 누락된 업무 목적·용어·정상 흐름·Mapper table/column·VO field·상태 변화·downstream 근거를 우선 보충한 뒤, 마지막 비어 있지 않은 한 줄에 NEXT_QUESTION: 형식의 후속 업무 질문을 반드시 작성해줘."
+    $reasons = New-Object System.Collections.Generic.List[string]
+    if ($FinishReason -in @("length", "content_filter")) { $reasons.Add("finish_reason=$FinishReason 로 응답이 완결되지 않았습니다") | Out-Null }
+    elseif (-not $MarkerFound) { $reasons.Add("응답의 마지막 비어 있지 않은 줄에 NEXT_QUESTION이 없습니다") | Out-Null }
+    if (-not [string]::IsNullOrWhiteSpace($QualityReason)) { $reasons.Add($QualityReason) | Out-Null }
+    if ($MissingSignals.Count -gt 0) { $reasons.Add("부족한 업무 근거: $($MissingSignals -join ', ')") | Out-Null }
+    if ($reasons.Count -eq 0) { $reasons.Add("응답을 완결 상태로 확인하지 못했습니다") | Out-Null }
+    return "원래 업무 질문 '$question'의 분석을 이어서 완성해줘. 보강 $Attempt/$MaxAttempts 회차이며, $($reasons -join '; '). 이미 확정한 내용은 짧게만 연결하고 누락된 업무 목적·actor/trigger/result·용어·정상 흐름·Mapper table/column·VO field·상태 변화·downstream·사실/추론/미확인 근거를 우선 보충한 뒤, 마지막 비어 있지 않은 한 줄에 NEXT_QUESTION: 형식의 후속 업무 질문을 반드시 작성해줘."
 }
 
 function Get-AnswerPreview([string]$content, [int]$maxLines, [int]$maxChars) {
@@ -3524,6 +4741,178 @@ function Test-SameQuestionText([string]$Left, [string]$Right) {
     return $l.Equals($r, [System.StringComparison]::Ordinal)
 }
 
+function Get-TranscriptRecoveryFacts([string]$Path, $TargetSequence = $null) {
+    $maxSequence = [int64]0
+    $maxRecord = $null
+    $targetRecord = $null
+    if (!(Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return [PSCustomObject]@{ maxSequence = $maxSequence; maxRecord = $null; targetRecord = $null }
+    }
+
+    foreach ($line in @(Get-Content -LiteralPath $Path -Encoding UTF8 | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
+        try {
+            $record = $line | ConvertFrom-Json
+            $seqValue = Get-JsonProperty $record "seq"
+            if ($null -eq $seqValue) { continue }
+            $seq = [int64]$seqValue
+            if ($seq -ge $maxSequence) {
+                $maxSequence = $seq
+                $maxRecord = $record
+            }
+            if ($null -ne $TargetSequence -and $seq -eq [int64]$TargetSequence) {
+                $targetRecord = $record
+            }
+        } catch {
+            # Ignore a torn final JSONL append and continue with the last valid
+            # audit record.  The pending turn remains available for retry.
+        }
+    }
+    return [PSCustomObject]@{ maxSequence = $maxSequence; maxRecord = $maxRecord; targetRecord = $targetRecord }
+}
+
+function Remove-PendingTurnFiles([string]$PendingTurnPath, [string]$PendingQuestionPath) {
+    foreach ($path in @($PendingTurnPath, $PendingQuestionPath)) {
+        if (-not [string]::IsNullOrWhiteSpace($path) -and (Test-Path -LiteralPath $path -PathType Leaf)) {
+            [System.IO.File]::Delete([System.IO.Path]::GetFullPath($path))
+        }
+    }
+}
+
+function Restore-CommittedTurnState($Record, [string]$NextQuestionPath, [string]$PartialStatePath, [string]$LastTurnPath, [string]$ExplorationStatePath, [string]$CycleEvidencePath) {
+    if ($null -eq $Record) { throw "Pending turn recovery conflict: transcript record is missing." }
+    $status = ([string](Get-JsonProperty $Record "completionStatus")).ToLowerInvariant()
+    if ($status -notin @("ok", "partial", "abandoned")) {
+        throw "Pending turn recovery conflict: transcript completionStatus is not committable: $status"
+    }
+    $nextQuestion = [string](Get-JsonProperty $Record "nextQuestion")
+    if ([string]::IsNullOrWhiteSpace($nextQuestion)) {
+        throw "Pending turn recovery conflict: transcript record has no nextQuestion."
+    }
+
+    $stateAfter = Get-JsonProperty $Record "stateAfter"
+    if ($null -eq $stateAfter -or [string](Get-JsonProperty $stateAfter "schema") -ne "qwen-loop-turn-state/v1") {
+        throw "Pending turn recovery conflict: transcript record has no valid stateAfter journal."
+    }
+    $journalNextQuestion = [string](Get-JsonProperty $stateAfter "nextQuestion")
+    if (-not (Test-SameQuestionText $nextQuestion $journalNextQuestion)) {
+        throw "Pending turn recovery conflict: record nextQuestion differs from stateAfter.nextQuestion."
+    }
+
+    $partialMode = [string](Get-JsonProperty $stateAfter "partialStateMode")
+    if ($partialMode -eq "write") {
+        $savedPartialState = Get-JsonProperty $stateAfter "partialState"
+        if ($null -eq $savedPartialState) { throw "Pending turn recovery conflict: partialStateMode=write without partialState." }
+        Write-Utf8File $PartialStatePath ($savedPartialState | ConvertTo-Json -Depth 30)
+    } elseif ($partialMode -eq "clear") {
+        Clear-ProjectPartialState $PartialStatePath
+    } else {
+        throw "Pending turn recovery conflict: invalid partialStateMode '$partialMode'."
+    }
+
+    $savedLastTurn = Get-JsonProperty $stateAfter "lastTurnText"
+    if ($null -eq $savedLastTurn) { throw "Pending turn recovery conflict: stateAfter.lastTurnText is missing." }
+    Write-Utf8File $LastTurnPath ([string]$savedLastTurn)
+
+    $explorationMode = [string](Get-JsonProperty $stateAfter "explorationStateMode")
+    if ($explorationMode -eq "write") {
+        $savedExplorationState = Get-JsonProperty $stateAfter "explorationState"
+        if ($null -eq $savedExplorationState) { throw "Pending turn recovery conflict: explorationStateMode=write without explorationState." }
+        Write-Utf8File $ExplorationStatePath ($savedExplorationState | ConvertTo-Json -Depth 30)
+    } elseif ($explorationMode -ne "unchanged") {
+        throw "Pending turn recovery conflict: invalid explorationStateMode '$explorationMode'."
+    }
+
+    if ($status -eq "ok" -and (ConvertTo-BooleanValue (Get-JsonProperty $stateAfter "writeCycleEvidence") $false)) {
+        $cycleValue = Get-JsonProperty $Record "cycleIndex"
+        $turnValue = Get-JsonProperty $Record "turnInCycle"
+        $seqValue = Get-JsonProperty $Record "seq"
+        if ($null -ne $cycleValue -and $null -ne $turnValue -and $null -ne $seqValue) {
+            Add-CycleEvidenceMemory $CycleEvidencePath ([int]$cycleValue) ([int]$turnValue) $status ([string](Get-JsonProperty $Record "question")) ([string](Get-JsonProperty $Record "answer")) ([int64]$seqValue)
+        }
+    }
+
+    # This pointer is deliberately last.  All prerequisite state has been
+    # restored before the next question becomes visible to a new run.
+    Write-Utf8File $NextQuestionPath $nextQuestion
+    return $nextQuestion
+}
+
+function Repair-PendingTurnCommit(
+    [string]$PendingTurnPath,
+    [string]$PendingQuestionPath,
+    [string]$TranscriptJsonlPath,
+    [string]$NextQuestionPath,
+    [string]$PartialStatePath,
+    [string]$LastTurnPath,
+    [string]$ExplorationStatePath,
+    [string]$CycleEvidencePath
+) {
+    $hasStructuredPending = Test-Path -LiteralPath $PendingTurnPath -PathType Leaf
+    $legacyQuestion = ""
+    if (Test-Path -LiteralPath $PendingQuestionPath -PathType Leaf) {
+        $legacyQuestion = (Read-Utf8File $PendingQuestionPath).Trim()
+    }
+    if (-not $hasStructuredPending -and [string]::IsNullOrWhiteSpace($legacyQuestion)) {
+        return [PSCustomObject]@{ status = "none"; recoveredSequence = $null; nextQuestion = "" }
+    }
+
+    if ($hasStructuredPending) {
+        try {
+            $pending = (Read-Utf8File $PendingTurnPath) | ConvertFrom-Json
+        } catch {
+            throw "pending_turn.json JSON 파싱 실패. 상태 충돌을 피하기 위해 자동 진행하지 않습니다: $($_.Exception.Message)"
+        }
+        if ([string](Get-JsonProperty $pending "schema") -ne "qwen-loop-pending-turn/v1") {
+            throw "pending_turn.json schema가 올바르지 않습니다. 상태 충돌을 피하기 위해 자동 진행하지 않습니다."
+        }
+        $pendingSeqValue = Get-JsonProperty $pending "seq"
+        $pendingQuestion = [string](Get-JsonProperty $pending "question")
+        if ($null -eq $pendingSeqValue -or [string]::IsNullOrWhiteSpace($pendingQuestion)) {
+            throw "pending_turn.json에 seq 또는 question이 없습니다. 상태 충돌을 피하기 위해 자동 진행하지 않습니다."
+        }
+        $pendingSequence = [int64]$pendingSeqValue
+        $facts = Get-TranscriptRecoveryFacts $TranscriptJsonlPath $pendingSequence
+
+        if ($facts.maxSequence -gt $pendingSequence) {
+            # A later durable audit record proves this marker is stale.  Never
+            # rewind next_question to an older turn.
+            Remove-PendingTurnFiles $PendingTurnPath $PendingQuestionPath
+            return [PSCustomObject]@{ status = "stale-cleared"; recoveredSequence = $pendingSequence; nextQuestion = "" }
+        }
+
+        if ($facts.targetRecord) {
+            $recordQuestion = [string](Get-JsonProperty $facts.targetRecord "question")
+            if (-not (Test-SameQuestionText $pendingQuestion $recordQuestion)) {
+                throw "Pending turn recovery conflict: seq $pendingSequence question differs between pending_turn.json and transcript.jsonl."
+            }
+            $recoveredNext = Restore-CommittedTurnState $facts.targetRecord $NextQuestionPath $PartialStatePath $LastTurnPath $ExplorationStatePath $CycleEvidencePath
+            Remove-PendingTurnFiles $PendingTurnPath $PendingQuestionPath
+            return [PSCustomObject]@{ status = "rolled-forward"; recoveredSequence = $pendingSequence; nextQuestion = $recoveredNext }
+        }
+
+        return [PSCustomObject]@{ status = "request-uncommitted"; recoveredSequence = $pendingSequence; nextQuestion = "" }
+    }
+
+    # Backward compatibility for a pre-v1 plain pending_question.txt.  A legacy
+    # marker has no seq/state journal, so never guess a commit or rewind state.
+    # Keep it for the existing interrupted-question retry/rescan policy.
+    $legacyFacts = Get-TranscriptRecoveryFacts $TranscriptJsonlPath
+    if ($legacyFacts.maxRecord) {
+        $latestQuestion = [string](Get-JsonProperty $legacyFacts.maxRecord "question")
+        if (Test-SameQuestionText $legacyQuestion $latestQuestion) {
+            $legacyState = Get-JsonProperty $legacyFacts.maxRecord "stateAfter"
+            if ($legacyState -and [string](Get-JsonProperty $legacyState "schema") -eq "qwen-loop-turn-state/v1") {
+                $recoveredNext = Restore-CommittedTurnState $legacyFacts.maxRecord $NextQuestionPath $PartialStatePath $LastTurnPath $ExplorationStatePath $CycleEvidencePath
+                Remove-PendingTurnFiles $PendingTurnPath $PendingQuestionPath
+                return [PSCustomObject]@{ status = "legacy-rolled-forward"; recoveredSequence = $legacyFacts.maxSequence; nextQuestion = $recoveredNext }
+            }
+            return [PSCustomObject]@{ status = "legacy-audit-without-state"; recoveredSequence = $legacyFacts.maxSequence; nextQuestion = "" }
+        }
+        return [PSCustomObject]@{ status = "legacy-uncommitted"; recoveredSequence = $legacyFacts.maxSequence; nextQuestion = "" }
+    }
+    return [PSCustomObject]@{ status = "legacy-uncommitted"; recoveredSequence = $null; nextQuestion = "" }
+}
+
 function New-InterruptedProjectSeedQuestion($ProjectScan, [string]$PreviousQuestion) {
     $selectedFile = $null
     if ($ProjectScan -and $ProjectScan.selectedFiles) {
@@ -3536,6 +4925,25 @@ function New-InterruptedProjectSeedQuestion($ProjectScan, [string]$PreviousQuest
     }
 
     return "이전 실행에서 프로젝트 스캔 기반 초기 질문이 이미 전송됐지만 완료 기록이 없습니다. 같은 질문을 반복하지 말고, 이번 스캔 결과의 핵심 후보 중 하나를 새롭게 골라 실제 업무 도메인 또는 사용자 시나리오 하나를 좁혀서 정상 흐름, 데이터/상태 이동, 다음 확인 파일, 마지막 리스크 점검 포인트를 구체적으로 분석해줘."
+}
+
+function Select-InterruptedGeneralQuestion([string]$PreviousQuestion, [string]$SeedFilePath, [string]$QuestionBankFilePath, [string]$TrackFilter) {
+    $alternatives = @(Read-QuestionSeeds $SeedFilePath $QuestionBankFilePath $TrackFilter | Where-Object {
+        -not (Test-SameQuestionText ([string]$_.Text) $PreviousQuestion)
+    })
+    if ($alternatives.Count -gt 0) {
+        $selected = $alternatives | Get-Random
+        return [PSCustomObject]@{
+            Question = [string]$selected.Text
+            Source = "interrupted-request-alternate-seed:$($selected.Track)"
+            SeedSource = [string]$selected.Source
+        }
+    }
+    return [PSCustomObject]@{
+        Question = "이전 실행에서 완료 여부를 확정할 수 없는 질문은 중복 전송하지 않는다. 직전 주제의 핵심 명사와 파일을 반복하지 말고, 현재 작업 범위에서 아직 다루지 않은 별도의 업무 목적·사용자 시나리오·데이터 흐름 하나를 새 질문으로 선택해 분석해줘."
+        Source = "interrupted-request-generic-escape"
+        SeedSource = $QuestionBankFilePath
+    }
 }
 
 function Initialize-NextQuestion([string]$nextPath, [string]$jsonlPath, [string]$transcriptPath, [string]$lastTurnPath, [string]$seedFile, [string]$questionBankFile, [string]$trackFilter) {
@@ -3569,7 +4977,7 @@ function Initialize-NextQuestion([string]$nextPath, [string]$jsonlPath, [string]
     return $bootstrap
 }
 
-function Get-RecentQuestionHistory([string]$jsonlPath, [int]$maxItems) {
+function Get-RecentQuestionHistory([string]$jsonlPath, [int]$maxItems, $CycleFilter = $null) {
     if (!(Test-Path -LiteralPath $jsonlPath -PathType Leaf)) { return "" }
 
     $seen = @{}
@@ -3579,6 +4987,10 @@ function Get-RecentQuestionHistory([string]$jsonlPath, [int]$maxItems) {
     for ($i = $lines.Count - 1; $i -ge 0 -and $items.Count -lt $maxItems; $i--) {
         try {
             $record = $lines[$i] | ConvertFrom-Json
+            if ($null -ne $CycleFilter) {
+                $recordCycle = Get-JsonProperty $record "cycleIndex"
+                if ($null -eq $recordCycle -or [int]$recordCycle -ne [int]$CycleFilter) { continue }
+            }
             foreach ($name in @("nextQuestion", "question")) {
                 $candidate = [string](Get-JsonProperty $record $name)
                 if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
@@ -3588,61 +5000,6 @@ function Get-RecentQuestionHistory([string]$jsonlPath, [int]$maxItems) {
                     $items.Add($candidate.Trim())
                     if ($items.Count -ge $maxItems) { break }
                 }
-            }
-        } catch { }
-    }
-
-    if ($items.Count -eq 0) { return "" }
-    return (($items | ForEach-Object { "- $_" }) -join "`n")
-}
-
-function Get-LoopDataHistoryRoot([string]$workDirPath) {
-    $scriptLoopData = Join-Path $PSScriptRoot "qwen-loop-data"
-    if (Test-Path -LiteralPath $scriptLoopData -PathType Container) {
-        return (Resolve-Path -LiteralPath $scriptLoopData | Select-Object -First 1).Path
-    }
-    if (Test-Path -LiteralPath $workDirPath -PathType Container) {
-        return (Resolve-Path -LiteralPath $workDirPath | Select-Object -First 1).Path
-    }
-    return ""
-}
-
-function Get-RecentQuestionHistoryFromTree([string]$rootDir, [string]$excludeJsonlPath, [int]$maxItems) {
-    if ([string]::IsNullOrWhiteSpace($rootDir) -or !(Test-Path -LiteralPath $rootDir -PathType Container)) { return "" }
-
-    $excludeFull = ""
-    try {
-        if (Test-Path -LiteralPath $excludeJsonlPath -PathType Leaf) {
-            $excludeFull = (Resolve-Path -LiteralPath $excludeJsonlPath | Select-Object -First 1).Path
-        }
-    } catch { }
-
-    $seen = @{}
-    $items = New-Object System.Collections.Generic.List[string]
-    $files = @(Get-ChildItem -LiteralPath $rootDir -Recurse -File -Filter "transcript.jsonl" -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending |
-        Select-Object -First 40)
-
-    foreach ($file in $files) {
-        if ($items.Count -ge $maxItems) { break }
-        if (-not [string]::IsNullOrWhiteSpace($excludeFull) -and $file.FullName.Equals($excludeFull, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
-
-        try {
-            $lines = @(Get-Content -LiteralPath $file.FullName -Encoding UTF8 | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-            for ($i = $lines.Count - 1; $i -ge 0 -and $items.Count -lt $maxItems; $i--) {
-                try {
-                    $record = $lines[$i] | ConvertFrom-Json
-                    foreach ($name in @("nextQuestion", "question")) {
-                        $candidate = [string](Get-JsonProperty $record $name)
-                        if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
-                        $key = $candidate.Trim().ToLowerInvariant()
-                        if (-not $seen.ContainsKey($key)) {
-                            $seen[$key] = $true
-                            $items.Add($candidate.Trim())
-                            if ($items.Count -ge $maxItems) { break }
-                        }
-                    }
-                } catch { }
             }
         } catch { }
     }
@@ -3735,6 +5092,7 @@ function Build-ClientHeaders($providerInfo, $settings, $networkIdentity, [int]$R
     Set-HeaderLikeSdk $headers "X-Stainless-Arch" (Get-StainlessArchName)
     Set-HeaderLikeSdk $headers "X-Stainless-Runtime" "node"
     Set-HeaderLikeSdk $headers "X-Stainless-Runtime-Version" (Get-NodeLikeRuntimeVersion)
+    Set-HeaderLikeSdk $headers "Content-Type" "application/json"
 
     if ($null -ne $providerInfo.ApiKey) {
         Set-HeaderLikeSdk $headers "Authorization" "Bearer $($providerInfo.ApiKey)"
@@ -3746,11 +5104,11 @@ function Build-ClientHeaders($providerInfo, $settings, $networkIdentity, [int]$R
     $customHeaders = Get-JsonProperty $generationConfig "customHeaders"
     if ($customHeaders) {
         foreach ($p in (Get-ObjectProperties $customHeaders)) {
+            Assert-CustomHeaderForTransport ([string]$p.Name) $p.Value
+            if ($null -eq $p.Value) { continue }
             Set-HeaderLikeSdk $headers ([string]$p.Name) $p.Value
         }
     }
-
-    Set-HeaderLikeSdk $headers "Content-Type" "application/json"
 
     # Qwen Code CLI does not send these project diagnostics. They are opt-in only.
     if ($LoopDiagnosticHeaders) {
@@ -3774,12 +5132,16 @@ function Build-ClientHeaders($providerInfo, $settings, $networkIdentity, [int]$R
     return $headers
 }
 
-function Get-LoggedHeaders($headers) {
+function Get-LoggedHeaders($headers, $providerInfo = $null) {
     $debugHeaders = [ordered]@{}
     $shouldMask = [bool]$MaskSensitiveLogs -and -not [bool]$LogSensitive
+    $knownSecrets = @()
+    if ($providerInfo -and $null -ne $providerInfo.ApiKey) { $knownSecrets += ,[string]$providerInfo.ApiKey }
     foreach ($k in $headers.Keys) {
-        if ($shouldMask -and (Is-SensitiveHeaderName $k)) {
+        if ($shouldMask -and ((Is-SensitiveHeaderName $k) -or (Test-SensitiveLogPropertyName $k))) {
             $debugHeaders[$k] = Mask-HeaderValue $k ([string]$headers[$k])
+        } elseif ($shouldMask) {
+            $debugHeaders[$k] = Protect-LoggedString ([string]$headers[$k]) $knownSecrets
         } else {
             $debugHeaders[$k] = $headers[$k]
         }
@@ -3809,11 +5171,26 @@ function Build-SettingsAwareSystemPrompt($settings, $providerInfo) {
     $permissions = Get-JsonProperty $settings "permissions"
     $allow = Get-JsonProperty $permissions "allow"
     $allowText = ""
-    if ($allow) { $allowText = (($allow | ForEach-Object { "- $(Convert-SettingHintForPrompt ([string]$_))" }) -join "`n") }
+    if ($allow) {
+        $allowText = (($allow | ForEach-Object {
+            $portableHint = Convert-SettingHintForPrompt ([string]$_)
+            "- $(Protect-ProjectSnippetSecrets $portableHint)"
+        }) -join "`n")
+    }
 
     $generationConfig = Get-JsonProperty $providerInfo.ProviderRaw "generationConfig"
-    $generationConfigJson = "{}"
-    if ($generationConfig) { $generationConfigJson = ($generationConfig | ConvertTo-Json -Depth 30) }
+    # Transport settings are applied to headers/body by their dedicated path.
+    # The model only needs a non-secret shape summary; serializing raw custom
+    # header values here would duplicate Authorization/API tokens into the
+    # prompt and last_request_body.json.
+    $generationConfigPromptSummary = [ordered]@{
+        timeoutMs = Get-JsonProperty $generationConfig "timeout"
+        customHeaderKeys = @((Get-ObjectProperties (Get-JsonProperty $generationConfig "customHeaders")) | ForEach-Object { $_.Name })
+        samplingParamKeys = @((Get-ObjectProperties (Get-JsonProperty $generationConfig "samplingParams")) | ForEach-Object { $_.Name })
+        extraBodyKeys = @((Get-ObjectProperties (Get-JsonProperty $generationConfig "extra_body")) | ForEach-Object { $_.Name })
+        compatBody = [bool]$CompatBody
+    }
+    $generationConfigJson = $generationConfigPromptSummary | ConvertTo-Json -Depth 10
 
 @"
 너는 코드 증거를 이용해 사용자의 업무와 도메인 프로세스를 복원하는 시니어 업무 분석가다. Java/Spring, MyBatis/JPA, React/TypeScript, 배치와 DB 지식은 업무 의미를 확인하는 도구이지 답변의 주제가 아니다.
@@ -3826,7 +5203,7 @@ function Build-SettingsAwareSystemPrompt($settings, $providerInfo) {
 - model id: $($providerInfo.ModelId)
 - baseUrl: $($providerInfo.BaseUrl)
 - outputLanguage: $outputLanguage
-- provider.generationConfig:
+- provider.generationConfig 적용 요약(민감한 header/body 값은 프롬프트에 복제하지 않음):
 $generationConfigJson
 
 Qwen settings permissions.allow 참고값(프롬프트용 경로 표기는 동적 환경 기준으로 정규화):
@@ -3864,27 +5241,51 @@ function Build-RequestBody($settings, $providerInfo, [string]$systemPrompt, [str
 
     $generationConfig = Get-GenerationConfig $providerInfo
     $samplingParams = Get-JsonProperty $generationConfig "samplingParams"
+    $samplingParamNames = @((Get-ObjectProperties $samplingParams) | ForEach-Object { ([string]$_.Name).ToLowerInvariant() })
+    if (-not $CompatBody -and ($samplingParamNames -contains "max_tokens") -and ($samplingParamNames -contains "max_completion_tokens")) {
+        throw "settings.json generationConfig.samplingParams에는 max_tokens와 max_completion_tokens 중 하나만 지정해야 합니다."
+    }
 
-    if ($samplingParams -and -not $CompatBody) {
-        # Qwen Code treats samplingParams as the source of truth for the OpenAI wire shape.
-        foreach ($p in (Get-ObjectProperties $samplingParams)) {
-            if ($null -ne $p.Value) { $bodyObj[[string]$p.Name] = ConvertTo-PlainObject $p.Value }
-        }
-    } elseif ($UseSchedulerSamplingDefaults) {
+    # Establish scheduler/model defaults first, then let settings-first
+    # samplingParams and extra_body override them in the same order as the
+    # Qwen Code provider path.  A samplingParams object containing only
+    # temperature must not accidentally remove the generous model token cap.
+    if ($UseSchedulerSamplingDefaults) {
         $bodyObj["temperature"] = $Temperature
         $bodyObj["max_tokens"] = $MaxTokens
     } else {
         $bodyObj["max_tokens"] = Get-QwenCodeOutputTokenLimit $providerInfo.ModelId
     }
 
+    if ($samplingParams -and -not $CompatBody) {
+        # Qwen Code treats samplingParams as the source of truth for the OpenAI wire shape.
+        foreach ($p in (Get-ObjectProperties $samplingParams)) {
+            if ($null -eq $p.Value) { continue }
+            if ([string]$p.Name -ieq "max_tokens") { $bodyObj.Remove("max_completion_tokens") }
+            elseif ([string]$p.Name -ieq "max_completion_tokens") { $bodyObj.Remove("max_tokens") }
+            $bodyObj[[string]$p.Name] = ConvertTo-PlainObject $p.Value
+        }
+    }
+
     if (-not $CompatBody) {
         $extraBody = Get-JsonProperty $generationConfig "extra_body"
         if ($extraBody) {
+            $extraBodyNames = @((Get-ObjectProperties $extraBody) | ForEach-Object { ([string]$_.Name).ToLowerInvariant() })
+            if (($extraBodyNames -contains "max_tokens") -and ($extraBodyNames -contains "max_completion_tokens")) {
+                throw "settings.json generationConfig.extra_body에는 max_tokens와 max_completion_tokens 중 하나만 지정해야 합니다."
+            }
             # Qwen Code merges extra_body last, so provider-specific fields can override defaults.
             foreach ($p in (Get-ObjectProperties $extraBody)) {
-                if ($null -ne $p.Value) { $bodyObj[[string]$p.Name] = ConvertTo-PlainObject $p.Value }
+                if ($null -eq $p.Value) { continue }
+                if ([string]$p.Name -ieq "max_tokens") { $bodyObj.Remove("max_completion_tokens") }
+                elseif ([string]$p.Name -ieq "max_completion_tokens") { $bodyObj.Remove("max_tokens") }
+                $bodyObj[[string]$p.Name] = ConvertTo-PlainObject $p.Value
             }
         }
+    }
+
+    if (($null -ne (Get-JsonProperty $bodyObj "max_tokens")) -and ($null -ne (Get-JsonProperty $bodyObj "max_completion_tokens"))) {
+        throw "최종 request body에 max_tokens와 max_completion_tokens가 동시에 남았습니다. settings generationConfig를 확인하세요."
     }
 
     # samplingParams/extra_body are settings-first overrides.  Normalize the
@@ -3909,6 +5310,7 @@ function Get-HttpStatusFromErrorMessage([string]$message) {
 }
 
 function Test-RetryableError([string]$message) {
+    if ($message -match '^(OpenAI (SSE|JSON) protocol error|settings\.json |provider\.baseUrl|최종 request body)') { return $false }
     $statusCode = Get-HttpStatusFromErrorMessage $message
     if ($null -eq $statusCode) {
         # Transport errors, connection resets, DNS failures, and request timeouts do not
@@ -4011,20 +5413,34 @@ function Get-OpenAIUsageFromRaw([string]$raw, [bool]$isStreaming) {
 function Get-OpenAIResponseMetadata([string]$raw, [bool]$isStreaming) {
     $finishReason = ""
     $usageRaw = $null
+    $streamDoneObserved = $false
+    $primaryTerminalSeen = $false
     if ($isStreaming) {
         foreach ($line in ($raw -split "`r?`n")) {
             $trimmed = $line.Trim()
             if (-not $trimmed.StartsWith("data:")) { continue }
             $data = $trimmed.Substring(5).Trim()
-            if ([string]::IsNullOrWhiteSpace($data) -or $data -eq "[DONE]") { continue }
+            if ([string]::IsNullOrWhiteSpace($data)) { continue }
+            if ($data -eq "[DONE]") {
+                $streamDoneObserved = $true
+                continue
+            }
             try {
                 $payload = $data | ConvertFrom-Json
                 $usage = Get-JsonProperty $payload "usage"
                 if ($usage) { $usageRaw = $usage }
+                $choiceOrdinal = 0
                 foreach ($choice in @(Get-JsonProperty $payload "choices")) {
                     if ($null -eq $choice) { continue }
+                    $choiceIndex = Get-JsonProperty $choice "index"
+                    $isPrimaryChoice = if ($null -ne $choiceIndex) { ([int]$choiceIndex -eq 0) } else { ($choiceOrdinal -eq 0) }
+                    $choiceOrdinal++
+                    if (-not $isPrimaryChoice) { continue }
                     $finish = Get-JsonProperty $choice "finish_reason"
-                    if (-not [string]::IsNullOrWhiteSpace([string]$finish)) { $finishReason = [string]$finish }
+                    if (-not [string]::IsNullOrWhiteSpace([string]$finish)) {
+                        $finishReason = [string]$finish
+                        $primaryTerminalSeen = $true
+                    }
                 }
             } catch { }
         }
@@ -4033,7 +5449,7 @@ function Get-OpenAIResponseMetadata([string]$raw, [bool]$isStreaming) {
             $payload = $raw | ConvertFrom-Json
             $usage = Get-JsonProperty $payload "usage"
             if ($usage) { $usageRaw = $usage }
-            foreach ($choice in @(Get-JsonProperty $payload "choices")) {
+            foreach ($choice in @(Get-JsonProperty $payload "choices") | Select-Object -First 1) {
                 if ($null -eq $choice) { continue }
                 $finish = Get-JsonProperty $choice "finish_reason"
                 if (-not [string]::IsNullOrWhiteSpace([string]$finish)) { $finishReason = [string]$finish }
@@ -4050,6 +5466,9 @@ function Get-OpenAIResponseMetadata([string]$raw, [bool]$isStreaming) {
     return [PSCustomObject]@{
         finishReason = if ([string]::IsNullOrWhiteSpace($finishReason)) { "unknown" } else { $finishReason }
         reasoningTokens = $reasoningTokens
+        streamDoneObserved = if ($isStreaming) { $streamDoneObserved } else { $null }
+        primaryTerminalSeen = if ($isStreaming) { $primaryTerminalSeen } else { $null }
+        streamCompleted = if ($isStreaming) { ($streamDoneObserved -or $primaryTerminalSeen) } else { $true }
     }
 }
 
@@ -4078,6 +5497,7 @@ function Get-AnswerDepthFacts($usage, $metadata, [string]$answer, $effectiveMaxT
     $charTargetMet = if ($isProject) { $answerChars -ge $ProjectTargetAnswerChars } else { $null }
     $contextYield = if ($null -ne $inputTokens -and [int64]$inputTokens -gt 0 -and $null -ne $visibleOutputTokens) { [Math]::Round(([double]$visibleOutputTokens / [double]$inputTokens) * 100, 2) } else { $null }
     $finishReason = if ($metadata) { [string]$metadata.finishReason } else { "unknown" }
+    $streamCompleted = if ($metadata) { Get-JsonProperty $metadata "streamCompleted" } else { $null }
     return [PSCustomObject]@{
         inputLoad = $inputLoad
         visibleOutput = $visibleClass
@@ -4094,7 +5514,8 @@ function Get-AnswerDepthFacts($usage, $metadata, [string]$answer, $effectiveMaxT
         charTargetMet = $charTargetMet
         contextYieldPercent = $contextYield
         finishReason = $finishReason
-        truncated = ($finishReason -eq "length")
+        streamCompleted = $streamCompleted
+        truncated = (($finishReason -eq "length") -or ($streamCompleted -eq $false))
         effectiveMaxTokens = $effectiveMaxTokens
     }
 }
@@ -4209,8 +5630,12 @@ function Read-ResponseStreamUtf8($Stream, [bool]$StopOnSseDone) {
 
     if (-not $StopOnSseDone) {
         $ms = New-Object System.IO.MemoryStream
-        $Stream.CopyTo($ms)
-        return [System.Text.Encoding]::UTF8.GetString($ms.ToArray())
+        try {
+            $Stream.CopyTo($ms)
+            return [System.Text.Encoding]::UTF8.GetString($ms.ToArray())
+        } finally {
+            $ms.Dispose()
+        }
     }
 
     $reader = New-Object System.IO.StreamReader($Stream, $Utf8NoBom, $true)
@@ -4250,6 +5675,9 @@ function Invoke-JsonPostUtf8([string]$Uri, $Headers, [byte[]]$BodyBytes, [int]$T
         if ($key -ieq "Accept") { $req.Accept = [string]$Headers[$key] }
         elseif ($key -ieq "Content-Type") { $req.ContentType = [string]$Headers[$key] }
         elseif ($key -ieq "User-Agent") { $req.UserAgent = [string]$Headers[$key] }
+        elseif ($key -ieq "Host") { $req.Host = [string]$Headers[$key] }
+        elseif ($key -ieq "Referer") { $req.Referer = [string]$Headers[$key] }
+        elseif ($key -ieq "Expect") { $req.Expect = [string]$Headers[$key] }
         else { $req.Headers[$key] = [string]$Headers[$key] }
     }
 
@@ -4261,16 +5689,36 @@ function Invoke-JsonPostUtf8([string]$Uri, $Headers, [byte[]]$BodyBytes, [int]$T
     try {
         $resp = $req.GetResponse()
         try {
-            $respStream = $resp.GetResponseStream()
-            $body = Read-ResponseStreamUtf8 $respStream $StopOnSseDone
-            $sw.Stop()
-            return [PSCustomObject]@{
-                Body = $body
-                StatusCode = [int]$resp.StatusCode
-                StatusDescription = [string]$resp.StatusDescription
-                ContentType = [string]$resp.ContentType
-                ReceivedBytes = [int64][System.Text.Encoding]::UTF8.GetByteCount($body)
-                DurationMs = [int64]$sw.ElapsedMilliseconds
+            try {
+                $respStream = $resp.GetResponseStream()
+                $responseContentType = [string]$resp.ContentType
+                $responseIsSse = $responseContentType.ToLowerInvariant().Contains("text/event-stream")
+                # The wire response is authoritative.  Even when settings asked
+                # for JSON, an SSE response must stop at [DONE] rather than waiting
+                # for a keep-alive connection to close.
+                $body = Read-ResponseStreamUtf8 $respStream ($StopOnSseDone -or $responseIsSse)
+                $sw.Stop()
+                return [PSCustomObject]@{
+                    Body = $body
+                    StatusCode = [int]$resp.StatusCode
+                    StatusDescription = [string]$resp.StatusDescription
+                    ContentType = $responseContentType
+                    ReceivedBytes = [int64][System.Text.Encoding]::UTF8.GetByteCount($body)
+                    DurationMs = [int64]$sw.ElapsedMilliseconds
+                }
+            } catch {
+                # GetResponse() has already succeeded.  A timeout or decoder
+                # failure while reading the body is therefore not a transport
+                # failure that may safely replay the POST: the server may have
+                # committed work and already started streaming an answer.
+                $readFailure = [System.IO.IOException]::new(
+                    "HTTP response started but its body could not be read completely: $($_.Exception.Message)",
+                    $_.Exception
+                )
+                $readFailure.Data["QwenLoopResponseStarted"] = $true
+                $readFailure.Data["QwenLoopStatusCode"] = [int]$resp.StatusCode
+                $readFailure.Data["QwenLoopStatusDescription"] = [string]$resp.StatusDescription
+                throw $readFailure
             }
         } finally {
             if ($respStream) { $respStream.Close() }
@@ -4278,18 +5726,31 @@ function Invoke-JsonPostUtf8([string]$Uri, $Headers, [byte[]]$BodyBytes, [int]$T
         }
     } catch [System.Net.WebException] {
         $sw.Stop()
+        $webExceptionMessage = [string]$_.Exception.Message
         $resp = $_.Exception.Response
         if ($resp) {
-            $respStream = $resp.GetResponseStream()
-            $ms = New-Object System.IO.MemoryStream
-            if ($respStream) { $respStream.CopyTo($ms) }
-            $bytes = $ms.ToArray()
-            $body = [System.Text.Encoding]::UTF8.GetString($bytes)
+            $respStream = $null
+            $ms = $null
             $statusCode = [int]$resp.StatusCode
             $statusDescription = [string]$resp.StatusDescription
-            throw "HTTP $statusCode $statusDescription after $($sw.ElapsedMilliseconds) ms: $($_.Exception.Message)`nResponse body:`n$body"
+            $bodyReadFailure = ""
+            try {
+                $respStream = $resp.GetResponseStream()
+                $ms = New-Object System.IO.MemoryStream
+                if ($respStream) {
+                    try { $respStream.CopyTo($ms) }
+                    catch { $bodyReadFailure = "`nResponse body read failed: $($_.Exception.Message)" }
+                }
+                $bytes = $ms.ToArray()
+                $body = [System.Text.Encoding]::UTF8.GetString($bytes)
+                throw "HTTP $statusCode $statusDescription after $($sw.ElapsedMilliseconds) ms: $webExceptionMessage$bodyReadFailure`nResponse body:`n$body"
+            } finally {
+                if ($ms) { $ms.Dispose() }
+                if ($respStream) { $respStream.Dispose() }
+                if ($resp) { $resp.Dispose() }
+            }
         }
-        throw "HTTP 호출 실패 after $($sw.ElapsedMilliseconds) ms: $($_.Exception.Message)"
+        throw "HTTP 호출 실패 after $($sw.ElapsedMilliseconds) ms: $webExceptionMessage"
     } catch {
         $sw.Stop()
         throw
@@ -4297,9 +5758,14 @@ function Invoke-JsonPostUtf8([string]$Uri, $Headers, [byte[]]$BodyBytes, [int]$T
 }
 
 function Convert-OpenAIResponseToText([string]$raw, [bool]$isStreaming) {
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        throw "OpenAI JSON protocol error: response body is empty."
+    }
     if ($isStreaming) {
         $textParts = New-Object System.Collections.Generic.List[string]
-        $jsonLines = New-Object System.Collections.Generic.List[string]
+        $eventNumber = 0
+        $parsedEvents = 0
+        $terminalIncomplete = $false
 
         foreach ($line in ($raw -split "`r?`n")) {
             $trimmed = $line.Trim()
@@ -4307,43 +5773,83 @@ function Convert-OpenAIResponseToText([string]$raw, [bool]$isStreaming) {
 
             $data = $trimmed.Substring(5).Trim()
             if ([string]::IsNullOrWhiteSpace($data) -or $data -eq "[DONE]") { continue }
-            $jsonLines.Add($data)
+            $eventNumber++
 
             try {
                 $chunk = $data | ConvertFrom-Json
-                if ($chunk.choices -and $chunk.choices.Count -gt 0) {
-                    foreach ($choice in @($chunk.choices)) {
-                        if ($choice.delta) {
-                            $deltaText = Convert-MessageContentToText $choice.delta.content
-                            if (-not [string]::IsNullOrEmpty($deltaText)) { $textParts.Add($deltaText) }
-                        }
-                    }
+            } catch {
+                throw "OpenAI SSE protocol error at data event ${eventNumber}: invalid JSON: $($_.Exception.Message)"
+            }
+            $parsedEvents++
+            $apiError = Get-JsonProperty $chunk "error"
+            if ($apiError) {
+                throw "OpenAI SSE protocol error: server returned error payload: $($apiError | ConvertTo-Json -Compress -Depth 10)"
+            }
+            $choiceOrdinal = 0
+            foreach ($choice in @(Get-JsonProperty $chunk "choices")) {
+                if ($null -eq $choice) { continue }
+                $choiceIndex = Get-JsonProperty $choice "index"
+                $isPrimaryChoice = if ($null -ne $choiceIndex) { ([int]$choiceIndex -eq 0) } else { ($choiceOrdinal -eq 0) }
+                $choiceOrdinal++
+                if (-not $isPrimaryChoice) { continue }
+                $finishReason = ([string](Get-JsonProperty $choice "finish_reason")).ToLowerInvariant()
+                if ($finishReason -in @("length", "content_filter")) { $terminalIncomplete = $true }
+                $piece = ""
+                $delta = Get-JsonProperty $choice "delta"
+                $message = Get-JsonProperty $choice "message"
+                if ($delta) {
+                    $piece = Convert-MessageContentToText (Get-JsonProperty $delta "content")
+                    if ([string]::IsNullOrEmpty($piece)) { $piece = Convert-MessageContentToText (Get-JsonProperty $delta "refusal") }
                 }
-            } catch { }
+                elseif ($message) {
+                    $piece = Convert-MessageContentToText (Get-JsonProperty $message "content")
+                    if ([string]::IsNullOrEmpty($piece)) { $piece = Convert-MessageContentToText (Get-JsonProperty $message "refusal") }
+                }
+                else { $piece = Convert-MessageContentToText (Get-JsonProperty $choice "text") }
+                if (-not [string]::IsNullOrEmpty($piece)) { $textParts.Add($piece) }
+            }
         }
 
+        if ($parsedEvents -eq 0) { throw "OpenAI SSE protocol error: no valid data event was received." }
         $joined = ($textParts -join "")
         if (-not [string]::IsNullOrWhiteSpace($joined)) {
             return (Repair-MojibakeIfLikely $joined)
         }
-
-        if ($jsonLines.Count -gt 0) {
-            return (Repair-MojibakeIfLikely ($jsonLines -join "`n"))
+        if ($terminalIncomplete) {
+            # A provider may legally return no visible text when moderation or
+            # the output limit stops generation.  Preserve that protocol state
+            # so the caller can queue a bounded continuation instead of
+            # misclassifying the HTTP 200 response as malformed JSON/SSE.
+            return [string]::Empty
         }
-        return (Repair-MojibakeIfLikely $raw)
+        throw "OpenAI SSE protocol error: valid events contained no textual completion content."
     }
 
-    $resp = $raw | ConvertFrom-Json
-    if ($resp.choices -and $resp.choices.Count -gt 0) {
-        $choice = $resp.choices[0]
-        if ($choice.message) {
-            $text = Convert-MessageContentToText $choice.message.content
+    try {
+        $resp = $raw | ConvertFrom-Json
+    } catch {
+        throw "OpenAI JSON protocol error: invalid JSON response: $($_.Exception.Message)"
+    }
+    $apiError = Get-JsonProperty $resp "error"
+    if ($apiError) {
+        throw "OpenAI JSON protocol error: server returned error payload: $($apiError | ConvertTo-Json -Compress -Depth 10)"
+    }
+    $choices = @(Get-JsonProperty $resp "choices")
+    if ($choices.Count -gt 0 -and $null -ne $choices[0]) {
+        $choice = $choices[0]
+        $finishReason = ([string](Get-JsonProperty $choice "finish_reason")).ToLowerInvariant()
+        $message = Get-JsonProperty $choice "message"
+        if ($message) {
+            $text = Convert-MessageContentToText (Get-JsonProperty $message "content")
+            if ([string]::IsNullOrEmpty($text)) { $text = Convert-MessageContentToText (Get-JsonProperty $message "refusal") }
             $text = Repair-MojibakeIfLikely $text
             if (-not [string]::IsNullOrWhiteSpace($text)) { return $text }
         }
-        if ($choice.text) { return (Repair-MojibakeIfLikely ([string]$choice.text)) }
+        $choiceText = Convert-MessageContentToText (Get-JsonProperty $choice "text")
+        if (-not [string]::IsNullOrWhiteSpace($choiceText)) { return (Repair-MojibakeIfLikely $choiceText) }
+        if ($finishReason -in @("length", "content_filter")) { return [string]::Empty }
     }
-    return (Repair-MojibakeIfLikely ($resp | ConvertTo-Json -Depth 30))
+    throw "OpenAI JSON protocol error: choices contained no textual completion content."
 }
 
 function Invoke-QwenChat($providerInfo, $settings, $networkIdentity, [string]$systemPrompt, [string]$userPrompt) {
@@ -4354,7 +5860,8 @@ function Invoke-QwenChat($providerInfo, $settings, $networkIdentity, [string]$sy
     $body = $bodyObj | ConvertTo-Json -Depth 80 -Compress
     $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($body)
 
-    Write-Utf8File (Join-Path $WorkDir "last_request_body.json") $body
+    $loggedBody = Get-LoggedObject $bodyObj $providerInfo
+    Write-Utf8File (Join-Path $WorkDir "last_request_body.json") ($loggedBody | ConvertTo-Json -Depth 80 -Compress)
 
     Assert-RetryConfig
 
@@ -4362,14 +5869,16 @@ function Invoke-QwenChat($providerInfo, $settings, $networkIdentity, [string]$sy
     foreach ($endpoint in (Get-EndpointCandidates $providerInfo.BaseUrl)) {
         for ($attempt = 0; $attempt -le $MaxRetries; $attempt++) {
             $headers = Build-ClientHeaders $providerInfo $settings $networkIdentity $attempt
-            $debugHeaders = Get-LoggedHeaders $headers
+            $debugHeaders = Get-LoggedHeaders $headers $providerInfo
             Write-Utf8File (Join-Path $WorkDir "last_request_headers.json") (($debugHeaders | ConvertTo-Json -Depth 30))
             if ($LogSensitive) { Write-Utf8File (Join-Path $WorkDir "last_request_headers_sensitive.json") (($headers | ConvertTo-Json -Depth 30)) }
 
+            $responseReceived = $false
             try {
                 $attemptText = "$($attempt + 1)/$($MaxRetries + 1)"
                 Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] POST $endpoint (attempt $attemptText, retry-count=$attempt)" -ForegroundColor Cyan
                 $response = Invoke-JsonPostUtf8 -Uri $endpoint -Headers $headers -BodyBytes $bodyBytes -TimeoutSeconds $EffectiveTimeoutSec -StopOnSseDone:$requestStreaming
+                $responseReceived = $true
                 Write-Host ("[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] HTTP {0} {1} ({2} ms, {3} bytes, retry-count={4})" -f $response.StatusCode, $response.StatusDescription, $response.DurationMs, $response.ReceivedBytes, $attempt) -ForegroundColor Green
                 $contentType = ([string]$response.ContentType).ToLowerInvariant()
                 $responseStreaming = if ($contentType.Contains("text/event-stream")) {
@@ -4382,7 +5891,7 @@ function Invoke-QwenChat($providerInfo, $settings, $networkIdentity, [string]$sy
                     $requestStreaming
                 }
                 $responseParseMode = if ($responseStreaming) { "sse" } else { "json" }
-                $answerText = Convert-OpenAIResponseToText $response.Body $responseStreaming
+                [string]$answerText = Convert-OpenAIResponseToText $response.Body $responseStreaming
                 $tokenUsage = Get-OpenAIUsageFromRaw $response.Body $responseStreaming
                 $responseMetadata = Get-OpenAIResponseMetadata $response.Body $responseStreaming
                 $answerDepth = Get-AnswerDepthFacts $tokenUsage $responseMetadata $answerText $effectiveMaxTokens (-not [string]::IsNullOrWhiteSpace($ProjectRoot))
@@ -4407,6 +5916,9 @@ function Invoke-QwenChat($providerInfo, $settings, $networkIdentity, [string]$sy
                     tokenUse = ConvertTo-PlainObject $tokenProfile
                     finishReason = $responseMetadata.finishReason
                     reasoningTokens = $responseMetadata.reasoningTokens
+                    streamDoneObserved = $responseMetadata.streamDoneObserved
+                    primaryTerminalSeen = $responseMetadata.primaryTerminalSeen
+                    streamCompleted = $responseMetadata.streamCompleted
                     effectiveMaxTokens = $effectiveMaxTokens
                     answerChars = $answerText.Length
                     answerDepth = ConvertTo-PlainObject $answerDepth
@@ -4422,6 +5934,9 @@ function Invoke-QwenChat($providerInfo, $settings, $networkIdentity, [string]$sy
                     AnswerDepth = $answerDepth
                     FinishReason = $responseMetadata.finishReason
                     ReasoningTokens = $responseMetadata.reasoningTokens
+                    StreamDoneObserved = $responseMetadata.streamDoneObserved
+                    PrimaryTerminalSeen = $responseMetadata.primaryTerminalSeen
+                    StreamCompleted = $responseMetadata.streamCompleted
                     EffectiveMaxTokens = $effectiveMaxTokens
                     RequestStreaming = $requestStreaming
                     ResponseParseMode = $responseParseMode
@@ -4439,32 +5954,62 @@ function Invoke-QwenChat($providerInfo, $settings, $networkIdentity, [string]$sy
                     CompletedAt = (Get-Date)
                 }
             } catch {
-                $lastError = [string]$_.Exception.Message
-                $retryable = Test-RetryableError $lastError
+                $caughtException = $_.Exception
+                $lastError = [string]$caughtException.Message
+                $responseStarted = $responseReceived
+                try {
+                    if ($caughtException.Data -and $caughtException.Data.Contains("QwenLoopResponseStarted")) {
+                        $responseStarted = ConvertTo-BooleanValue $caughtException.Data["QwenLoopResponseStarted"] $responseStarted
+                    }
+                } catch { }
+                # Once an HTTP response has been fully received, parser or local
+                # diagnostic/state failures must not resend the same request.
+                # The same applies once response headers/body streaming have
+                # begun, even if reading later times out before [DONE].
+                $retryable = (-not $responseStarted) -and (Test-RetryableError $lastError)
                 Write-Host "Endpoint failed: $endpoint (attempt $($attempt + 1)/$($MaxRetries + 1), retryable=$retryable)" -ForegroundColor Yellow
                 Write-Host $lastError -ForegroundColor Yellow
 
                 $errorStatusCode = $null
                 $errorStatusDescription = $null
                 $errorDurationMs = $null
+                if ($responseStarted) {
+                    try {
+                        if ($caughtException.Data.Contains("QwenLoopStatusCode")) { $errorStatusCode = [int]$caughtException.Data["QwenLoopStatusCode"] }
+                        if ($caughtException.Data.Contains("QwenLoopStatusDescription")) { $errorStatusDescription = [string]$caughtException.Data["QwenLoopStatusDescription"] }
+                    } catch { }
+                }
                 if ($lastError -match '^HTTP\s+(\d+)\s+(.+?)\s+after\s+(\d+)\s+ms') {
                     $errorStatusCode = [int]$Matches[1]
                     $errorStatusDescription = [string]$Matches[2]
                     $errorDurationMs = [int64]$Matches[3]
                 }
-                Write-Utf8File (Join-Path $WorkDir "last_response_status.json") (([ordered]@{
+                $errorStatusJson = (([ordered]@{
                     ok = $false
                     endpoint = $endpoint
                     attempt = ($attempt + 1)
                     retryCount = $attempt
                     maxRetries = $MaxRetries
                     retryable = $retryable
+                    responseStarted = $responseStarted
                     statusCode = $errorStatusCode
                     statusDescription = $errorStatusDescription
                     durationMs = $errorDurationMs
                     error = $lastError
                     completedAt = (Get-Date).ToString("o")
                 }) | ConvertTo-Json -Depth 10)
+                try {
+                    Write-Utf8File (Join-Path $WorkDir "last_response_status.json") $errorStatusJson
+                } catch {
+                    if ($responseStarted) {
+                        throw "HTTP response was received but could not be safely accepted; request will not be resent: $lastError | response status log failed: $($_.Exception.Message)"
+                    }
+                    throw
+                }
+
+                if ($responseStarted) {
+                    throw "HTTP response was received but could not be safely accepted; request will not be resent: $lastError"
+                }
 
                 if (-not $retryable -or $attempt -ge $MaxRetries) { break }
 
@@ -4480,7 +6025,9 @@ function Invoke-QwenChat($providerInfo, $settings, $networkIdentity, [string]$sy
 
 $projectSessionLayout = $null
 $projectSessionRetention = $null
-$projectSessionLockStream = $null
+$projectSessionStartupCleanup = $null
+$projectSessionReady = $false
+$workDirLifetimeLockStream = $null
 if ($NewProjectSession) {
     if ([string]::IsNullOrWhiteSpace($ProjectRoot)) { throw "-NewProjectSession은 -ProjectRoot와 함께 사용해야 합니다." }
     $resolvedSessionProjectRoot = Resolve-ProjectRoot $ProjectRoot
@@ -4490,38 +6037,24 @@ if ($NewProjectSession) {
     $projectSessionLayout = New-ProjectSessionLayout $ProjectRoot $WorkDir
     $ProjectRoot = $projectSessionLayout.ProjectRoot
     $WorkDir = $projectSessionLayout.SessionDir
+} elseif (-not [string]::IsNullOrWhiteSpace($ProjectRoot)) {
+    # Resolve relative/%ENV%/~ project input with the same script-root policy
+    # used by the scanner before any destructive-boundary comparison.
+    $ProjectRoot = Resolve-ProjectRoot $ProjectRoot
 }
 
+$normalizedWorkDirInput = Expand-PathInput $WorkDir
+if (-not [System.IO.Path]::IsPathRooted($normalizedWorkDirInput)) {
+    $normalizedWorkDirInput = Join-Path $PSScriptRoot $normalizedWorkDirInput
+}
+$WorkDir = Get-NormalizedFullPath $normalizedWorkDirInput
 Assert-SafeWorkDir $WorkDir $ProjectRoot
+$WorkDir = Get-PhysicalNormalizedPath $WorkDir
 if (!(Test-Path -LiteralPath $SettingsPath)) { throw "settings.json을 찾지 못했습니다: $SettingsPath" }
-$workDirExistedBefore = Test-Path -LiteralPath $WorkDir -PathType Container
-$workDirWasEmpty = $false
-if ($workDirExistedBefore) {
-    $workDirWasEmpty = (@(Get-ChildItem -LiteralPath $WorkDir -Force -ErrorAction SilentlyContinue).Count -eq 0)
-}
-New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
-$defaultLoopDataRoot = Get-NormalizedFullPath (Join-Path $PSScriptRoot "qwen-loop-data")
-$workDirCanBeClaimed = ($null -ne $projectSessionLayout) -or (Test-PathInsideRoot $defaultLoopDataRoot $WorkDir) -or (-not $workDirExistedBefore) -or $workDirWasEmpty
-$workDirCleanupOwned = Initialize-QwenLoopWorkDirOwnership $WorkDir $workDirCanBeClaimed
-if ($projectSessionLayout) {
-    $lockPath = Join-Path $WorkDir ".active.lock"
-    $projectSessionLockStream = [System.IO.File]::Open($lockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
-}
 
-try {
-if ($projectSessionLayout) {
-    $sessionIdentity = [ordered]@{
-        schema = "qwen-loop-project-session/v1"
-        identity = $projectSessionLayout.Identity
-        canonicalProjectRoot = $projectSessionLayout.ProjectRoot
-        sessionId = $projectSessionLayout.SessionId
-        createdAt = (Get-Date).ToString("o")
-        processId = $PID
-    }
-    Write-Utf8File (Join-Path $WorkDir "session_identity.json") ($sessionIdentity | ConvertTo-Json -Depth 10)
-    $projectSessionRetention = Invoke-ProjectSessionRetention $projectSessionLayout
-}
-
+# Complete every read-only settings/configuration validation before a new
+# project session becomes retention-eligible.  A typo or malformed settings
+# file must never create a valid empty session that can evict older evidence.
 $settingsRaw = Read-Utf8File $SettingsPath
 try {
     $settings = $settingsRaw | ConvertFrom-Json
@@ -4534,8 +6067,51 @@ $intervalPlan = Get-IntervalPlan
 Assert-RetryConfig
 Assert-TokenUsageConfig
 Assert-CleanupConfig
+Assert-RuntimeConfig $EffectiveTimeoutSec
+if (-not [string]::IsNullOrWhiteSpace($ProjectRoot)) { Assert-ProjectScanConfig }
+if ($projectSessionLayout) { Assert-ProjectSessionRetentionConfig }
+[void](Get-EndpointCandidates $providerInfo.BaseUrl)
+[void](Build-ClientHeaders $providerInfo $settings $null)
+[void](Build-RequestBody $settings $providerInfo "configuration validation" "configuration validation" $null)
+
+$workDirExistedBefore = Test-Path -LiteralPath $WorkDir -PathType Container
+$workDirWasEmpty = $false
+if ($workDirExistedBefore) {
+    $workDirWasEmpty = (@(Get-ChildItem -LiteralPath $WorkDir -Force -ErrorAction SilentlyContinue).Count -eq 0)
+}
+New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
+$workDirLifetimeLockPath = Join-Path $WorkDir ".active.lock"
+$workDirLifetimeLockStream = Open-ExclusiveFileLock $workDirLifetimeLockPath 3000
+if ($null -eq $workDirLifetimeLockStream) {
+    throw "같은 WorkDir를 사용하는 다른 qwen loop가 이미 실행 중입니다. 상태 파일 충돌을 막기 위해 시작을 중단합니다: $WorkDir"
+}
+$defaultLoopDataRoot = Get-NormalizedFullPath (Join-Path $PSScriptRoot "qwen-loop-data")
+$workDirCanBeClaimed = ($null -ne $projectSessionLayout) -or (Test-PhysicalPathInsideRoot $defaultLoopDataRoot $WorkDir) -or (-not $workDirExistedBefore) -or $workDirWasEmpty
+$workDirCleanupOwned = $false
+$sessionIdentity = $null
+
+try {
+if ($projectSessionLayout) {
+    $sessionIdentity = [ordered]@{
+        schema = "qwen-loop-project-session/v1"
+        identity = $projectSessionLayout.Identity
+        canonicalProjectRoot = $projectSessionLayout.ProjectRoot
+        physicalProjectRoot = Get-PhysicalNormalizedPath $projectSessionLayout.ProjectRoot
+        sessionId = $projectSessionLayout.SessionId
+        physicalSessionDir = Get-PhysicalNormalizedPath $WorkDir
+        createdAt = (Get-Date).ToString("o")
+        processId = $PID
+        state = "initializing"
+    }
+    Write-Utf8File (Join-Path $WorkDir "session_identity.json") ($sessionIdentity | ConvertTo-Json -Depth 10)
+}
+$workDirCleanupOwned = Initialize-QwenLoopWorkDirOwnership $WorkDir $workDirCanBeClaimed
+if ($projectSessionLayout) {
+    $projectSessionStartupCleanup = Invoke-ProjectSessionRetention $projectSessionLayout -AbandonedOnly
+}
+
 $networkIdentity = $null
-if ($LoopDiagnosticHeaders) {
+if ($LoopDiagnosticHeaders -and -not $NoClientIdentityHeaders) {
     $networkIdentity = Get-ClientNetworkIdentity $providerInfo.BaseUrl
 }
 
@@ -4547,15 +6123,77 @@ $runHistoryPath = Join-Path $WorkDir "run_history.md"
 $runHistoryJsonlPath = Join-Path $WorkDir "run_history.jsonl"
 $errorLogPath = Join-Path $WorkDir "error.log"
 $pendingQuestionPath = Join-Path $WorkDir "pending_question.txt"
+$pendingTurnPath = Join-Path $WorkDir "pending_turn.json"
+$partialStatePath = Join-Path $WorkDir "partial_state.json"
+$pendingCycleTransitionPath = Join-Path $WorkDir "pending_cycle_transition.json"
 $dynamicProjectContextPath = Join-Path $WorkDir "last_dynamic_project_context.json"
 $projectExplorationStatePath = Join-Path $WorkDir "exploration_state.json"
 $projectCycleHistoryPath = Join-Path $WorkDir "cycle_history.jsonl"
 $projectCycleEvidencePath = Join-Path $WorkDir "cycle_evidence.md"
 
+$startupPendingSequenceFloor = Get-PendingTurnSequence $pendingTurnPath
+$pendingTurnRecovery = $null
+if ($FreshProjectQuestion) {
+    # An explicit fresh start is authoritative and must not roll an older
+    # session's interrupted transaction into the newly selected business area.
+    Remove-PendingTurnFiles $pendingTurnPath $pendingQuestionPath
+} else {
+    $pendingTurnRecovery = Repair-PendingTurnCommit $pendingTurnPath $pendingQuestionPath $jsonlPath $nextQuestionPath $partialStatePath $lastTurnPath $projectExplorationStatePath $projectCycleEvidencePath
+    if ($pendingTurnRecovery.status -notin @("none", "request-uncommitted", "legacy-uncommitted")) {
+        Write-Host "PendingTurn  : $($pendingTurnRecovery.status)$(if ($pendingTurnRecovery.recoveredSequence) { ' (seq=' + $pendingTurnRecovery.recoveredSequence + ')' } else { '' })" -ForegroundColor Yellow
+    }
+}
+
 $projectScan = $null
 $projectContext = ""
 $projectCycleNumber = 1
 $projectSuccessfulTurnsInCycle = 0
+$savedExplorationState = $null
+$savedExplorationStateValid = $false
+if (-not $FreshProjectQuestion -and -not [string]::IsNullOrWhiteSpace($ProjectRoot) -and (Test-Path -LiteralPath $projectExplorationStatePath -PathType Leaf)) {
+    try {
+        $savedExplorationState = (Read-Utf8File $projectExplorationStatePath) | ConvertFrom-Json
+        if ([string](Get-JsonProperty $savedExplorationState "schema") -eq "qwen-loop-project-exploration-state/v1") {
+            $savedCycle = [int](Get-JsonProperty $savedExplorationState "cycleIndex")
+            $savedTurns = [int](Get-JsonProperty $savedExplorationState "successfulTurnsInCycle")
+            if ($savedCycle -ge 1 -and $savedTurns -ge 0) {
+                $projectCycleNumber = $savedCycle
+                $projectSuccessfulTurnsInCycle = $savedTurns
+                $savedExplorationStateValid = $true
+            }
+        }
+    } catch {
+        Write-Host "ExplorationState: 기존 상태를 읽지 못해 cycle 1부터 안전하게 다시 계산합니다: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
+$pendingCycleTransition = $null
+$pendingCycleRecoveryStatus = "none"
+if ($FreshProjectQuestion) {
+    if (Test-Path -LiteralPath $pendingCycleTransitionPath -PathType Leaf) {
+        [System.IO.File]::Delete([System.IO.Path]::GetFullPath($pendingCycleTransitionPath))
+    }
+} elseif (-not [string]::IsNullOrWhiteSpace($ProjectRoot)) {
+    $pendingCycleTransition = Read-PendingCycleTransition $pendingCycleTransitionPath
+    if ($pendingCycleTransition) {
+        $pendingTransitionId = [string](Get-JsonProperty $pendingCycleTransition "transitionId")
+        $pendingNextCycle = [int](Get-JsonProperty $pendingCycleTransition "nextCycle")
+        $savedTransitionId = if ($savedExplorationStateValid) { [string](Get-JsonProperty $savedExplorationState "transitionId") } else { "" }
+        if ($savedExplorationStateValid -and $savedTransitionId -eq $pendingTransitionId -and $projectCycleNumber -eq $pendingNextCycle) {
+            # Every persistent transition artifact precedes exploration_state.
+            # Matching IDs therefore prove the cycle commit completed; only the
+            # final marker/partial cleanup was interrupted.
+            Clear-ProjectPartialState $partialStatePath
+            [System.IO.File]::Delete([System.IO.Path]::GetFullPath($pendingCycleTransitionPath))
+            $pendingCycleTransition = $null
+            $pendingCycleRecoveryStatus = "committed-marker-cleared"
+        } else {
+            # Resume the staged target cycle itself.  Never increment it again.
+            $projectCycleNumber = $pendingNextCycle
+            $projectSuccessfulTurnsInCycle = 0
+            $pendingCycleRecoveryStatus = "resume-staged-transition"
+        }
+    }
+}
 $projectExplorationHistoryPath = if ($projectSessionLayout) { $projectSessionLayout.ExplorationHistoryPath } else { Join-Path $WorkDir "exploration_history.jsonl" }
 $projectExplorationLockPath = if ($projectSessionLayout) { Join-Path $projectSessionLayout.ProjectBase ".exploration.lock" } else { Join-Path $WorkDir ".exploration.lock" }
 $projectExplorationLockStream = $null
@@ -4565,19 +6203,118 @@ if (-not [string]::IsNullOrWhiteSpace($ProjectRoot) -and -not $DryRun) {
         throw "다른 실행이 이 프로젝트의 업무 영역을 선택하고 있습니다. 중복 family 예약을 피하기 위해 시작을 중단합니다. 잠시 후 다시 실행하세요: $projectExplorationLockPath"
     }
 }
+$startedFreshCycleThisRun = $false
+$projectSnapshotReset = $false
 try {
     $projectExplorationAvoidance = Get-ProjectExplorationAvoidance $projectExplorationHistoryPath
     if (-not [string]::IsNullOrWhiteSpace($ProjectRoot)) {
-    $projectScan = New-ProjectScanContext $ProjectRoot $projectExplorationAvoidance $projectCycleNumber
+    if (-not $FreshProjectQuestion) {
+        if ($pendingCycleTransition) {
+            $projectScan = Read-ProjectScanCycleSnapshot $WorkDir $ProjectRoot $projectCycleNumber ([string](Get-JsonProperty $pendingCycleTransition "nextBusinessFamily")) ([string](Get-JsonProperty $pendingCycleTransition "nextPrimaryPath"))
+        } elseif ($savedExplorationStateValid) {
+            $projectScan = Read-ProjectScanCycleSnapshot $WorkDir $ProjectRoot $projectCycleNumber ([string](Get-JsonProperty $savedExplorationState "primaryBusinessFamily")) ([string](Get-JsonProperty $savedExplorationState "primaryPath"))
+        }
+    }
+
+    if ($null -eq $projectScan -and $savedExplorationStateValid -and -not $FreshProjectQuestion -and $null -eq $pendingCycleTransition) {
+        # A saved counter without its matching scan snapshot would mix one
+        # business family's turn count with another family's prompt.  Stage an
+        # explicit new cycle and recover through the same transaction path.
+        $previousCycle = $projectCycleNumber
+        $projectCycleNumber++
+        $projectSuccessfulTurnsInCycle = 0
+        $pendingCycleTransition = [PSCustomObject][ordered]@{
+            schema = "qwen-loop-cycle-transition/v1"
+            transitionId = [Guid]::NewGuid().ToString("N")
+            stagedAt = (Get-Date).ToString("o")
+            reason = "snapshot-unavailable"
+            previousCycle = $previousCycle
+            nextCycle = $projectCycleNumber
+            previousBusinessFamily = [string](Get-JsonProperty $savedExplorationState "primaryBusinessFamily")
+        }
+        Write-Utf8File $pendingCycleTransitionPath ($pendingCycleTransition | ConvertTo-Json -Depth 20)
+        $pendingCycleRecoveryStatus = "snapshot-reset"
+        $projectSnapshotReset = $true
+    }
+
+    if ($null -eq $projectScan) {
+        $projectScan = New-ProjectScanContext $ProjectRoot $projectExplorationAvoidance $projectCycleNumber
+    }
     Write-ProjectScanFiles $projectScan $WorkDir
     $projectContext = $projectScan.promptContext
 
-    if ($FreshProjectQuestion) {
+    if ($pendingCycleTransition) {
+        $transitionId = [string](Get-JsonProperty $pendingCycleTransition "transitionId")
+        $transitionReason = [string](Get-JsonProperty $pendingCycleTransition "reason")
+        $previousCycle = [int](Get-JsonProperty $pendingCycleTransition "previousCycle")
+        $previousFamily = [string](Get-JsonProperty $pendingCycleTransition "previousBusinessFamily")
+        $pendingCycleTransition | Add-Member -NotePropertyName nextBusinessFamily -NotePropertyValue $projectScan.primaryBusinessFamily -Force
+        $pendingCycleTransition | Add-Member -NotePropertyName nextPrimaryPath -NotePropertyValue $projectScan.primaryQuestionCandidateFile -Force
+        $pendingCycleTransition | Add-Member -NotePropertyName nextSeedQuestion -NotePropertyValue $projectScan.seedQuestion -Force
+        Write-Utf8File $pendingCycleTransitionPath ($pendingCycleTransition | ConvertTo-Json -Depth 20)
+
+        if ($transitionReason -eq "continuation-limit") {
+            $previousScan = Read-ProjectScanCycleSnapshot $WorkDir $ProjectRoot $previousCycle $previousFamily ""
+            if ($previousScan) {
+                $abandonedSessionId = if ($projectSessionLayout) { [string]$projectSessionLayout.SessionId } else { "legacy-p$PID" }
+                Add-ProjectExplorationHistory $projectExplorationHistoryPath $previousScan $abandonedSessionId "abandoned-before-rescan" "${transitionId}:abandoned"
+            }
+        }
+        $sessionHistoryId = if ($projectSessionLayout) { [string]$projectSessionLayout.SessionId } else { "legacy-p$PID" }
+        Add-ProjectExplorationHistory $projectExplorationHistoryPath $projectScan $sessionHistoryId $transitionReason "${transitionId}:selected"
+        Write-Utf8File $nextQuestionPath $projectScan.seedQuestion
+        Write-Utf8File $lastTurnPath ""
+        Write-Utf8File $projectCycleEvidencePath "# Compact business evidence memory`n"
+        $cycleRecord = [ordered]@{
+            transitionId = $transitionId
+            transitionedAt = (Get-Date).ToString("o")
+            reason = $transitionReason
+            turnsPerCycle = $ProjectTurnsPerCycle
+            previousCycle = $previousCycle
+            nextCycle = $projectCycleNumber
+            previousBusinessFamily = $previousFamily
+            nextBusinessFamily = $projectScan.primaryBusinessFamily
+            nextPrimaryPath = $projectScan.primaryQuestionCandidateFile
+        }
+        Add-ProjectCycleHistory $projectCycleHistoryPath $cycleRecord
+        $savedExplorationState = [PSCustomObject][ordered]@{
+            schema = "qwen-loop-project-exploration-state/v1"
+            transitionId = $transitionId
+            updatedAt = (Get-Date).ToString("o")
+            cycleIndex = $projectCycleNumber
+            successfulTurnsInCycle = 0
+            turnsPerCycle = $ProjectTurnsPerCycle
+            primaryBusinessFamily = $projectScan.primaryBusinessFamily
+            primaryPath = $projectScan.primaryQuestionCandidateFile
+            nextQuestion = $projectScan.seedQuestion
+        }
+        Write-Utf8File $projectExplorationStatePath ($savedExplorationState | ConvertTo-Json -Depth 20)
+        Clear-ProjectPartialState $partialStatePath
+        [System.IO.File]::Delete([System.IO.Path]::GetFullPath($pendingCycleTransitionPath))
+        $pendingCycleTransition = $null
+        $savedExplorationStateValid = $true
+        $startedFreshCycleThisRun = $true
+        $pendingCycleRecoveryStatus = if ($projectSnapshotReset) { "snapshot-reset-committed" } else { "staged-transition-committed" }
+        $projectExplorationAvoidance = Get-ProjectExplorationAvoidance $projectExplorationHistoryPath
+    }
+
+    $forceFreshProjectSeed = $FreshProjectQuestion -or $startedFreshCycleThisRun
+    if ($forceFreshProjectSeed) {
         Write-Utf8File $nextQuestionPath $projectScan.seedQuestion
         $initialQuestion = [PSCustomObject]@{
             Question = $projectScan.seedQuestion
-            Source = "project-fresh-scan"
+            Source = if ($FreshProjectQuestion) { "project-fresh-scan" } else { "project-cycle-recovery-scan" }
             SeedSource = (Join-Path $WorkDir "project_scan_summary.md")
+        }
+    } elseif ($pendingTurnRecovery -and $pendingTurnRecovery.status -in @("request-uncommitted", "legacy-uncommitted", "legacy-audit-without-state")) {
+        $interruptedQuestion = ""
+        if (Test-Path -LiteralPath $pendingQuestionPath -PathType Leaf) { $interruptedQuestion = (Read-Utf8File $pendingQuestionPath).Trim() }
+        $candidate = New-InterruptedProjectSeedQuestion $projectScan $interruptedQuestion
+        Write-Utf8File $nextQuestionPath $candidate
+        $initialQuestion = [PSCustomObject]@{
+            Question = $candidate
+            Source = "project-interrupted-turn-escape"
+            SeedSource = $pendingQuestionPath
         }
     } else {
         $existingProjectQuestion = ""
@@ -4650,21 +6387,109 @@ try {
         $projectExplorationAvoidance = Get-ProjectExplorationAvoidance $projectExplorationHistoryPath
     }
     } else {
-        $initialQuestion = Initialize-NextQuestion $nextQuestionPath $jsonlPath $transcriptPath $lastTurnPath $SeedFile $QuestionBankFile $QuestionTrack
+        if ($pendingTurnRecovery -and $pendingTurnRecovery.status -in @("request-uncommitted", "legacy-uncommitted", "legacy-audit-without-state")) {
+            $interruptedQuestion = ""
+            if (Test-Path -LiteralPath $pendingQuestionPath -PathType Leaf) {
+                $interruptedQuestion = (Read-Utf8File $pendingQuestionPath).Trim()
+            }
+            $initialQuestion = Select-InterruptedGeneralQuestion $interruptedQuestion $SeedFile $QuestionBankFile $QuestionTrack
+            Write-Utf8File $nextQuestionPath $initialQuestion.Question
+        } else {
+            $initialQuestion = Initialize-NextQuestion $nextQuestionPath $jsonlPath $transcriptPath $lastTurnPath $SeedFile $QuestionBankFile $QuestionTrack
+        }
     }
+} catch {
+    $outerFailure = $_
+    if ($projectSessionLayout -and -not $projectSessionReady -and $sessionIdentity) {
+        try {
+            $sessionIdentity["state"] = "failed"
+            $sessionIdentity["failedAt"] = (Get-Date).ToString("o")
+            $sessionIdentity["failure"] = Get-TextPrefix ([string]$outerFailure.Exception.Message) 1000
+            Write-Utf8File (Join-Path $WorkDir "session_identity.json") ($sessionIdentity | ConvertTo-Json -Depth 10)
+        } catch { }
+    }
+    throw $outerFailure
 } finally {
     if ($projectExplorationLockStream) { $projectExplorationLockStream.Dispose(); $projectExplorationLockStream = $null }
 }
-if ($projectScan -and $FreshProjectQuestion) {
+if ($projectScan -and ($FreshProjectQuestion -or $startedFreshCycleThisRun)) {
     Write-Utf8File $projectCycleEvidencePath "# Compact business evidence memory`n"
 }
 $seedQuestion = $initialQuestion.Question
 $projectQuestionSource = $initialQuestion.Source
+$partialState = $null
+if ($FreshProjectQuestion) {
+    Clear-ProjectPartialState $partialStatePath
+} else {
+    $partialState = Read-ProjectPartialState $partialStatePath
+}
+if ($partialState) {
+    $savedIsProject = ConvertTo-BooleanValue (Get-JsonProperty $partialState "isProject") $false
+    $currentIsProject = ($null -ne $projectScan)
+    $partialCompatible = ($savedIsProject -eq $currentIsProject)
+    if ($partialCompatible -and $currentIsProject) {
+        $savedPartialCycle = [int](Get-JsonProperty $partialState "cycleIndex")
+        $savedPartialTurn = [int](Get-JsonProperty $partialState "turnInCycle")
+        $savedPartialFamily = [string](Get-JsonProperty $partialState "primaryBusinessFamily")
+        $expectedPartialTurn = $projectSuccessfulTurnsInCycle + 1
+        $partialCompatible = ($savedPartialCycle -eq $projectCycleNumber -and $savedPartialTurn -eq $expectedPartialTurn)
+        if ($partialCompatible -and -not [string]::IsNullOrWhiteSpace($savedPartialFamily)) {
+            $partialCompatible = $savedPartialFamily.Equals([string]$projectScan.primaryBusinessFamily, [System.StringComparison]::OrdinalIgnoreCase)
+        }
+    }
+    if (-not $partialCompatible) {
+        Write-Host "PartialState : 현재 mode/cycle/business family와 달라 누적 품질 상태를 분리합니다." -ForegroundColor Yellow
+        Clear-ProjectPartialState $partialStatePath
+        $partialState = $null
+    }
+}
+$projectForceRescan = $false
+if ($projectScan -and $partialState -and (ConvertTo-BooleanValue (Get-JsonProperty $partialState "forceRescan") $false)) {
+    $projectForceRescan = $true
+}
+if ($projectSessionLayout) {
+    # Only a session with a completed initial scan/question is eligible to
+    # count as ready evidence.  A later retention pass classifies strictly
+    # validated, inactive initializing/failed siblings as abandoned and
+    # removes them before applying ready-session count/day/size limits.
+    $sessionIdentity["state"] = "ready"
+    $sessionIdentity["readyAt"] = (Get-Date).ToString("o")
+    Write-Utf8File (Join-Path $WorkDir "session_identity.json") ($sessionIdentity | ConvertTo-Json -Depth 10)
+    $projectSessionReady = $true
+    $projectSessionRetention = Invoke-ProjectSessionRetention $projectSessionLayout
+}
 $startupCleanup = Invoke-WorkDirCleanup $WorkDir $transcriptPath $jsonlPath $errorLogPath
 
 $systemPrompt = Build-SettingsAwareSystemPrompt $settings $providerInfo
 $runtimeRequestShape = Build-RequestBody $settings $providerInfo $systemPrompt "runtime-shape-preview" $networkIdentity
+$runtimeRequestHeaders = Build-ClientHeaders $providerInfo $settings $networkIdentity 0
 $effectiveRequestStreaming = ConvertTo-BooleanValue (Get-JsonProperty $runtimeRequestShape "stream") (-not [bool]$NonStreaming)
+$effectiveUserAgent = [string](Get-JsonProperty $runtimeRequestHeaders "User-Agent")
+$effectiveContentType = [string](Get-JsonProperty $runtimeRequestHeaders "Content-Type")
+$summaryGenerationConfig = Get-GenerationConfig $providerInfo
+$summaryCustomHeaders = Get-JsonProperty $summaryGenerationConfig "customHeaders"
+$summarySamplingParams = Get-JsonProperty $summaryGenerationConfig "samplingParams"
+$summaryExtraBody = Get-JsonProperty $summaryGenerationConfig "extra_body"
+$summarySamplingParamNames = @((Get-ObjectProperties $summarySamplingParams) | Where-Object { $null -ne $_.Value } | ForEach-Object { ([string]$_.Name).ToLowerInvariant() })
+$summaryExtraBodyNames = @((Get-ObjectProperties $summaryExtraBody) | Where-Object { $null -ne $_.Value } | ForEach-Object { ([string]$_.Name).ToLowerInvariant() })
+$effectiveTokenLimitKey = if ($null -ne (Get-JsonProperty $runtimeRequestShape "max_completion_tokens")) { "max_completion_tokens" } elseif ($null -ne (Get-JsonProperty $runtimeRequestShape "max_tokens")) { "max_tokens" } else { "none" }
+$effectiveMaxTokensPolicy = if (-not $CompatBody -and $summaryExtraBodyNames -contains $effectiveTokenLimitKey) {
+    "settings.generationConfig.extra_body.$effectiveTokenLimitKey"
+} elseif (-not $CompatBody -and $summarySamplingParamNames -contains $effectiveTokenLimitKey) {
+    "settings.generationConfig.samplingParams.$effectiveTokenLimitKey"
+} elseif ($UseSchedulerSamplingDefaults) {
+    "scheduler-argument.$effectiveTokenLimitKey"
+} else {
+    "qwen-code-token-limit.$effectiveTokenLimitKey"
+}
+$customUserAgentConfigured = $null -ne (Get-JsonProperty $summaryCustomHeaders "User-Agent")
+$effectiveUserAgentSource = if ($customUserAgentConfigured) { "settings.generationConfig.customHeaders.User-Agent" } else { Get-QwenCodeVersionSource }
+$customContentTypeConfigured = $null -ne (Get-JsonProperty $summaryCustomHeaders "Content-Type")
+$effectiveContentTypeSource = if ($customContentTypeConfigured) { "settings.generationConfig.customHeaders.Content-Type" } else { "scheduler-default.application/json" }
+$summaryKnownSecrets = @()
+if ($null -ne $providerInfo.ApiKey) { $summaryKnownSecrets += ,[string]$providerInfo.ApiKey }
+$loggedEffectiveUserAgent = if ($MaskSensitiveLogs -and -not $LogSensitive) { Protect-LoggedString $effectiveUserAgent $summaryKnownSecrets } else { $effectiveUserAgent }
+$loggedEffectiveContentType = if ($MaskSensitiveLogs -and -not $LogSensitive) { Protect-LoggedString $effectiveContentType $summaryKnownSecrets } else { $effectiveContentType }
 
 Write-StartupBanner
 Write-Host "=== Runtime Summary: SETTINGS-FIRST ===" -ForegroundColor Green
@@ -4681,33 +6506,47 @@ else { Write-Host "Authorization: sent exactly from $($providerInfo.ApiKeySource
 if (Test-QuotedEmptySecret $providerInfo.ApiKey) {
     Write-Host "WARNING      : API key value is literal empty quotes. OS env or .env should override it for real calls." -ForegroundColor Yellow
 }
-if ($LoopDiagnosticHeaders) {
+if ($LoopDiagnosticHeaders -and -not $NoClientIdentityHeaders) {
     Write-Host "ClientHost   : $($networkIdentity.computerName) / $($networkIdentity.userDomain)\$($networkIdentity.userName)"
     Write-Host "ClientIP     : $($networkIdentity.localAddress):$($networkIdentity.localPort)"
+} elseif ($LoopDiagnosticHeaders) {
+    Write-Host "ClientIdent  : suppressed by -NoClientIdentityHeaders; generic loop diagnostics remain enabled"
 } else {
     Write-Host "ClientIdent  : disabled; use -LoopDiagnosticHeaders only when receiver-side tracing needs it"
 }
 Write-Host "CompatBody   : $CompatBody"
 Write-Host "WireMode     : Qwen Code OpenAI SDK-like headers/body"
+Write-Host "UserAgent    : $loggedEffectiveUserAgent ($effectiveUserAgentSource)"
 Write-Host "Stream       : $effectiveRequestStreaming (effective after settings overrides; switch requested=$(-not [bool]$NonStreaming))"
 Write-Host "Retry        : max $MaxRetries, backoff $RetryInitialDelaySeconds-$RetryMaxDelaySeconds sec"
 Write-Host "TokenUse     : short < $TokenLowThreshold, extended >= $TokenRichThreshold output tokens (diagnostic only)"
 Write-Host "HeaderLog    : $(if ($MaskSensitiveLogs -and -not $LogSensitive) { 'masked' } else { 'unmasked' })"
 Write-Host "QuestionSrc  : $($initialQuestion.Source)"
+if ($pendingTurnRecovery -and $pendingTurnRecovery.status -ne "none") { Write-Host "TurnRecovery : $($pendingTurnRecovery.status)" }
+if ($pendingCycleRecoveryStatus -ne "none") { Write-Host "CycleRecovery: $pendingCycleRecoveryStatus" }
 if ($projectScan) {
     Write-Host "ProjectRoot  : $($projectScan.root)"
     Write-Host "ProjectScan  : $($projectScan.scannedFileCount) files scanned, $($projectScan.selectedFileCount) key files selected"
     Write-Host "ProjectStart : $(if ($NewProjectSession) { 'isolated timestamp session; project exploration ledger avoids recent business families' } elseif ($FreshProjectQuestion) { 'fresh scan question; saved continuation is ignored on startup' } else { 'legacy continuation from saved next_question when available' })"
     Write-Host "ProjectCycle : $ProjectTurnsPerCycle successful turns; then fresh scan / new business slice"
-    Write-Host "OutputTarget : $ProjectTargetOutputTokens tokens or $ProjectTargetAnswerChars chars as separate diagnostics"
+    Write-Host "QualityGate  : $(if ($NoProjectQualityGate) { 'disabled' } else { "$ProjectTargetOutputTokens cumulative visible tokens OR $ProjectTargetAnswerChars cumulative chars, plus $ProjectQualityMinEvidenceSignals evidence signals; max continuation=$ProjectMaxContinuationAttempts" })"
 }
 if ($projectSessionLayout) {
     Write-Host "SessionId    : $($projectSessionLayout.SessionId)"
     Write-Host "ProjectIdent : $($projectSessionLayout.Identity)"
-    $retentionActionCount = if ($projectSessionRetention) { @($projectSessionRetention.actions).Count } else { 0 }
+    $startupCleanupActionCount = if ($projectSessionStartupCleanup) { @($projectSessionStartupCleanup.actions).Count } else { 0 }
+    $readyRetentionActionCount = if ($projectSessionRetention) { @($projectSessionRetention.actions).Count } else { 0 }
+    $retentionActionCount = $startupCleanupActionCount + $readyRetentionActionCount
     Write-Host "SessionKeep  : count=$ProjectSessionKeepCount, days=$ProjectSessionKeepDays, total=${ProjectSessionMaxTotalMB}MB; removed=$retentionActionCount"
+    if ($projectSessionRetention -and $projectSessionRetention.storage) {
+        $storage = $projectSessionRetention.storage
+        Write-Host "SessionStore : ready=$($storage.managedSessionCount)/$(Format-ByteSize ([int64]$storage.managedSessionBytes)); active-ready=$($storage.activeSessionCount); abandoned=$($storage.abandonedSessionCount)/$(Format-ByteSize ([int64]$storage.abandonedSessionBytes)); active-abandoned=$($storage.activeAbandonedSessionCount); unrecognized=$($storage.unrecognizedSessionCount)/$(Format-ByteSize ([int64]$storage.unrecognizedSessionBytes)); other-projects=$($storage.otherProjectIdentityCount)/$(Format-ByteSize ([int64]$storage.otherProjectIdentityBytes))"
+    }
     if ($projectSessionRetention -and -not [string]::IsNullOrWhiteSpace([string]$projectSessionRetention.warning)) {
         Write-Host "SessionWarn  : $($projectSessionRetention.warning)" -ForegroundColor Yellow
+    }
+    if ($projectSessionStartupCleanup -and -not [string]::IsNullOrWhiteSpace([string]$projectSessionStartupCleanup.warning)) {
+        Write-Host "SessionWarn  : $($projectSessionStartupCleanup.warning)" -ForegroundColor Yellow
     }
 }
 $answerPreviewText = if ($NoAnswerPreview) { "disabled" } else { "$AnswerPreviewLines lines / $AnswerPreviewChars chars" }
@@ -4730,18 +6569,41 @@ Write-Host "==============================================" -ForegroundColor Gre
 $settingsSummary = [ordered]@{
     settingsPath = $SettingsPath
     settingsPathPolicy = "runtime settings file path used by this process; not included in API request body"
+    settingsCoverage = [ordered]@{
+        env = [ordered]@{ status = "applied"; usage = "API key fallback after OS environment and .env candidates; values are not bulk-forwarded" }
+        modelProviders = [ordered]@{ status = "applied"; usage = "provider/model/baseUrl/envKey/generationConfig selection" }
+        generationConfig = if ($CompatBody) {
+            [ordered]@{ status = "partially-applied"; usage = "timeout and customHeaders are applied; samplingParams/extra_body are intentionally omitted by -CompatBody" }
+        } else {
+            [ordered]@{ status = "applied"; usage = "timeout, customHeaders, samplingParams, extra_body and effective stream/body shape" }
+        }
+        general = [ordered]@{ status = "partially-applied"; usage = "outputLanguage is included in the system prompt; interactive CLI-only general fields are not applicable" }
+        permissions = [ordered]@{ status = "prompt-only"; usage = "permissions.allow is supplied as scope context; this scheduler does not execute Qwen tools" }
+        security = [ordered]@{ status = "applied"; usage = "security.auth.selectedType selects modelProviders.<type>; unrelated interactive auth UI state is not applicable" }
+        ui = [ordered]@{ status = "not-applicable"; usage = "terminal status-line/feedback preferences belong to interactive Qwen Code UI and are preserved but not emulated" }
+        '$version' = [ordered]@{ status = "diagnostic-only"; usage = "settings schema version; never treated as the Qwen Code package version" }
+    }
     providerType = $providerInfo.Type
     providerName = $providerInfo.ProviderName
     providerId = $providerInfo.ProviderId
     model = $providerInfo.ModelId
     baseUrl = $providerInfo.BaseUrl
+    settingsSchemaVersion = Get-JsonProperty $settings '$version'
     envKey = $providerInfo.EnvKey
     apiKeySource = $providerInfo.ApiKeySource
     authorizationSent = ($null -ne $providerInfo.ApiKey)
     apiKeyLogged = if ($MaskSensitiveLogs -and -not $LogSensitive) { Mask-Secret $providerInfo.ApiKey } else { $providerInfo.ApiKey }
     apiKeyLooksLikeQuotedEmpty = (Test-QuotedEmptySecret $providerInfo.ApiKey)
-    clientNetworkIdentity = if ($LoopDiagnosticHeaders) { ConvertTo-PlainObject $networkIdentity } else { $null }
-    clientNetworkIdentityPolicy = if ($LoopDiagnosticHeaders) { "collected-and-sent-as-X-Qwen-Loop-diagnostic-headers" } else { "not-collected-or-sent-by-default" }
+    pendingTurnRecovery = ConvertTo-PlainObject $pendingTurnRecovery
+    pendingCycleRecoveryStatus = $pendingCycleRecoveryStatus
+    clientNetworkIdentity = if ($LoopDiagnosticHeaders -and -not $NoClientIdentityHeaders) { ConvertTo-PlainObject $networkIdentity } else { $null }
+    clientNetworkIdentityPolicy = if ($LoopDiagnosticHeaders -and -not $NoClientIdentityHeaders) {
+        "collected-and-sent-as-X-Qwen-Loop-client-identity-headers"
+    } elseif ($LoopDiagnosticHeaders) {
+        "not-collected-or-sent; generic-X-Qwen-Loop-diagnostic-headers-only"
+    } else {
+        "not-collected-or-sent-by-default"
+    }
     compatBody = [bool]$CompatBody
     stream = $effectiveRequestStreaming
     streamRequestedBySwitch = (-not [bool]$NonStreaming)
@@ -4764,6 +6626,9 @@ $settingsSummary = [ordered]@{
         extended = "at or above richThreshold"
         projectTargetOutputTokens = $ProjectTargetOutputTokens
         projectTargetAnswerChars = $ProjectTargetAnswerChars
+        projectQualityMinEvidenceSignals = $ProjectQualityMinEvidenceSignals
+        projectMaxContinuationAttempts = $ProjectMaxContinuationAttempts
+        projectQualityGateDisabled = [bool]$NoProjectQualityGate
         note = "finish_reason and AnswerDepth distinguish model stop, length truncation, visible output, reasoning tokens, and target progress."
     }
     bannerEnabled = (-not [bool]$NoBanner)
@@ -4816,6 +6681,8 @@ $settingsSummary = [ordered]@{
             sessionDir = $projectSessionLayout.SessionDir
             projectBase = $projectSessionLayout.ProjectBase
             explorationHistory = $projectSessionLayout.ExplorationHistoryPath
+            ready = $projectSessionReady
+            startupAbandonedCleanup = ConvertTo-PlainObject $projectSessionStartupCleanup
             retention = ConvertTo-PlainObject $projectSessionRetention
             keepCount = $ProjectSessionKeepCount
             keepDays = $ProjectSessionKeepDays
@@ -4838,6 +6705,11 @@ $settingsSummary = [ordered]@{
             maxFiles = $ProjectScanMaxFiles
             maxFileChars = $ProjectScanMaxFileChars
             maxTotalChars = $ProjectScanMaxTotalChars
+            candidateMaxFiles = $ProjectCandidateMaxFiles
+            candidateMaxDirectories = $ProjectCandidateMaxDirectories
+            contentScanMaxFiles = $ProjectContentScanMaxFiles
+            maxSourceFileMB = $ProjectMaxSourceFileMB
+            candidateIndex = ConvertTo-PlainObject $projectScan.candidateIndex
             summaryMarkdown = (Join-Path $WorkDir "project_scan_summary.md")
             summaryJson = (Join-Path $WorkDir "project_scan_summary.json")
         }
@@ -4846,14 +6718,24 @@ $settingsSummary = [ordered]@{
     endpointFallbacks = [bool]$EndpointFallbacks
     endpoints = @(Get-EndpointCandidates $providerInfo.BaseUrl)
     qwenCompat = [ordered]@{
-        userAgent = (Get-PlatformUserAgent)
+        userAgent = $loggedEffectiveUserAgent
+        userAgentSource = $effectiveUserAgentSource
+        platformUserAgentDefault = (Get-PlatformUserAgent)
+        userAgentVersionSource = (Get-QwenCodeVersionSource)
+        contentType = $loggedEffectiveContentType
+        contentTypeSource = $effectiveContentTypeSource
+        settingsVersionIsNotQwenCodeVersion = $true
         openAISdkVersion = $OpenAISdkVersion
         nodeRuntimeVersion = (Get-NodeLikeRuntimeVersion)
-        generationConfig = ConvertTo-PlainObject (Get-GenerationConfig $providerInfo)
-        customHeaderKeys = @((Get-ObjectProperties (Get-JsonProperty (Get-GenerationConfig $providerInfo) "customHeaders")) | ForEach-Object { $_.Name })
-        samplingParamKeys = @((Get-ObjectProperties (Get-JsonProperty (Get-GenerationConfig $providerInfo) "samplingParams")) | ForEach-Object { $_.Name })
-        extraBodyKeys = @((Get-ObjectProperties (Get-JsonProperty (Get-GenerationConfig $providerInfo) "extra_body")) | ForEach-Object { $_.Name })
-        maxTokensPolicy = if ($UseSchedulerSamplingDefaults) { "scheduler-argument" } elseif ((Get-JsonProperty (Get-GenerationConfig $providerInfo) "samplingParams")) { "settings.generationConfig.samplingParams" } else { "qwen-code-token-limit" }
+        generationConfig = Get-LoggedObject $summaryGenerationConfig $providerInfo
+        customHeaderKeys = @((Get-ObjectProperties $summaryCustomHeaders) | ForEach-Object { $_.Name })
+        samplingParamKeys = @((Get-ObjectProperties $summarySamplingParams) | ForEach-Object { $_.Name })
+        extraBodyKeys = @((Get-ObjectProperties $summaryExtraBody) | ForEach-Object { $_.Name })
+        samplingParamsApplied = (-not [bool]$CompatBody)
+        extraBodyApplied = (-not [bool]$CompatBody)
+        effectiveTokenLimitKey = $effectiveTokenLimitKey
+        effectiveTokenLimit = if ($effectiveTokenLimitKey -ne "none") { Get-JsonProperty $runtimeRequestShape $effectiveTokenLimitKey } else { $null }
+        maxTokensPolicy = $effectiveMaxTokensPolicy
         bodyPolicy = if ($CompatBody) { "standard-openai-only" } else { "qwen-code-compatible-streaming-samplingParams-extra_body" }
         note = "Default wire mode follows Qwen Code's OpenAI-compatible provider path more closely: OpenAI SDK stainless headers, QwenCode user-agent, streaming with include_usage, no qwen-loop diagnostic headers, exact baseUrl/chat/completions endpoint, customHeaders to headers, samplingParams and extra_body to request body."
     }
@@ -4864,10 +6746,11 @@ if ($DryRun) {
     $dryRunPromptParts = New-Object System.Collections.Generic.List[string]
     $dryRunPromptParts.Add("현재 루프 질문:`n$seedQuestion") | Out-Null
     if ($projectScan) {
-        if (-not $NewProjectSession) {
-            $dryRunQuestionHistory = Get-RecentQuestionHistoryFromTree (Get-LoopDataHistoryRoot $WorkDir) $jsonlPath 12
-            if ([string]::IsNullOrWhiteSpace($dryRunQuestionHistory)) { $dryRunQuestionHistory = "(none)" }
-            $dryRunPromptParts.Add("기존 qwen-loop-data 최근 질문(중복 회피용):`n$dryRunQuestionHistory") | Out-Null
+        if (-not $startedFreshCycleThisRun -and -not $FreshProjectQuestion) {
+            $dryRunQuestionHistory = Get-RecentQuestionHistory $jsonlPath 8 $projectCycleNumber
+            if (-not [string]::IsNullOrWhiteSpace($dryRunQuestionHistory)) {
+                $dryRunPromptParts.Add("현재 project/cycle 최근 질문(중복 회피용):`n$dryRunQuestionHistory") | Out-Null
+            }
         }
         $dryRunDynamicProjectContext = Build-DynamicProjectContext $projectScan.root $seedQuestion "" ([string]$projectScan.primaryBusinessFamily)
         Write-Utf8File $dynamicProjectContextPath ($dryRunDynamicProjectContext | ConvertTo-Json -Depth 50)
@@ -4880,8 +6763,8 @@ if ($DryRun) {
     $dryRunPrompt = ($dryRunPromptParts -join "`n`n")
     $dryRunHeaders = Build-ClientHeaders $providerInfo $settings $networkIdentity
     $dryRunBody = Build-RequestBody $settings $providerInfo $systemPrompt $dryRunPrompt $networkIdentity
-    Write-Utf8File (Join-Path $WorkDir "dry_run_request_headers.json") ((Get-LoggedHeaders $dryRunHeaders) | ConvertTo-Json -Depth 30)
-    Write-Utf8File (Join-Path $WorkDir "dry_run_request_body.json") ($dryRunBody | ConvertTo-Json -Depth 80 -Compress)
+    Write-Utf8File (Join-Path $WorkDir "dry_run_request_headers.json") ((Get-LoggedHeaders $dryRunHeaders $providerInfo) | ConvertTo-Json -Depth 30)
+    Write-Utf8File (Join-Path $WorkDir "dry_run_request_body.json") ((Get-LoggedObject $dryRunBody $providerInfo) | ConvertTo-Json -Depth 80 -Compress)
     if ($LogSensitive) { Write-Utf8File (Join-Path $WorkDir "dry_run_request_headers_sensitive.json") ($dryRunHeaders | ConvertTo-Json -Depth 30) }
 
     Write-Host "DryRun mode: API 호출 없이 settings.json 활용 내역만 확인했습니다." -ForegroundColor Yellow
@@ -4897,7 +6780,13 @@ if ($DryRun) {
 }
 
 $runCount = 0
-$nextRunSequence = Get-NextRunHistorySequence $runHistoryJsonlPath
+$nextRunSequence = Get-NextDurableSequence $runHistoryJsonlPath $jsonlPath $pendingTurnPath
+if ($startupPendingSequenceFloor -ge $nextRunSequence) { $nextRunSequence = [int64]$startupPendingSequenceFloor + 1 }
+$hadRunError = $false
+$hadAbandonedTurn = $false
+$hasUnresolvedPartial = ($null -ne $partialState -and -not (ConvertTo-BooleanValue (Get-JsonProperty $partialState "forceRescan") $false))
+$fatalStateCommitError = $false
+$processExitCode = 0
 while ($true) {
     $runCount++
     $runSeq = $nextRunSequence
@@ -4917,12 +6806,20 @@ while ($true) {
     $nextQuestionMarkerFound = $false
     $nextQuestionMarkerPresent = $false
     $partialReason = ""
+    $qualityFacts = $null
+    $logicalOriginalQuestion = ""
+    $continuationAttempt = 0
+    $nextPartialState = $null
+    $turnCommitStarted = $false
+    $cycleTransitionStarted = $false
     $questionSource = $projectQuestionSource
     $projectCycleForRun = if ($projectScan) { $projectCycleNumber } else { $null }
     $projectTurnInCycle = if ($projectScan) { $projectSuccessfulTurnsInCycle + 1 } else { $null }
     $projectPhase = if ($projectScan) { Get-ProjectExplorationPhase $projectTurnInCycle $ProjectTurnsPerCycle } else { $null }
     try {
-        if ($NewProjectSession -and $projectScan -and $projectSuccessfulTurnsInCycle -ge $ProjectTurnsPerCycle) {
+        $scheduledCycleRescan = $projectScan -and $projectSuccessfulTurnsInCycle -ge $ProjectTurnsPerCycle
+        if ($projectScan -and ($scheduledCycleRescan -or $projectForceRescan)) {
+            $transitionReason = if ($projectForceRescan) { "continuation-limit" } else { "successful-turn-limit" }
             $previousFamily = [string]$projectScan.primaryBusinessFamily
             $nextCycle = $projectCycleNumber + 1
             $cycleExplorationLock = Open-ExclusiveFileLock $projectExplorationLockPath 30000
@@ -4930,35 +6827,81 @@ while ($true) {
                 throw "다른 실행이 이 프로젝트의 다음 업무 영역을 선택하고 있습니다. 중복 family 예약을 피하기 위해 이번 cycle 전환을 보류합니다: $projectExplorationLockPath"
             }
             try {
+                $cycleTransitionStarted = $true
+                $transitionId = [Guid]::NewGuid().ToString("N")
+                $pendingTransition = [ordered]@{
+                    schema = "qwen-loop-cycle-transition/v1"
+                    transitionId = $transitionId
+                    stagedAt = (Get-Date).ToString("o")
+                    reason = $transitionReason
+                    previousCycle = $projectCycleNumber
+                    nextCycle = $nextCycle
+                    previousBusinessFamily = $previousFamily
+                }
+                Write-Utf8File $pendingCycleTransitionPath ($pendingTransition | ConvertTo-Json -Depth 10)
+                if ($transitionReason -eq "continuation-limit") {
+                    $abandonedSessionId = if ($projectSessionLayout) { [string]$projectSessionLayout.SessionId } else { "legacy-p$PID" }
+                    Add-ProjectExplorationHistory $projectExplorationHistoryPath $projectScan $abandonedSessionId "abandoned-before-rescan" "${transitionId}:abandoned"
+                }
                 $projectExplorationAvoidance = Get-ProjectExplorationAvoidance $projectExplorationHistoryPath
                 $nextScan = New-ProjectScanContext $ProjectRoot $projectExplorationAvoidance $nextCycle
                 Write-ProjectScanFiles $nextScan $WorkDir
-                $projectScan = $nextScan
-                $projectContext = $projectScan.promptContext
-                $seedQuestion = $projectScan.seedQuestion
-                Write-Utf8File $nextQuestionPath $seedQuestion
+                $nextSeedQuestion = [string]$nextScan.seedQuestion
+                $pendingTransition["nextBusinessFamily"] = $nextScan.primaryBusinessFamily
+                $pendingTransition["nextPrimaryPath"] = $nextScan.primaryQuestionCandidateFile
+                $pendingTransition["nextSeedQuestion"] = $nextSeedQuestion
+                Write-Utf8File $pendingCycleTransitionPath ($pendingTransition | ConvertTo-Json -Depth 20)
+                $sessionHistoryId = if ($projectSessionLayout) { [string]$projectSessionLayout.SessionId } else { "legacy-p$PID" }
+                Add-ProjectExplorationHistory $projectExplorationHistoryPath $nextScan $sessionHistoryId $transitionReason "${transitionId}:selected"
+                Write-Utf8File $nextQuestionPath $nextSeedQuestion
                 Write-Utf8File $lastTurnPath ""
                 Write-Utf8File $projectCycleEvidencePath "# Compact business evidence memory`n"
+                $cycleRecord = [ordered]@{
+                    transitionId = $transitionId
+                    transitionedAt = (Get-Date).ToString("o")
+                    reason = $transitionReason
+                    turnsPerCycle = $ProjectTurnsPerCycle
+                    previousCycle = ($nextCycle - 1)
+                    nextCycle = $nextCycle
+                    previousBusinessFamily = $previousFamily
+                    nextBusinessFamily = $nextScan.primaryBusinessFamily
+                    nextPrimaryPath = $nextScan.primaryQuestionCandidateFile
+                }
+                Add-ProjectCycleHistory $projectCycleHistoryPath $cycleRecord
+                $committedExplorationState = [ordered]@{
+                    schema = "qwen-loop-project-exploration-state/v1"
+                    transitionId = $transitionId
+                    updatedAt = (Get-Date).ToString("o")
+                    cycleIndex = $nextCycle
+                    successfulTurnsInCycle = 0
+                    turnsPerCycle = $ProjectTurnsPerCycle
+                    primaryBusinessFamily = $nextScan.primaryBusinessFamily
+                    primaryPath = $nextScan.primaryQuestionCandidateFile
+                    nextQuestion = $nextSeedQuestion
+                }
+                Write-Utf8File $projectExplorationStatePath ($committedExplorationState | ConvertTo-Json -Depth 20)
+
+                # Commit in-memory state only after every persistent artifact was
+                # successfully written. A surviving marker resumes this exact
+                # transitionId/nextCycle on the next process start.
+                $projectScan = $nextScan
+                $projectContext = $nextScan.promptContext
+                $seedQuestion = $nextSeedQuestion
                 $projectCycleNumber = $nextCycle
                 $projectSuccessfulTurnsInCycle = 0
-                $projectQuestionSource = "cycle-rescan"
+                $projectQuestionSource = if ($transitionReason -eq "continuation-limit") { "continuation-limit-rescan" } else { "cycle-rescan" }
                 $questionSource = $projectQuestionSource
-                Add-ProjectExplorationHistory $projectExplorationHistoryPath $projectScan $projectSessionLayout.SessionId "successful-turn-limit"
+                $partialState = $null
+                Clear-ProjectPartialState $partialStatePath
+                $projectForceRescan = $false
+                $hadAbandonedTurn = $false
+                $startedFreshCycleThisRun = $true
+                [System.IO.File]::Delete([System.IO.Path]::GetFullPath($pendingCycleTransitionPath))
+                $cycleTransitionStarted = $false
             } finally {
                 if ($cycleExplorationLock) { $cycleExplorationLock.Dispose() }
             }
-            $cycleRecord = [ordered]@{
-                transitionedAt = (Get-Date).ToString("o")
-                reason = "successful-turn-limit"
-                turnsPerCycle = $ProjectTurnsPerCycle
-                previousCycle = ($nextCycle - 1)
-                nextCycle = $nextCycle
-                previousBusinessFamily = $previousFamily
-                nextBusinessFamily = $projectScan.primaryBusinessFamily
-                nextPrimaryPath = $projectScan.primaryQuestionCandidateFile
-            }
-            Append-Utf8File $projectCycleHistoryPath (($cycleRecord | ConvertTo-Json -Compress -Depth 20) + "`n")
-            Write-Host "`nProjectCycle : $($nextCycle - 1) completed; fresh scan selected cycle $nextCycle / $($projectScan.primaryBusinessFamily)" -ForegroundColor Magenta
+            Write-Host "`nProjectCycle : $transitionReason; fresh scan selected cycle $nextCycle / $($projectScan.primaryBusinessFamily)" -ForegroundColor Magenta
         }
 
         $projectCycleForRun = if ($projectScan) { $projectCycleNumber } else { $null }
@@ -4966,22 +6909,42 @@ while ($true) {
         $projectPhase = if ($projectScan) { Get-ProjectExplorationPhase $projectTurnInCycle $ProjectTurnsPerCycle } else { $null }
         $question = (Read-Utf8File $nextQuestionPath).Trim()
         if ([string]::IsNullOrWhiteSpace($question)) { $question = $seedQuestion }
+        $logicalOriginalQuestion = $question
+        if ($partialState -and -not (ConvertTo-BooleanValue (Get-JsonProperty $partialState "forceRescan") $false)) {
+            $queuedQuestion = [string](Get-JsonProperty $partialState "queuedQuestion")
+            if ([string]::IsNullOrWhiteSpace($queuedQuestion) -or (Test-SameQuestionText $queuedQuestion $question)) {
+                $savedOriginalQuestion = [string](Get-JsonProperty $partialState "originalQuestion")
+                if (-not [string]::IsNullOrWhiteSpace($savedOriginalQuestion)) { $logicalOriginalQuestion = $savedOriginalQuestion }
+            } else {
+                # next_question was intentionally changed by the user or another
+                # recovery path; do not attach stale cumulative quality state.
+                Clear-ProjectPartialState $partialStatePath
+                $partialState = $null
+                $hasUnresolvedPartial = $false
+            }
+        }
+        $pendingTurn = [ordered]@{
+            schema = "qwen-loop-pending-turn/v1"
+            seq = $runSeq
+            startedAt = $started.ToString("o")
+            question = $question
+            cycleIndex = $projectCycleForRun
+            turnInCycle = $projectTurnInCycle
+        }
+        Write-Utf8File $pendingTurnPath ($pendingTurn | ConvertTo-Json -Depth 10)
+        # Keep the plain marker for human diagnostics and compatibility with
+        # pre-v1 interrupted project-seed handling.
         Write-Utf8File $pendingQuestionPath $question
 
         $contextBundle = Read-ContextBundle $ContextListFile $MaxContextChars
         $lastTurn = ""
-        $skipStoredProjectTurn = $projectScan -and (($NewProjectSession -and $projectTurnInCycle -eq 1) -or ($FreshProjectQuestion -and $runCount -eq 1))
+        $skipStoredProjectTurn = $projectScan -and ($startedFreshCycleThisRun -or ($NewProjectSession -and $projectTurnInCycle -eq 1) -or ($FreshProjectQuestion -and $runCount -eq 1))
         if ((-not $skipStoredProjectTurn) -and (Test-Path -LiteralPath $lastTurnPath)) { $lastTurn = Get-TextPrefix ((Read-Utf8File $lastTurnPath).Trim()) $LastTurnChars }
         $dynamicProjectContext = $null
-        $questionHistory = if ($NewProjectSession -and $projectScan) { Get-RecentQuestionHistory $jsonlPath ([Math]::Min(8, $projectSuccessfulTurnsInCycle)) } else { Get-RecentQuestionHistory $jsonlPath 8 }
+        $questionHistory = if ($projectScan) {
+            if ($startedFreshCycleThisRun) { "" } else { Get-RecentQuestionHistory $jsonlPath 8 $projectCycleForRun }
+        } else { Get-RecentQuestionHistory $jsonlPath 8 }
         if ($projectScan) {
-            if (-not $NewProjectSession) {
-                $globalQuestionHistory = Get-RecentQuestionHistoryFromTree (Get-LoopDataHistoryRoot $WorkDir) $jsonlPath 12
-                if (-not [string]::IsNullOrWhiteSpace($globalQuestionHistory)) {
-                    if (-not [string]::IsNullOrWhiteSpace($questionHistory)) { $questionHistory += "`n" }
-                    $questionHistory += "기존 qwen-loop-data 최근 질문(중복 회피용):`n$globalQuestionHistory"
-                }
-            }
             $questionHistory = Get-TextSuffix $questionHistory 6000
             $dynamicProjectContext = Build-DynamicProjectContext $projectScan.root $question $lastTurn ([string]$projectScan.primaryBusinessFamily)
             Write-Utf8File $dynamicProjectContextPath ($dynamicProjectContext | ConvertTo-Json -Depth 50)
@@ -5009,6 +6972,15 @@ while ($true) {
         if ($projectScan -and (Test-Path -LiteralPath $projectCycleEvidencePath -PathType Leaf)) {
             $cycleEvidenceMemory = Get-TextSuffix (Read-Utf8File $projectCycleEvidencePath) 9000
         }
+        $partialEvidenceMemory = ""
+        if ($partialState) {
+            $partialEvidenceItems = @(Get-JsonProperty $partialState "evidenceExcerpts")
+            if ($partialEvidenceItems.Count -eq 0) {
+                $legacyPartialEvidence = [string](Get-JsonProperty $partialState "evidenceExcerpt")
+                if (-not [string]::IsNullOrWhiteSpace($legacyPartialEvidence)) { $partialEvidenceItems = @($legacyPartialEvidence) }
+            }
+            $partialEvidenceMemory = Get-TextSuffix (($partialEvidenceItems | ForEach-Object { [string]$_ }) -join "`n`n--- previous partial ---`n") 6500
+        }
 
         $userPrompt = @"
 현재 루프 질문:
@@ -5023,6 +6995,9 @@ $questionHistory
 현재 cycle의 압축 업무 근거 메모리(앞선 turn의 결론을 5번째 보고서까지 유지):
 $cycleEvidenceMemory
 
+현재 질문의 이전 partial 응답 누적 근거(조각을 반복하지 말고 하나의 완결된 분석으로 통합):
+$partialEvidenceMemory
+
 공통 컨텍스트:
 $contextBundle
 
@@ -5034,6 +7009,7 @@ $projectPhaseSection
 위 질문에 답변해줘.
 현재 업무 질문을 충분히 분석한 뒤, 마지막 비어 있지 않은 한 줄에만 NEXT_QUESTION: 으로 후속 질문을 작성해줘.
 파일의 Java 기술 구조를 주제로 삼지 말고 업무 목적, actor/trigger/result, 업무 용어·상태, Mapper table/column과 VO field 의미, 정상 데이터 lineage와 downstream을 근거로 복원해줘. 연결 파일은 미확인 업무 가설을 검증하는 증거로 사용하고, 트랜잭션·패턴·성능·보안은 업무 영향이 있는 경우 마지막 15~20%에만 다뤄줘.
+이전 partial 응답이 있다면 그 근거를 이어 붙인 조각 답변이 아니라, 현재 답변만 읽어도 결론과 근거가 연결되는 자기완결형 통합 답변으로 마무리해줘.
 "@
 
         Write-Host "`n[$($started.ToString('yyyy-MM-dd HH:mm:ss'))] RUN #$runCount QUESTION:" -ForegroundColor Green
@@ -5050,19 +7026,97 @@ $projectPhaseSection
         $nextQuestionMarkerFound = [bool]$nextQuestionExtraction.explicitMarkerFound
         $nextQuestionMarkerPresent = ([int]$nextQuestionExtraction.markerLineIndex -ge 0)
         $finishReason = ([string]$chatResult.FinishReason).ToLowerInvariant()
-        $isIncompleteResponse = ($finishReason -in @("length", "content_filter")) -or (-not $nextQuestionMarkerFound)
-        if ($isIncompleteResponse) {
-            $nextQuestion = New-PartialResponseContinuationQuestion $question $finishReason $nextQuestionMarkerFound
-            $partialReason = if ($finishReason -in @("length", "content_filter")) { "finish_reason=$finishReason" } elseif ($nextQuestionMarkerPresent) { "next-question-marker-not-final" } else { "missing-next-question-marker" }
+        $unterminatedStreamingResponse = ([string]$chatResult.ResponseParseMode -eq "sse") -and (-not (ConvertTo-BooleanValue $chatResult.StreamCompleted $false))
+        $protocolIncomplete = ($finishReason -in @("length", "content_filter")) -or $unterminatedStreamingResponse -or (-not $nextQuestionMarkerFound)
+        if ($projectScan) {
+            $qualityFacts = Get-ProjectAnswerQuality $answer $answerDepth $partialState
+        }
+        $qualityIncomplete = $projectScan -and -not [bool]$qualityFacts.adequate
+        $needsContinuation = $protocolIncomplete -or $qualityIncomplete
+        if ($finishReason -in @("length", "content_filter")) {
+            $partialReason = "finish_reason=$finishReason"
+        } elseif ($unterminatedStreamingResponse) {
+            $partialReason = "unterminated-sse"
+        } elseif (-not $nextQuestionMarkerFound) {
+            $partialReason = if ($nextQuestionMarkerPresent) { "next-question-marker-not-final" } else { "missing-next-question-marker" }
+        } elseif ($qualityIncomplete) {
+            $partialReason = "quality-target-or-evidence-not-met"
+        }
+
+        $usedContinuationAttempts = 0
+        if ($partialState) {
+            try { $usedContinuationAttempts = [int](Get-JsonProperty $partialState "continuationAttempts") } catch { $usedContinuationAttempts = 0 }
+        }
+        $partialEvidenceExcerpts = if ($needsContinuation) { @(Get-CumulativePartialEvidence $partialState $answer 6500) } else { @() }
+        if ($needsContinuation -and $usedContinuationAttempts -lt $ProjectMaxContinuationAttempts) {
+            $continuationAttempt = $usedContinuationAttempts + 1
+            $qualityReason = ""
+            $missingQualitySignals = @()
+            if ($qualityIncomplete) {
+                $qualityReason = "누적 답변 분량 또는 업무 근거 신호가 품질 기준에 미달했습니다"
+                $missingQualitySignals = @($qualityFacts.missingSignals)
+            }
+            $nextQuestion = New-PartialResponseContinuationQuestion $logicalOriginalQuestion $finishReason $nextQuestionMarkerFound $qualityReason $missingQualitySignals $continuationAttempt $ProjectMaxContinuationAttempts
             $runStatus = "partial"
+            $nextPartialState = [ordered]@{
+                schema = "qwen-loop-project-partial-state/v1"
+                updatedAt = (Get-Date).ToString("o")
+                isProject = ($null -ne $projectScan)
+                cycleIndex = $projectCycleForRun
+                turnInCycle = $projectTurnInCycle
+                primaryBusinessFamily = if ($projectScan) { $projectScan.primaryBusinessFamily } else { $null }
+                originalQuestion = $logicalOriginalQuestion
+                queuedQuestion = $nextQuestion
+                continuationAttempts = $continuationAttempt
+                maxContinuationAttempts = $ProjectMaxContinuationAttempts
+                cumulativeAnswerChars = if ($qualityFacts) { $qualityFacts.cumulativeAnswerChars } else { ([string]$answer).Length }
+                cumulativeVisibleTokens = if ($qualityFacts) { $qualityFacts.cumulativeVisibleTokens } else { 0 }
+                visibleTokensKnown = if ($qualityFacts) { $qualityFacts.visibleTokensKnown } else { $false }
+                evidenceSignals = if ($qualityFacts) { @($qualityFacts.evidenceSignals) } else { @() }
+                evidenceExcerpts = $partialEvidenceExcerpts
+                evidenceExcerpt = Get-TextPrefix (($partialEvidenceExcerpts -join "`n`n--- previous partial ---`n")) 6500
+                lastReason = $partialReason
+                forceRescan = $false
+            }
+        } elseif ($needsContinuation) {
+            $runStatus = "abandoned"
+            $continuationAttempt = $usedContinuationAttempts
+            $partialReason = "continuation-limit:$partialReason"
+            if ($projectScan) {
+                $projectForceRescan = $true
+                $nextQuestion = [string]$projectScan.seedQuestion
+                $nextPartialState = [ordered]@{
+                    schema = "qwen-loop-project-partial-state/v1"
+                    updatedAt = (Get-Date).ToString("o")
+                    isProject = $true
+                    cycleIndex = $projectCycleForRun
+                    turnInCycle = $projectTurnInCycle
+                    primaryBusinessFamily = $projectScan.primaryBusinessFamily
+                    originalQuestion = $logicalOriginalQuestion
+                    queuedQuestion = $nextQuestion
+                    continuationAttempts = $usedContinuationAttempts
+                    maxContinuationAttempts = $ProjectMaxContinuationAttempts
+                    cumulativeAnswerChars = if ($qualityFacts) { $qualityFacts.cumulativeAnswerChars } else { ([string]$answer).Length }
+                    cumulativeVisibleTokens = if ($qualityFacts) { $qualityFacts.cumulativeVisibleTokens } else { 0 }
+                    visibleTokensKnown = if ($qualityFacts) { $qualityFacts.visibleTokensKnown } else { $false }
+                    evidenceSignals = if ($qualityFacts) { @($qualityFacts.evidenceSignals) } else { @() }
+                    evidenceExcerpts = $partialEvidenceExcerpts
+                    evidenceExcerpt = Get-TextPrefix (($partialEvidenceExcerpts -join "`n`n--- previous partial ---`n")) 6500
+                    lastReason = $partialReason
+                    forceRescan = $true
+                }
+            } else {
+                $fallbackQuestion = Select-BootstrapQuestion $SeedFile $QuestionBankFile $QuestionTrack
+                $nextQuestion = [string]$fallbackQuestion.Question
+                $nextPartialState = $null
+            }
         } else {
             $nextQuestion = [string]$nextQuestionExtraction.question
             $runStatus = "ok"
+            $nextPartialState = $null
         }
         $ended = Get-Date
         $completedAt = $ended
-
-        Write-Utf8File $nextQuestionPath $nextQuestion
 
         $lastTurnText = @"
 이전 질문:
@@ -5071,7 +7125,6 @@ $question
 이전 답변 일부:
 $(Get-TextPrefix $answer $LastTurnChars)
 "@
-        Write-Utf8File $lastTurnPath $lastTurnText
 
         $md = @"
 
@@ -5082,6 +7135,10 @@ $(Get-TextPrefix $answer $LastTurnChars)
 ## Question
 
 $question
+
+## Run Sequence
+
+$runSeq
 
 ## Next Question
 
@@ -5095,6 +7152,10 @@ $(Format-TokenUsageForMarkdown $tokenUsage $tokenUse)
 
 cycle=$projectCycleForRun, turn=$projectTurnInCycle/$ProjectTurnsPerCycle, phase=$(if ($projectPhase) { $projectPhase.label } else { "n/a" }), source=$questionSource
 
+## Completion Status
+
+status=$runStatus, reason=$partialReason, originalQuestion=$(Get-TextPrefix $logicalOriginalQuestion 1200)
+
 ## Answer Depth
 
 $(if ($answerDepth) { $answerDepth | ConvertTo-Json -Compress -Depth 10 } else { "not available" })
@@ -5104,9 +7165,33 @@ $(if ($answerDepth) { $answerDepth | ConvertTo-Json -Compress -Depth 10 } else {
 $answer
 
 "@
-        Append-Utf8File $transcriptPath $md
-
+        $nextSuccessfulTurnsInCycle = $projectSuccessfulTurnsInCycle
+        $explorationStateAfter = $null
+        if ($projectScan -and $runStatus -eq "ok") {
+            $nextSuccessfulTurnsInCycle = $projectSuccessfulTurnsInCycle + 1
+            $explorationStateAfter = [ordered]@{
+                schema = "qwen-loop-project-exploration-state/v1"
+                updatedAt = (Get-Date).ToString("o")
+                cycleIndex = $projectCycleNumber
+                successfulTurnsInCycle = $nextSuccessfulTurnsInCycle
+                turnsPerCycle = $ProjectTurnsPerCycle
+                primaryBusinessFamily = $projectScan.primaryBusinessFamily
+                primaryPath = $projectScan.primaryQuestionCandidateFile
+                nextQuestion = $nextQuestion
+            }
+        }
+        $stateAfter = [ordered]@{
+            schema = "qwen-loop-turn-state/v1"
+            nextQuestion = $nextQuestion
+            lastTurnText = $lastTurnText
+            partialStateMode = if ($nextPartialState) { "write" } else { "clear" }
+            partialState = ConvertTo-PlainObject $nextPartialState
+            explorationStateMode = if ($explorationStateAfter) { "write" } else { "unchanged" }
+            explorationState = ConvertTo-PlainObject $explorationStateAfter
+            writeCycleEvidence = ($projectScan -and $runStatus -eq "ok")
+        }
         $record = [ordered]@{
+            seq = $runSeq
             started = $started.ToString("o")
             ended = $ended.ToString("o")
             providerType = $providerInfo.Type
@@ -5118,11 +7203,13 @@ $answer
             apiKeySource = $providerInfo.ApiKeySource
             clientIp = $networkIdentity.localAddress
             question = $question
+            logicalOriginalQuestion = $logicalOriginalQuestion
             nextQuestion = $nextQuestion
             nextQuestionMarkerFound = $nextQuestionMarkerFound
             nextQuestionMarkerPresent = $nextQuestionMarkerPresent
             completionStatus = $runStatus
             partialReason = $partialReason
+            continuationAttempt = $continuationAttempt
             cycleIndex = $projectCycleForRun
             turnInCycle = $projectTurnInCycle
             phase = if ($projectPhase) { $projectPhase.key } else { $null }
@@ -5131,30 +7218,57 @@ $answer
             usage = ConvertTo-PlainObject $tokenUsage
             tokenUse = ConvertTo-PlainObject $tokenUse
             answerDepth = ConvertTo-PlainObject $answerDepth
+            quality = ConvertTo-PlainObject $qualityFacts
+            stateAfter = $stateAfter
             answer = $answer
         }
-        Append-Utf8File $jsonlPath (($record | ConvertTo-Json -Compress -Depth 50) + "`n")
+        # transcript.jsonl is the canonical completed-turn journal.  Append it
+        # before derived human-readable/state files so pending_turn.json can
+        # deterministically roll the full state forward after a process stop.
+        $turnCommitStarted = $true
+        Append-JsonlRecord $jsonlPath $record 50
+        Append-Utf8File $transcriptPath $md
         if ($projectScan -and $runStatus -eq "ok") {
-            Add-CycleEvidenceMemory $projectCycleEvidencePath $projectCycleForRun $projectTurnInCycle $runStatus $question $answer
+            Add-CycleEvidenceMemory $projectCycleEvidencePath $projectCycleForRun $projectTurnInCycle $runStatus $question $answer $runSeq
         }
 
-        if ($projectScan -and $runStatus -eq "ok") {
-            $projectSuccessfulTurnsInCycle++
-            $projectQuestionSource = "model-next-question"
-            $explorationState = [ordered]@{
-                schema = "qwen-loop-project-exploration-state/v1"
-                updatedAt = (Get-Date).ToString("o")
-                cycleIndex = $projectCycleNumber
-                successfulTurnsInCycle = $projectSuccessfulTurnsInCycle
-                turnsPerCycle = $ProjectTurnsPerCycle
-                primaryBusinessFamily = $projectScan.primaryBusinessFamily
-                primaryPath = $projectScan.primaryQuestionCandidateFile
-                nextQuestion = $nextQuestion
+        if ($explorationStateAfter) {
+            Write-Utf8File $projectExplorationStatePath ($explorationStateAfter | ConvertTo-Json -Depth 20)
+        }
+
+        if ($nextPartialState) {
+            Write-ProjectPartialState $partialStatePath $nextPartialState
+        } else {
+            Clear-ProjectPartialState $partialStatePath
+        }
+        Write-Utf8File $lastTurnPath $lastTurnText
+        # next_question is the transaction's commit pointer and is deliberately
+        # written after logs, quality state, and exploration state.
+        Write-Utf8File $nextQuestionPath $nextQuestion
+        Remove-PendingTurnFiles $pendingTurnPath $pendingQuestionPath
+        $turnCommitStarted = $false
+
+        $partialState = $nextPartialState
+        $startedFreshCycleThisRun = $false
+        if ($runStatus -eq "ok") {
+            if ($projectScan) {
+                $projectSuccessfulTurnsInCycle = $nextSuccessfulTurnsInCycle
+                $projectQuestionSource = "model-next-question"
             }
-            Write-Utf8File $projectExplorationStatePath ($explorationState | ConvertTo-Json -Depth 20)
-        } elseif ($projectScan -and $runStatus -eq "partial") {
+            $hasUnresolvedPartial = $false
+        } elseif ($runStatus -eq "partial") {
+            if ($projectScan) { $projectQuestionSource = "partial-response-continuation" }
+            $hasUnresolvedPartial = $true
+        } elseif ($runStatus -eq "abandoned") {
+            if ($projectScan) { $projectQuestionSource = "continuation-limit-pending-rescan" }
+            $hadAbandonedTurn = $true
+            $hasUnresolvedPartial = $false
+        }
+        if ($projectScan -and $runStatus -eq "partial") {
             $projectQuestionSource = "partial-response-continuation"
             Write-Host "Partial turn : successful cycle count was not advanced ($partialReason)." -ForegroundColor Yellow
+        } elseif ($projectScan -and $runStatus -eq "abandoned") {
+            Write-Host "Abandoned turn: continuation limit reached; a different business family will be rescanned before the next request." -ForegroundColor Red
         }
 
         if (-not $NoAnswerPreview) {
@@ -5180,13 +7294,22 @@ $answer
         if ($projectScan) { Write-Host "- $dynamicProjectContextPath" }
         if ($runStatus -eq "partial") {
             Write-Host "`nRUN #$runCount partial. Answer saved; continuation queued without advancing the successful-turn cycle." -ForegroundColor Yellow
+        } elseif ($runStatus -eq "abandoned") {
+            Write-Host "`nRUN #$runCount abandoned. Answer saved; continuation limit reached and fresh rescan was queued." -ForegroundColor Red
         } else {
             Write-Host "`nRUN #$runCount complete. Full answer saved to transcript.md." -ForegroundColor Green
         }
     } catch {
         $completedAt = Get-Date
+        $hadRunError = $true
+        $runStatus = "error"
         $msg = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ERROR: $($_.Exception.Message)`n$($_.ScriptStackTrace)`n"
         $errorText = [string]$_.Exception.Message
+        $responseAcceptanceFatal = $errorText.StartsWith("HTTP response was received but could not be safely accepted; request will not be resent:", [System.StringComparison]::Ordinal)
+        if ($turnCommitStarted -or $cycleTransitionStarted -or $responseAcceptanceFatal -or $null -ne $chatResult) {
+            $fatalStateCommitError = $true
+            $errorText += " | durable state transition interrupted; process will stop for startup roll-forward"
+        }
         Append-Utf8File $errorLogPath $msg
         Write-Host $msg -ForegroundColor Red
     }
@@ -5194,7 +7317,7 @@ $answer
     $loopCleanup = Invoke-WorkDirCleanup $WorkDir $transcriptPath $jsonlPath $errorLogPath
     Write-WorkDirCleanupStatus $loopCleanup $false
 
-    $willStop = ($Once -or ($MaxRuns -gt 0 -and $runCount -ge $MaxRuns))
+    $willStop = ($fatalStateCommitError -or $Once -or ($MaxRuns -gt 0 -and $runCount -ge $MaxRuns))
     $nextWaitSeconds = $null
     $nextRunAt = $null
     if (-not $willStop) {
@@ -5237,7 +7360,11 @@ $answer
         totalTokens = $historyTotalTokens
         tokenUse = ConvertTo-PlainObject $tokenUse
         answerDepth = ConvertTo-PlainObject $answerDepth
+        quality = ConvertTo-PlainObject $qualityFacts
         finishReason = if ($chatResult) { $chatResult.FinishReason } else { $null }
+        streamDoneObserved = if ($chatResult) { $chatResult.StreamDoneObserved } else { $null }
+        primaryTerminalSeen = if ($chatResult) { $chatResult.PrimaryTerminalSeen } else { $null }
+        streamCompleted = if ($chatResult) { $chatResult.StreamCompleted } else { $null }
         nextQuestionMarkerFound = $nextQuestionMarkerFound
         nextQuestionMarkerPresent = $nextQuestionMarkerPresent
         partialReason = $partialReason
@@ -5261,6 +7388,7 @@ $answer
     Write-Host "RunHistory  : $runHistoryPath" -ForegroundColor DarkGreen
 
     if ($willStop) {
+        $processExitCode = if ($hadRunError) { 1 } elseif ($hadAbandonedTurn -or $hasUnresolvedPartial) { 2 } else { 0 }
         Write-Host "`n지정된 실행 횟수만큼 실행 후 종료합니다." -ForegroundColor DarkGray
         break
     }
@@ -5269,5 +7397,9 @@ $answer
 }
 
 } finally {
-    if ($projectSessionLockStream) { $projectSessionLockStream.Dispose(); $projectSessionLockStream = $null }
+    if ($workDirLifetimeLockStream) { $workDirLifetimeLockStream.Dispose(); $workDirLifetimeLockStream = $null }
+}
+
+if (($fatalStateCommitError -or $Once -or $MaxRuns -gt 0) -and $processExitCode -ne 0) {
+    exit $processExitCode
 }

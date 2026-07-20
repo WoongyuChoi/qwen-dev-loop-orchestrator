@@ -107,6 +107,7 @@ try {
         "-ProjectSessionKeepCount", "12",
         "-ProjectSessionKeepDays", "30",
         "-ProjectSessionMaxTotalMB", "50",
+        "-NoProjectQualityGate",
         "-IntervalSeconds", "0",
         "-MaxRuns", "6",
         "-MaxRetries", "0",
@@ -132,6 +133,7 @@ try {
     $manifest = Get-Content -LiteralPath (Join-Path $session.FullName "session_identity.json") -Raw -Encoding UTF8 | ConvertFrom-Json
     Assert-True ([string]$manifest.identity -eq $projectBase.Name) "session identity marker mismatch"
     Assert-True ([string]$manifest.canonicalProjectRoot -eq (Resolve-Path $fixture).Path) "canonical ProjectRoot mismatch"
+    Assert-True ([string]$manifest.state -eq "ready" -and -not [string]::IsNullOrWhiteSpace([string]$manifest.readyAt)) "successful initial scan did not transition session identity from initializing to ready"
     Assert-True (Test-Path -LiteralPath (Join-Path $session.FullName ".qwen-loop-workdir.json") -PathType Leaf) "session WorkDir ownership marker was not created"
 
     $history = @(Get-Content -LiteralPath (Join-Path $session.FullName "run_history.jsonl") -Encoding UTF8 | Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json })
@@ -224,6 +226,7 @@ try {
         "-ProjectSessionKeepCount", "1",
         "-ProjectSessionKeepDays", "30",
         "-ProjectSessionMaxTotalMB", "50",
+        "-NoProjectQualityGate",
         "-IntervalSeconds", "0",
         "-MaxRuns", "1",
         "-MaxRetries", "0",
@@ -267,11 +270,12 @@ try {
         "-SettingsPath", $settingsPath, "-ProjectRoot", $fixture, "-WorkDir", $sessionRoot,
         "-NewProjectSession", "-FreshProjectQuestion", "-ProjectTurnsPerCycle", "5",
         "-ProjectSessionKeepCount", "12", "-ProjectSessionKeepDays", "30", "-ProjectSessionMaxTotalMB", "50",
+        "-NoProjectQualityGate",
         "-IntervalSeconds", "0", "-MaxRuns", "2", "-MaxRetries", "0", "-TimeoutSec", "20",
         "-NoCountdown", "-NoBanner", "-NoAnswerPreview"
     )
     $partialConsole = @(& powershell.exe @partialArgs 2>&1)
-    Assert-True ($LASTEXITCODE -eq 0) ("partial-response run failed: " + (($partialConsole | Select-Object -Last 20) -join [Environment]::NewLine))
+    Assert-True ($LASTEXITCODE -eq 2) ("partial-response bounded run should return incomplete exit code 2: " + (($partialConsole | Select-Object -Last 20) -join [Environment]::NewLine))
     [void]$server.WaitForExit(5000)
     Assert-True ($server.HasExited -and $server.ExitCode -eq 0) "partial-response mock requests did not complete"
     $partialSession = @(Get-ChildItem -LiteralPath (Join-Path $projectBase.FullName "sessions") -Directory | Where-Object { $sessionsBeforePartial -notcontains $_.FullName } | Select-Object -First 1)[0]
@@ -310,7 +314,7 @@ try {
         "-NoCountdown", "-NoBanner", "-NoAnswerPreview"
     )
     $unownedConsole = @(& powershell.exe @unownedArgs 2>&1)
-    Assert-True ($LASTEXITCODE -eq 0) ("unowned-WorkDir run failed: " + (($unownedConsole | Select-Object -Last 20) -join [Environment]::NewLine))
+    Assert-True ($LASTEXITCODE -eq 2) ("unowned-WorkDir partial run should return incomplete exit code 2: " + (($unownedConsole | Select-Object -Last 20) -join [Environment]::NewLine))
     [void]$server.WaitForExit(5000)
     Assert-True ($server.HasExited -and $server.ExitCode -eq 0) "unowned-WorkDir mock request did not complete"
     Assert-True (Test-Path -LiteralPath $unownedSentinel -PathType Leaf) "auto-cleanup deleted a file from an unowned custom WorkDir"

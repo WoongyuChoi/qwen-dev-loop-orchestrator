@@ -19,4 +19,7 @@ powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%qwe
   -ContextListFile "%SCRIPT_DIR%context_files.txt" ^
   -CompatBody
 
+set "QWEN_EXIT_CODE=%ERRORLEVEL%"
+if not "%QWEN_EXIT_CODE%"=="0" echo [ERROR] qwen-loop.ps1 exited with code %QWEN_EXIT_CODE%.
 pause
+exit /b %QWEN_EXIT_CODE%
